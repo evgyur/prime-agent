@@ -11,6 +11,33 @@ use super::{
 };
 
 impl SessionEngine for AgentSessionEngine {
+    fn control_goal(
+        &self,
+        goal_id: &str,
+        expected_objective: &str,
+        action: pa_core::session_engine::goal_driver::GoalControlAction,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = anyhow::Result<Option<pa_core::goals::GoalState>>>
+                + Send
+                + '_,
+        >,
+    > {
+        let goal_id = goal_id.to_string();
+        let expected_objective = expected_objective.to_string();
+        Box::pin(async move {
+            let model = self.resolve_model()?;
+            self.ensure_core_session_async(&model).await?;
+            let handles = self.goal_runtime.lock().expect("goal runtime lock").clone();
+            let handles = handles.ok_or_else(|| {
+                anyhow::anyhow!("Cannot control goal because this thread has no goal.")
+            })?;
+            let mut driver = handles.driver.lock().await;
+            let mut session = handles.session.lock().await;
+            driver.control_goal(&mut session, &goal_id, &expected_objective, action)
+        })
+    }
+
     /// Withdraw the queued minted goal-context turns so a state change leaves nothing stale to run.
     fn purge_queued_goal_contexts(&self) {
         let purge = self

@@ -47,6 +47,20 @@ pub trait SessionEngine: Send + Sync {
     /// waiting to run; engines without a queue do nothing.
     fn purge_queued_goal_contexts(&self) {}
 
+    /// Compare and apply a direct goal lifecycle change; `None` means cleared.
+    fn control_goal(
+        &self,
+        _goal_id: &str,
+        _expected_objective: &str,
+        _action: pa_core::session_engine::goal_driver::GoalControlAction,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<pa_core::goals::GoalState>>> + Send + '_,
+        >,
+    > {
+        Box::pin(async { anyhow::bail!("Goal lifecycle control is unavailable") })
+    }
+
     /// Release the session's kernel at a parent-owned child's idle settle: a
     /// snapshot-flushing stop; engines that cannot release (scripted harness, no
     /// kernel, failed settled gates) no-op.

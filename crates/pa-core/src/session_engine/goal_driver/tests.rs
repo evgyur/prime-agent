@@ -1401,3 +1401,74 @@ fn pending_continuation_never_re_arms() {
     driver.clear(&mut session).unwrap();
     assert!(!driver.pending_continuation());
 }
+
+#[test]
+fn direct_goal_control_checks_cas_and_preserves_pause_accounting() {
+    let mut session = persisted_session();
+    let mut driver = GoalDriver::new();
+    let started = driver
+        .start(&mut session, "ship the mission", Some(1000))
+        .unwrap();
+    let goal_id = started.goal_id.as_deref().unwrap();
+    let entries = session.get_entries().len();
+    assert!(driver
+        .control_goal(
+            &mut session,
+            "wrong",
+            "ship the mission",
+            GoalControlAction::Pause
+        )
+        .is_err());
+    assert!(driver
+        .control_goal(&mut session, goal_id, "stale", GoalControlAction::Clear)
+        .is_err());
+    assert_eq!(session.get_entries().len(), entries);
+
+    let paused = driver
+        .control_goal(
+            &mut session,
+            goal_id,
+            "ship the mission",
+            GoalControlAction::Pause,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(paused.status, GoalStatus::Paused);
+    assert_eq!(paused.goal_id, started.goal_id);
+    assert_eq!(paused.objective, started.objective);
+    assert_eq!(paused.token_budget, started.token_budget);
+    assert_eq!(paused.tokens_used, started.tokens_used);
+    assert_eq!(paused.continuations_used, started.continuations_used);
+    assert_eq!(session.get_entries().len(), entries + 1);
+    assert!(driver
+        .control_goal(
+            &mut session,
+            goal_id,
+            "ship the mission",
+            GoalControlAction::Pause,
+        )
+        .is_err());
+    assert!(driver
+        .control_goal(
+            &mut session,
+            goal_id,
+            "ship the mission",
+            GoalControlAction::Clear,
+        )
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        GoalDriver::load_persisted(&session).state().status,
+        GoalStatus::Idle
+    );
+    assert_eq!(GoalDriver::load_persisted(&session).state().objective, None);
+    assert_eq!(session.get_entries().len(), entries + 2);
+    assert!(driver
+        .control_goal(
+            &mut session,
+            goal_id,
+            "ship the mission",
+            GoalControlAction::Clear,
+        )
+        .is_err());
+}

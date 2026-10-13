@@ -341,6 +341,7 @@ pub fn default_server_capabilities() -> Vec<DaemonServerCapability> {
                 "prompt_admission_cancellation",
                 "owned_prompt_cancellation",
                 "queue_message_mutation",
+                "goal_lifecycle_control",
                 "authoritative_child_roster",
                 "owned_session_recovery_context",
                 "rlm_quiescence_barrier",
@@ -696,6 +697,9 @@ pub fn command_active_session_id(command: &DaemonCommand) -> Option<&str> {
         | DaemonCommand::GetState {
             active_session_id, ..
         }
+        | DaemonCommand::ControlGoal {
+            active_session_id, ..
+        }
         | DaemonCommand::GetConnectionState {
             active_session_id, ..
         }
@@ -981,6 +985,7 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
         DaemonCommand::WaitForHeadlessCompletion { .. } => "wait_for_headless_completion",
         DaemonCommand::GetSessionHeader { .. } => "get_session_header",
         DaemonCommand::GetState { .. } => "get_state",
+        DaemonCommand::ControlGoal { .. } => "control_goal",
         DaemonCommand::GetConnectionState { .. } => "get_connection_state",
         DaemonCommand::GetMessages { .. } => "get_messages",
         DaemonCommand::GetRlmChildren { .. } => "get_rlm_children",
@@ -1085,6 +1090,30 @@ mod tests {
             assert!(pa_types::daemon::is_session_plane_daemon_command(kind));
         }
         assert!(default_server_capabilities().contains(&"kernel_bash_activity".to_string()));
+    }
+
+    #[test]
+    fn goal_control_command_is_session_scoped() {
+        let line = serde_json::json!({
+            "type": "command",
+            "id": "c1",
+            "protocol": current_protocol_info(),
+            "command": {
+                "type": "control_goal",
+                "activeSessionId": "session",
+                "goalId": "goal",
+                "expectedObjective": "old",
+                "action": "clear",
+            },
+        })
+        .to_string();
+        let parsed = parse_daemon_command_line(&line).unwrap();
+        assert_eq!(command_type_name(&parsed.command), "control_goal");
+        assert_eq!(command_active_session_id(&parsed.command), Some("session"));
+        assert!(pa_types::daemon::is_session_plane_daemon_command(
+            "control_goal"
+        ));
+        assert!(default_server_capabilities().contains(&"goal_lifecycle_control".to_string()));
     }
 
     #[test]

@@ -41,6 +41,13 @@ pub enum UsageOutcome {
     Ignored,
 }
 
+/// A direct, compare-and-swap lifecycle change requested by a session client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalControlAction {
+    Pause,
+    Clear,
+}
+
 pub struct GoalDriver {
     state: GoalState,
     /// Ids of assistant messages already counted (double-counting guard).
@@ -288,6 +295,45 @@ impl GoalDriver {
         self.owed_continuation_for_rlm_work = false;
         self.continuation_consumed();
         Ok(())
+    }
+
+    /// Change a goal only while both its identity and objective still match.
+    /// `None` means the goal was cleared.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an absent or stale goal, or failed persistence.
+    pub fn control_goal(
+        &mut self,
+        session: &mut SessionManager,
+        goal_id: &str,
+        expected_objective: &str,
+        action: GoalControlAction,
+    ) -> anyhow::Result<Option<GoalState>> {
+        if self.state.goal_id.is_none()
+            || self.state.objective.is_none()
+            || self.state.status == GoalStatus::Idle
+        {
+            anyhow::bail!("Cannot control goal because this thread has no goal.");
+        }
+        if self.state.goal_id.as_deref() != Some(goal_id)
+            || self.state.objective.as_deref() != Some(expected_objective)
+        {
+            anyhow::bail!("Goal changed; refresh the goal before controlling it.");
+        }
+        match action {
+            GoalControlAction::Pause => {
+                if self.state.status != GoalStatus::Active {
+                    anyhow::bail!("Cannot pause goal because it is no longer active.");
+                }
+                self.pause(session, "Paused by user")?;
+                Ok(Some(self.state_with_creation_elapsed()))
+            }
+            GoalControlAction::Clear => {
+                self.clear(session)?;
+                Ok(None)
+            }
+        }
     }
 
     fn set_state(&mut self, session: &mut SessionManager, next: GoalState) -> anyhow::Result<()> {
