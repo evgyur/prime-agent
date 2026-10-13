@@ -114,6 +114,10 @@ pub struct AgentSessionEngine {
     /// across a turn's admission, so goal checks inside emit callbacks
     /// (which may run in async context) must not lock it.
     pub(crate) goal_runtime: std::sync::Mutex<Option<GoalRuntimeHandles>>,
+    /// Wakes headless completion waits after an owed goal continuation retry
+    /// has either admitted its turn or settled without one.
+    pub(crate) goal_retry_notify: tokio::sync::Notify,
+    pub(crate) goal_retry_in_flight: std::sync::atomic::AtomicUsize,
     /// The pending-continuation guard, mirrored lock-free at build: contexts
     /// that cannot take the async driver lock release it through this atomic
     /// handle.

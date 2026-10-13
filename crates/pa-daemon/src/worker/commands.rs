@@ -389,6 +389,9 @@ impl Worker {
         self.engine.abort_in_flight_turn();
         // An idle withdrawal has no turn-end event to refresh the roster.
         self.push_roster_delta();
+        // An idle headless goal may be waiting behind background Bash or a
+        // backoff wake; no turn boundary will signal its abort.
+        self.idle_notify.notify_waiters();
     }
 
     fn handle_abort(&self) -> DaemonResponse {
@@ -567,6 +570,7 @@ impl Worker {
         drop(core);
         // And the same eager agent abort.
         self.engine.abort_in_flight_turn();
+        self.idle_notify.notify_waiters();
         response_success(None, "abort_and_clear_queue", cleared.data)
     }
 

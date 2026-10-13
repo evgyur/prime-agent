@@ -316,6 +316,202 @@ async fn goal_turn_end_loop_runs_to_completion() {
     assert!(plain.success, "a post-goal prompt failed: {plain:?}");
 }
 
+/// A kernel background Bash handle may outlive the turn that started it.
+/// The headless owner must keep the worker alive until its settle hook admits
+/// the owed goal continuation and the completing turn has run.
+#[allow(clippy::await_holding_lock)] // the faux registry is process-global: the guard must span the async flow
+#[tokio::test]
+async fn headless_completion_waits_for_background_bash_goal_continuation() {
+    let _faux = crate::agent_engine::tests::FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = std::env::temp_dir().join(format!("pa-headless-goal-bash-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let worker = std::sync::Arc::new(Worker::new(
+        WorkerConfig {
+            socket_path: dir.join("worker.sock"),
+            supervisor_socket_path: PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "headless-goal-bash".to_string(),
+            agent_dir: dir.join("agent"),
+            recovery_journal_path: dir.join("recovery.jsonl"),
+            telemetry_disabled: None,
+            script: Some(json!({
+                "engine": "faux",
+                "responses": [
+                    "warm turn",
+                    "goal start turn",
+                    { "content": [
+                        { "type": "toolCall", "name": "python_repl",
+                          "arguments": { "code": "import goal; await goal.complete()" } },
+                    ] },
+                ],
+            })),
+        },
+        None,
+    ));
+    let created = worker
+        .dispatch("create", &json!({ "noSession": true, "cwd": "/tmp" }))
+        .await;
+    assert!(created.success, "create failed: {created:?}");
+    let warm = worker
+        .dispatch(
+            "prompt_and_wait",
+            &json!({ "activeSessionId": "headless-goal-bash", "message": "warm" }),
+        )
+        .await;
+    assert!(warm.success, "warm turn failed: {warm:?}");
+    let engine = worker.agent_engine.as_ref().expect("concrete engine");
+    let live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let probe = std::sync::Arc::clone(&live);
+    *engine.background_bash_probe.lock().unwrap() = Some(std::sync::Arc::new(move || {
+        probe.load(std::sync::atomic::Ordering::SeqCst)
+    }));
+    let mut events = worker.events.subscribe();
+    let start = worker
+        .dispatch(
+            "prompt_and_wait",
+            &json!({
+                "activeSessionId": "headless-goal-bash",
+                "message": "/goal finish after Bash settles",
+            }),
+        )
+        .await;
+    assert!(start.success, "goal start failed: {start:?}");
+    let idle = worker.dispatch("wait_for_idle", &json!({})).await;
+    assert!(idle.success, "worker did not park: {idle:?}");
+    assert_eq!(
+        engine.headless_goal_wait_state().await,
+        crate::goal_continuation::HeadlessGoalWait::Pending
+    );
+
+    let completion_payload = json!({});
+    let completion = worker.dispatch("wait_for_headless_completion", &completion_payload);
+    tokio::pin!(completion);
+    std::future::poll_fn(|cx| {
+        assert!(
+            std::future::Future::poll(completion.as_mut(), cx).is_pending(),
+            "headless wait returned before Bash settled"
+        );
+        std::task::Poll::Ready(())
+    })
+    .await;
+
+    live.store(false, std::sync::atomic::Ordering::SeqCst);
+    engine.retry_owed_goal_continuation();
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(30), completion)
+        .await
+        .expect("headless wait did not finish after Bash settled");
+    assert!(
+        completed.success,
+        "headless completion failed: {completed:?}"
+    );
+    assert_eq!(worker.engine.goal_state_value()["status"], "complete");
+    let observed = session_events_since(&mut events);
+    assert!(
+        observed.iter().any(|event| {
+            event["type"] == "message_start" && event["message"]["customType"] == "goal_context"
+        }),
+        "owed continuation did not run: {observed:?}"
+    );
+}
+
+#[allow(clippy::await_holding_lock)] // the faux registry is process-global: the guard must span the async flow
+#[tokio::test]
+async fn idle_abort_releases_headless_goal_wait() {
+    let _faux = crate::agent_engine::tests::FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = std::env::temp_dir().join(format!("pa-headless-goal-abort-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let worker = std::sync::Arc::new(Worker::new(
+        WorkerConfig {
+            socket_path: dir.join("worker.sock"),
+            supervisor_socket_path: PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "headless-goal-abort".to_string(),
+            agent_dir: dir.join("agent"),
+            recovery_journal_path: dir.join("recovery.jsonl"),
+            telemetry_disabled: None,
+            script: Some(json!({
+                "engine": "faux",
+                "responses": ["warm turn", "goal start turn"],
+            })),
+        },
+        None,
+    ));
+    assert!(
+        worker
+            .dispatch("create", &json!({ "noSession": true, "cwd": "/tmp" }))
+            .await
+            .success
+    );
+    assert!(
+        worker
+            .dispatch(
+                "prompt_and_wait",
+                &json!({ "activeSessionId": "headless-goal-abort", "message": "warm" }),
+            )
+            .await
+            .success
+    );
+    let engine = worker.agent_engine.as_ref().expect("concrete engine");
+    let live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let probe = std::sync::Arc::clone(&live);
+    *engine.background_bash_probe.lock().unwrap() = Some(std::sync::Arc::new(move || {
+        probe.load(std::sync::atomic::Ordering::SeqCst)
+    }));
+    assert!(
+        worker
+            .dispatch(
+                "prompt_and_wait",
+                &json!({
+                    "activeSessionId": "headless-goal-abort",
+                    "message": "/goal stop when aborted",
+                }),
+            )
+            .await
+            .success
+    );
+    assert!(worker.dispatch("wait_for_idle", &json!({})).await.success);
+    let mut events = worker.events.subscribe();
+
+    let completion_payload = json!({});
+    let completion = worker.dispatch("wait_for_headless_completion", &completion_payload);
+    tokio::pin!(completion);
+    std::future::poll_fn(|cx| {
+        assert!(
+            std::future::Future::poll(completion.as_mut(), cx).is_pending(),
+            "headless wait returned before abort"
+        );
+        std::task::Poll::Ready(())
+    })
+    .await;
+    assert!(worker.dispatch("abort", &json!({})).await.success);
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(5), completion)
+        .await
+        .expect("idle abort did not release headless wait");
+    assert!(completed.success, "completion failed: {completed:?}");
+    assert_eq!(worker.engine.goal_state_value()["status"], "active");
+    live.store(false, std::sync::atomic::Ordering::SeqCst);
+    let retried = engine.goal_retry_notify.notified();
+    tokio::pin!(retried);
+    retried.as_mut().enable();
+    engine.retry_owed_goal_continuation();
+    tokio::time::timeout(std::time::Duration::from_secs(5), retried)
+        .await
+        .expect("settle retry did not finish");
+    let observed = session_events_since(&mut events);
+    assert!(
+        !observed.iter().any(|event| {
+            event["type"] == "message_start" && event["message"]["customType"] == "goal_context"
+        }),
+        "abort admitted a continuation: {observed:?}"
+    );
+}
+
 #[allow(clippy::await_holding_lock)] // the faux registry is process-global: the guard must span the async flow
 #[tokio::test]
 async fn goal_pause_withdraws_the_queued_continuation() {
