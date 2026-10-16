@@ -136,6 +136,10 @@ async fn spawn_fake_supervisor(
                                 )
                         ) =>
                         {
+                            if matches!(child, FakeChild::PromptFails) {
+                                PROMPT_FAILURE_STARTED.notify_one();
+                                PROMPT_FAILURE_RELEASE.notified().await;
+                            }
                             // Two get_state reads per watcher pass for the
                             // parked variant (the refresh read, then the
                             // liveness poll): the last one is the give-up
@@ -379,6 +383,39 @@ async fn spawn_child(sessions: &SupervisorChildSessions) -> RlmSpawnHandle {
         })
         .await
         .expect("spawn must succeed against the fake supervisor")
+}
+
+async fn begin_failed_spawn(
+    sessions: &SupervisorChildSessions,
+) -> (
+    tokio::task::JoinHandle<anyhow::Result<RlmSpawnHandle>>,
+    String,
+) {
+    let task = tokio::spawn(sessions.spawn(RlmSpawnRequest {
+        prompt: "f20 child task".into(),
+        name: Some("f20-worker".into()),
+        model: None,
+        thinking: None,
+        spawned_by_request_id: None,
+    }));
+    PROMPT_FAILURE_STARTED.notified().await;
+    let child_id = sessions.inner.children.lock().await[0]
+        .lock()
+        .await
+        .rlm_child_id
+        .clone();
+    (task, child_id)
+}
+
+async fn refuse_failed_spawn(task: tokio::task::JoinHandle<anyhow::Result<RlmSpawnHandle>>) {
+    PROMPT_FAILURE_RELEASE.notify_one();
+    PROMPT_FAILURE_STARTED.notified().await;
+    PROMPT_FAILURE_RELEASE.notify_one();
+    let error = task
+        .await
+        .unwrap()
+        .expect_err("initial prompt failure must not return a usable handle");
+    assert!(format!("{error:#}").contains("refused by the fake supervisor"));
 }
 
 #[tokio::test]
@@ -807,9 +844,9 @@ async fn a_child_whose_task_prompt_cannot_be_routed_delivers_the_failure_notice(
     sessions.set_settle_hook(Arc::new(move || {
         let _ = hook_tx.send(());
     }));
-    let handle = spawn_child(&sessions).await;
+    let (spawned, child_id) = begin_failed_spawn(&sessions).await;
     // The worker releases the detached prompt at its turn boundary.
-    sessions.notify_turn_done();
+    refuse_failed_spawn(spawned).await;
 
     let follow_up = tokio::time::timeout(Duration::from_secs(10), follow_up_rx.recv())
         .await
@@ -817,7 +854,7 @@ async fn a_child_whose_task_prompt_cannot_be_routed_delivers_the_failure_notice(
         .expect("the follow_up channel stays open");
     assert_failure_row(
         &follow_up,
-        &handle.rlm_child_id,
+        &child_id,
         "prompt RLM child session child-live: refused by the fake supervisor",
     );
     let entries = sessions.list_subagents().await.expect("child roster");
@@ -862,6 +899,9 @@ async fn an_unreachable_child_delivers_the_failure_notice_instead_of_no_reply() 
 /// Hand-off into the unreachable give-up's poll: the fake parks the
 /// give-up poll, the test lands the reader's verdict, the fake releases
 /// the poll. Only the lost-claim test uses these.
+static PROMPT_FAILURE_STARTED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+static PROMPT_FAILURE_RELEASE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
 static GIVE_UP_POLL: tokio::sync::Notify = tokio::sync::Notify::const_new();
 static VERDICT_LANDED: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
@@ -929,7 +969,7 @@ async fn a_collect_inside_the_prompt_failure_window_does_not_swallow_the_failure
     sessions.set_settle_hook(Arc::new(move || {
         let _ = hook_tx.send(());
     }));
-    let handle = spawn_child(&sessions).await;
+    let (spawned, child_id) = begin_failed_spawn(&sessions).await;
     // The window's entry condition, set deterministically: the detached
     // prompt task flips `prompt_admitted` BEFORE its first
     // `prompt_child` (host.rs), and the collect below races that task in
@@ -940,7 +980,7 @@ async fn a_collect_inside_the_prompt_failure_window_does_not_swallow_the_failure
         .await
         .prompt_admitted = true;
     let misread = sessions
-        .collect(vec![handle.rlm_child_id.clone()], 1_000)
+        .collect(vec![child_id.clone()], 1_000)
         .await
         .expect("collect inside the window");
     assert_eq!(
@@ -950,7 +990,7 @@ async fn a_collect_inside_the_prompt_failure_window_does_not_swallow_the_failure
 
     // The task prompt now runs and fails (prompt + retry) inside the
     // window the collect already scored.
-    sessions.notify_turn_done();
+    refuse_failed_spawn(spawned).await;
 
     let follow_up = tokio::time::timeout(Duration::from_secs(10), follow_up_rx.recv())
         .await
@@ -958,7 +998,7 @@ async fn a_collect_inside_the_prompt_failure_window_does_not_swallow_the_failure
         .expect("follow_up channel open");
     assert_failure_row(
         &follow_up,
-        &handle.rlm_child_id,
+        &child_id,
         "prompt RLM child session child-live: refused by the fake supervisor",
     );
     let entries = sessions.list_subagents().await.expect("child roster");
@@ -984,9 +1024,9 @@ async fn a_replied_child_whose_prompt_fails_still_delivers_the_failure_row() {
     let (sessions, _kill_rx) =
         sessions_with_fake_supervisor(follow_up_tx, 0, FakeKill::Success, FakeChild::PromptFails)
             .await;
-    let handle = spawn_child(&sessions).await;
+    let (spawned, child_id) = begin_failed_spawn(&sessions).await;
     sessions.mark_replied("child-live").await;
-    sessions.notify_turn_done();
+    refuse_failed_spawn(spawned).await;
 
     let follow_up = tokio::time::timeout(Duration::from_secs(10), follow_up_rx.recv())
         .await
@@ -994,7 +1034,7 @@ async fn a_replied_child_whose_prompt_fails_still_delivers_the_failure_row() {
         .expect("follow_up channel open");
     assert_failure_row(
         &follow_up,
-        &handle.rlm_child_id,
+        &child_id,
         "prompt RLM child session child-live: refused by the fake supervisor",
     );
     let extra = tokio::time::timeout(Duration::from_millis(300), follow_up_rx.recv()).await;
@@ -1067,15 +1107,17 @@ async fn collect_with_a_timeout_waits_for_a_running_grandchild() {
     sessions.notify_turn_done();
     wait_for_quiescent_wait(&grandchild).await;
 
-    let finish = Arc::clone(&grandchild);
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        finish.running.store(false, Ordering::SeqCst);
-    });
-    let results = sessions
-        .collect(vec![handle.rlm_child_id.clone()], 10_000)
-        .await
-        .expect("collect the child");
+    let mut collecting = Box::pin(sessions.collect(vec![handle.rlm_child_id.clone()], 10_000));
+    std::future::poll_fn(|cx| {
+        assert!(
+            std::future::Future::poll(collecting.as_mut(), cx).is_pending(),
+            "collect returned while the grandchild still ran"
+        );
+        std::task::Poll::Ready(())
+    })
+    .await;
+    grandchild.running.store(false, Ordering::SeqCst);
+    let results = collecting.await.expect("collect the child");
     assert_eq!(results[0].status, "done");
     assert!(!grandchild.running.load(Ordering::SeqCst));
 }

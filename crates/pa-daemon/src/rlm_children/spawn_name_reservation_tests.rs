@@ -15,6 +15,26 @@ async fn spawn_gated_supervisor(
     rename_seen_tx: mpsc::UnboundedSender<Value>,
     rename_verdict_rx: Option<mpsc::UnboundedReceiver<()>>,
 ) {
+    spawn_gated_supervisor_with_prompt(
+        socket,
+        create_seen_tx,
+        verdict_rx,
+        rename_seen_tx,
+        rename_verdict_rx,
+        None,
+    )
+    .await;
+}
+
+async fn spawn_gated_supervisor_with_prompt(
+    socket: std::path::PathBuf,
+    create_seen_tx: mpsc::UnboundedSender<Value>,
+    verdict_rx: mpsc::UnboundedReceiver<bool>,
+    rename_seen_tx: mpsc::UnboundedSender<Value>,
+    rename_verdict_rx: Option<mpsc::UnboundedReceiver<()>>,
+    prompt_gate: Option<(mpsc::UnboundedSender<Value>, mpsc::UnboundedReceiver<bool>)>,
+) {
+    let prompt_gate = prompt_gate.map(|(tx, rx)| (tx, Arc::new(tokio::sync::Mutex::new(rx))));
     let verdict_rx = std::sync::Arc::new(tokio::sync::Mutex::new(verdict_rx));
     let rename_verdict_rx = rename_verdict_rx.map(|rx| Arc::new(tokio::sync::Mutex::new(rx)));
     let listener = bind_transport(&socket).await.unwrap();
@@ -23,6 +43,7 @@ async fn spawn_gated_supervisor(
             let Ok(stream) = listener.accept().await else {
                 return;
             };
+            let prompt_gate = prompt_gate.clone();
             let create_seen_tx = create_seen_tx.clone();
             let rename_seen_tx = rename_seen_tx.clone();
             let verdict_rx = std::sync::Arc::clone(&verdict_rx);
@@ -72,6 +93,15 @@ async fn spawn_gated_supervisor(
                                     "create refused by the gated supervisor",
                                     None,
                                 ),
+                            }
+                        }
+                        "prompt" if prompt_gate.is_some() => {
+                            let (tx, rx) = prompt_gate.as_ref().unwrap();
+                            tx.send(command.clone()).unwrap();
+                            if rx.lock().await.recv().await == Some(true) {
+                                response_success(Some(&id), command_type, None)
+                            } else {
+                                response_failure(Some(&id), command_type, "kickoff refused", None)
                             }
                         }
                         "prompt" | "wait_for_idle" => {
@@ -462,4 +492,92 @@ async fn concurrent_parent_renames_keep_the_last_applied_name() {
     );
     let rows = sessions.list_subagents().await.expect("roster");
     assert_eq!(rows[0].session_name, "second");
+}
+
+/// A handle is not an admission receipt until the initial task is queued.
+#[tokio::test]
+async fn initial_task_ack_precedes_handle_and_survives_caller_cancellation() {
+    exercise_initial_task_admission(true).await;
+}
+
+#[tokio::test]
+async fn refused_initial_task_returns_error_instead_of_a_usable_handle() {
+    exercise_initial_task_admission(false).await;
+}
+
+async fn exercise_initial_task_admission(cancel_caller: bool) {
+    let socket = std::env::temp_dir().join(format!(
+        "pa-rlm-kickoff-{}.sock",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let (create_tx, mut create_rx) = mpsc::unbounded_channel();
+    let (verdict_tx, verdict_rx) = mpsc::unbounded_channel();
+    let (rename_tx, _rename_rx) = mpsc::unbounded_channel();
+    let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel();
+    let (ack_tx, ack_rx) = mpsc::unbounded_channel();
+    spawn_gated_supervisor_with_prompt(
+        socket.clone(),
+        create_tx,
+        verdict_rx,
+        rename_tx,
+        None,
+        Some((prompt_tx, ack_rx)),
+    )
+    .await;
+    let sessions = SupervisorChildSessions::new(
+        Arc::new(crate::supervisor_link::SupervisorLink::new(socket)),
+        std::env::temp_dir(),
+        "parent-live".into(),
+        Arc::new(crate::model_allowlist::ModelRefusalTelemetry::new(
+            std::env::temp_dir(),
+            true,
+        )),
+    );
+    sessions.set_identity(ParentIdentity {
+        model: Some("mock/mock-1".into()),
+        cwd: Some(std::env::temp_dir().to_string_lossy().into()),
+        ..ParentIdentity::with_default_depth()
+    });
+    let spawned = tokio::spawn(sessions.spawn(spawn_request("gated-kickoff", "BRIEF_A")));
+    create_rx.recv().await.unwrap();
+    verdict_tx.send(true).unwrap();
+    let prompt = tokio::time::timeout(Duration::from_secs(2), prompt_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(prompt["message"], "[task from parent]\n\nBRIEF_A");
+    assert!(
+        !spawned.is_finished(),
+        "handle returned before initial queue acknowledgment"
+    );
+    if !cancel_caller {
+        ack_tx.send(false).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), prompt_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        ack_tx.send(false).unwrap();
+        let error = spawned
+            .await
+            .unwrap()
+            .expect_err("refused initial admission returned a handle");
+        assert!(format!("{error:#}").contains("kickoff refused"), "{error:#}");
+        assert!(!sessions.spawn_name_reserved("gated-kickoff"));
+        return;
+    }
+    spawned.abort();
+    let _ = spawned.await;
+    ack_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let rows = sessions.list_subagents().await.unwrap();
+            if rows.iter().any(|row| row.status == "completed") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled caller lost the registered child's settle watcher");
+    assert!(prompt_rx.try_recv().is_err(), "initial kickoff duplicated");
 }

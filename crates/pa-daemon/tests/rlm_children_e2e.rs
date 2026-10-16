@@ -254,9 +254,8 @@ async fn rlm_children_spawn_roster_collect_delete_end_to_end() {
         .spawn(spawn_request("worker-a", "ship the lane"))
         .await
         .expect("spawn");
-    // The registry sits outside a live worker turn here: release the
-    // detached task prompt at the boundary the worker would signal.
-    children.notify_turn_done();
+    // Spawn acknowledges initial queue admission without waiting for a
+    // parent turn boundary. No notify_turn_done is needed to run the task.
     assert_eq!(handle.name, "worker-a");
     assert!(handle.rlm_child_id.starts_with("sub-"), "{handle:?}");
     assert_eq!(handle.model, "scripted/faux-1");

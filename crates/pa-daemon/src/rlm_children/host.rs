@@ -194,9 +194,9 @@ impl RlmSubagentHost for SupervisorChildSessions {
             }
             .await;
             let (record, created, model) = admission?;
-            // The task prompt runs detached from the spawn admission: the
-            // handle returns at registration and the child's first turn
-            // starts after the parent's continuation request is in flight.
+            // Admit the task before returning a handle: a caller can send a
+            // supplement immediately, and it must never reach the model first.
+            // This waits for queue admission, not the child's completed turn.
             let watcher_this = Arc::clone(&this);
             let watcher_record = Arc::clone(&record);
             // TS `spawnMessage`: the kickoff rides prompt admission as
@@ -238,19 +238,13 @@ impl RlmSubagentHost for SupervisorChildSessions {
             let child_active_session_id = created.active_session_id.clone();
             let child_session_file = created.session_file.clone();
             let child_log_id = child_id.clone();
-            // Capture the current turn boundary before detaching: spawn
-            // admission happens mid-turn, so the parent's continuation
-            // request reaches the provider first (see `wait_turn_done`).
-            let turn_generation = *this.turn_done.subscribe().borrow();
-            tokio::spawn(async move {
-                watcher_this.wait_turn_done(turn_generation).await;
-                // The parent closed before the prompt admitted: the
-                // child is closed with it, so the detached task prompt
-                // never fires.
-                if watcher_record.lock().await.closed_by_parent {
-                    return;
+            // Dropping the caller while queue admission is in flight must not
+            // cancel the registered child's kickoff or its settle observation.
+            let admission = tokio::spawn(async move {
+                if record.lock().await.closed_by_parent {
+                    bail!("Child closed before initial task admission");
                 }
-                watcher_record.lock().await.prompt_admitted = true;
+                record.lock().await.prompt_admitted = true;
                 if let Err(error) = watcher_this
                     .prompt_child(
                         &child_active_session_id,
@@ -292,11 +286,15 @@ impl RlmSubagentHost for SupervisorChildSessions {
                                 super::lifecycle::FailedArm::Prompt,
                             )
                             .await;
-                        return;
+                        return Err(retry_error);
                     }
                 }
-                watcher_this.watch_child_settle(&watcher_record).await;
+                tokio::spawn(async move {
+                    watcher_this.watch_child_settle(&watcher_record).await;
+                });
+                anyhow::Ok(())
             });
+            admission.await.context("join RLM child task admission")??;
             Ok(RlmSpawnHandle {
                 rlm_child_id: child_id,
                 name,
