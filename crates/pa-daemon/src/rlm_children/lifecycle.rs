@@ -355,6 +355,9 @@ impl SupervisorChildSessionsInner {
             rest: Map::default(),
         };
         let state = self.command(&command, STATE_TIMEOUT_MS).await?;
+        if let Some(record) = self.find_record(active_session_id).await {
+            record.lock().await.observe_summary(&state);
+        }
         let flag = |name: &str| state.get(name).and_then(Value::as_bool).unwrap_or(false);
         Ok(flag("isStreaming")
             || flag("hasRunningSubagents")
@@ -410,9 +413,13 @@ impl SupervisorChildSessionsInner {
     /// Refresh one record against its worker: settle a child whose worker ran out of work and
     /// capture its answer once; an unreachable child keeps its last known state.
     pub(super) async fn refresh_record(&self, record: &Arc<Mutex<ChildRecord>>) {
+        let admission_lock = record.lock().await.admission_lock.clone();
+        let Ok(_observation) = admission_lock.try_lock() else {
+            return;
+        };
         {
             let record = record.lock().await;
-            if !record.prompt_admitted {
+            if !record.prompt_admitted || record.admission_blocked {
                 return;
             }
         }
@@ -435,6 +442,9 @@ impl SupervisorChildSessionsInner {
             .as_deref()
             .map(|text| cap_text(text, ANSWER_TEXT_MAX_CHARS));
         let mut record = record.lock().await;
+        if record.admission_blocked {
+            return;
+        }
         // The settle verdict is one-shot, the answer capture is not: a
         // `None` first capture (the settle raced the worker's answer
         // hand-off) froze the row empty before — the capture fill only
@@ -457,12 +467,20 @@ impl SupervisorChildSessionsInner {
     /// Watch one admitted child until its run settles, then deliver the parent's terminal notice
     /// when the child never replied; the watcher stops as soon as the record is removed.
     pub(super) async fn watch_child_settle(&self, record: &Arc<Mutex<ChildRecord>>) {
+        let watch_lock = record.lock().await.settle_watch_lock.clone();
+        let Ok(_watch) = watch_lock.try_lock() else {
+            return;
+        };
         let mut unreachable_polls: u32 = 0;
         loop {
             // The parent closed with this child running: the child dies
             // with it and no notice is owed — end without polling it.
             if record.lock().await.closed_by_parent {
                 return;
+            }
+            if record.lock().await.admission_blocked {
+                tokio::time::sleep(Duration::from_millis(WATCH_POLL_INTERVAL_MS)).await;
+                continue;
             }
             // Slice-top usage flush: rows of turns that completed since the
             // last slice land here (crash loss is bounded to one slice).
@@ -492,6 +510,16 @@ impl SupervisorChildSessionsInner {
                     continue;
                 }
                 self.refresh_record(record).await;
+                let admission_lock = record.lock().await.admission_lock.clone();
+                let Ok(_settling) = admission_lock.try_lock() else {
+                    continue;
+                };
+                {
+                    let row = record.lock().await;
+                    if row.admission_blocked || row.settled_status.is_none() {
+                        continue;
+                    }
+                }
                 // The run's final rows are attributed before the terminal
                 // notice rides the parent's follow-up route.
                 self.emit_final_child_usage(record).await;
@@ -515,10 +543,11 @@ impl SupervisorChildSessionsInner {
                         else {
                             return Ok(());
                         };
-                        if display.child_id != child_id || display.status != "running" {
+                        if display.child_id != child_id || display.status == "deleted" {
                             return Ok(());
                         }
                         display.status = "completed".to_string();
+                        display.admission_unresolved = None;
                         crate::rlm_ledger::write_rlm_subagent_display(&display).map(|_| ())
                     })
                     .await
@@ -540,9 +569,6 @@ impl SupervisorChildSessionsInner {
             } else {
                 unreachable_polls += 1;
                 if unreachable_polls >= WATCH_MAX_UNREACHABLE_POLLS {
-                    // A dead child keeps whatever rows its file already
-                    // holds; capture them before the terminal notice.
-                    self.emit_final_child_usage(record).await;
                     if self
                         .settle_failed(
                             record,
@@ -659,6 +685,12 @@ impl SupervisorChildSessionsInner {
         error: String,
         arm: FailedArm,
     ) -> bool {
+        let admission_lock = record.lock().await.admission_lock.clone();
+        let _failure = admission_lock.lock().await;
+        if record.lock().await.admission_blocked {
+            return false;
+        }
+        self.emit_final_child_usage(record).await;
         // The exit capture (the M4 seam): a child that dies without
         // reporting still said something — the live worker's last
         // assistant text when it is still reachable, else the durable
@@ -806,7 +838,10 @@ pub(super) enum FailedArm {
 /// change. The settle state is durable and the passive roster row
 /// stays the representation.
 pub(super) fn should_mark_unreachable_error(state: &ChildRecord) -> bool {
-    !(state.closed_by_parent || state.notice_delivered || state.settled_status.is_some())
+    !(state.admission_blocked
+        || state.closed_by_parent
+        || state.notice_delivered
+        || state.settled_status.is_some())
 }
 
 /// The child's last assistant text from its durable session file (the exit

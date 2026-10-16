@@ -430,6 +430,8 @@ impl SupervisorChildSessionsInner {
                 .into_iter()
                 .map(|record| Arc::new(Mutex::new(record))),
         );
+        drop(children);
+        self.refresh_running().await;
     }
 }
 
@@ -469,6 +471,9 @@ fn ledger_child_records(
             .parent()
             .and_then(crate::rlm_ledger::read_rlm_subagent_display)
             .filter(|display| display.child_id == edge.child_id);
+        let unresolved = display
+            .as_ref()
+            .is_some_and(|display| display.admission_unresolved == Some(true));
         records.push(ChildRecord {
             rlm_child_id: edge.child_id,
             session_name: edge.name,
@@ -489,6 +494,8 @@ fn ledger_child_records(
                     ))
                 })
                 .unwrap_or_default(),
+            thinking_level: None,
+            progress_note: None,
             label: rlm_child_label(
                 display
                     .as_ref()
@@ -505,7 +512,7 @@ fn ledger_child_records(
                 },
                 |display| display.created_at,
             ),
-            settled_status: Some(
+            settled_status: (!unresolved).then_some(
                 if display
                     .as_ref()
                     .is_some_and(|display| display.status == "running")
@@ -515,12 +522,15 @@ fn ledger_child_records(
                     "done"
                 },
             ),
-            settled: true,
+            settled: !unresolved,
+            admission_blocked: unresolved,
+            admission_lock: Arc::new(Mutex::new(())),
+            settle_watch_lock: Arc::new(Mutex::new(())),
             answer_preview: None,
             answer_text: None,
             answer_captured: false,
             replied_since_task: false,
-            notice_delivered: true,
+            notice_delivered: !unresolved,
             prompt_admitted: true,
             error: None,
             closed_by_parent: false,

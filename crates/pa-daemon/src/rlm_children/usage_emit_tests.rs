@@ -49,10 +49,15 @@ fn record_with_file(child_id: &str, session_file: &Path) -> Arc<Mutex<ChildRecor
         session_id: None,
         session_dir: String::new(),
         model: String::new(),
+        thinking_level: None,
+        progress_note: None,
         label: "child".to_string(),
         started_at_ms: 0,
         settled_status: None,
         settled: false,
+        admission_blocked: false,
+        admission_lock: Arc::new(Mutex::new(())),
+        settle_watch_lock: Arc::new(Mutex::new(())),
         answer_preview: None,
         answer_text: None,
         answer_captured: false,
@@ -261,6 +266,7 @@ async fn reseed_lists_live_ledger_children_settled_and_bills_only_after_a_delive
                 spawn_code: None,
                 model: None,
                 status: status.to_string(),
+                admission_unresolved: None,
                 created_at: 1234,
             },
         )
@@ -369,6 +375,179 @@ async fn reseed_lists_live_ledger_children_settled_and_bills_only_after_a_delive
         panic!("one batch: {:?}", reports[0].batches);
     };
     assert_eq!((usage.input, usage.output), (10, 5));
+}
+
+#[tokio::test]
+async fn retask_restart_process_reader() {
+    let Some(agent) = std::env::var_os("PA_RETASK_TEST_AGENT") else {
+        return;
+    };
+    let agent = PathBuf::from(agent);
+    let socket = PathBuf::from(std::env::var_os("PA_RETASK_TEST_SOCKET").unwrap());
+    let parent = std::env::var("PA_RETASK_TEST_PARENT").unwrap();
+    let restarted = SupervisorChildSessions::new(
+        Arc::new(SupervisorLink::new(socket)),
+        agent.clone(),
+        "parent-live".into(),
+        Arc::new(crate::model_allowlist::ModelRefusalTelemetry::new(
+            agent, true,
+        )),
+    );
+    restarted.set_identity(ParentIdentity {
+        session_file: Some(parent),
+        ..ParentIdentity::with_default_depth()
+    });
+    restarted.reseed_from_ledger().await;
+    let current = restarted.collect(vec!["sub-a".into()], 100).await.unwrap();
+    assert_eq!(current[0].status, "running");
+    assert!(!current[0].settled);
+    assert_eq!(current[0].answer_text, None);
+    assert!(restarted.has_running_children());
+    let row = restarted.inner.find_record("sub-a").await.unwrap();
+    assert!(row.lock().await.admission_blocked);
+    assert!(!row.lock().await.settled);
+    let legacy = restarted.collect(vec!["sub-b".into()], 0).await.unwrap();
+    assert_eq!(legacy[0].status, "error");
+    assert!(legacy[0].settled);
+}
+
+#[tokio::test]
+async fn retask_unknown_marker_survives_parent_registry_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agent = tmp.path().join("agent");
+    let daemon_sessions = tmp.path().join("daemon-sessions");
+    let proto = child_file(tmp.path());
+    let file_at = |path: PathBuf| {
+        std::fs::create_dir_all(path.parent().expect("parent dir")).unwrap();
+        std::fs::copy(&proto, &path).unwrap();
+        path.display().to_string()
+    };
+    let parent_one = file_at(daemon_sessions.join("P.jsonl"));
+    let parent_two = file_at(daemon_sessions.join("Q.jsonl"));
+    let child_one = file_at(agent.join("session-artifacts/P/sub-a/sess-a.jsonl"));
+    let child_two = file_at(agent.join("session-artifacts/P/sub-b/sess-b.jsonl"));
+    let child_legacy = file_at(agent.join("session-artifacts/P/sub-legacy/sess-legacy.jsonl"));
+    let child_three = file_at(agent.join("session-artifacts/P/sub-c/sess-c.jsonl"));
+    let child_four = file_at(agent.join("session-artifacts/Q/sub-d/sess-d.jsonl"));
+    for (child_id, session_file, status, prompt) in [
+        ("sub-a", &child_one, "completed", Some("finished task")),
+        ("sub-b", &child_two, "running", None),
+    ] {
+        crate::rlm_ledger::write_rlm_subagent_display(
+            &crate::rlm_ledger::RlmSubagentDisplayEntry {
+                type_tag: "rlm_subagent".to_string(),
+                child_id: child_id.to_string(),
+                session_name: child_id.to_string(),
+                session_dir: Path::new(session_file)
+                    .parent()
+                    .unwrap()
+                    .display()
+                    .to_string(),
+                session_file: session_file.clone(),
+                rlm_parent_node_id: None,
+                prompt: prompt.map(str::to_string),
+                spawn_code: None,
+                model: None,
+                status: status.to_string(),
+                admission_unresolved: None,
+                created_at: 1234,
+            },
+        )
+        .unwrap();
+    }
+    let spawn = |child_id: &str, parent: &str, child: &str| {
+        format!(
+            r#"{{"v":1,"op":"spawn","at":"2026-09-30T00:00:00Z","childId":"{child_id}","parent":"{parent}","child":"{child}","depth":1,"name":"{child_id}"}}"#
+        )
+    };
+    let ledger_path = crate::rlm_ledger::rlm_ledger_path(&agent, &daemon_sessions);
+    std::fs::create_dir_all(ledger_path.parent().expect("ledger dir")).unwrap();
+    std::fs::write(
+        ledger_path,
+        [
+            r#"{"v":1,"op":"meta","at":"2026-09-30T00:00:00Z"}"#,
+            spawn("sub-a", &parent_one, &child_one).as_str(),
+            r#"{"v":1,"op":"spawn","at":"#,
+            spawn("sub-b", &parent_one, &child_two).as_str(),
+            spawn("sub-legacy", &parent_one, &child_legacy).as_str(),
+            spawn("sub-c", &parent_one, &child_three).as_str(),
+            format!(
+                r#"{{"v":1,"op":"delete","at":"2026-09-30T00:00:01Z","childId":"sub-c","child":"{child_three}","reason":"user"}}"#
+            )
+            .as_str(),
+            spawn("sub-d", &parent_two, &child_four).as_str(),
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+    let sessions = registry(&agent);
+    let supervisor_socket = sessions.inner.link.socket_path().clone();
+    crate::descriptor::persist_supervisor_config(
+        &crate::descriptor::descriptor_dir(&agent, &supervisor_socket)
+            .join(crate::descriptor::SUPERVISOR_CONFIG_FILE_NAME),
+        &crate::descriptor::PersistedSupervisorConfig {
+            version: 1,
+            socket_path: supervisor_socket.to_string_lossy().to_string(),
+            default_session_dir: Some(daemon_sessions.display().to_string()),
+        },
+    )
+    .unwrap();
+    sessions.set_identity(ParentIdentity {
+        session_file: Some(parent_one.clone()),
+        ..ParentIdentity::with_default_depth()
+    });
+    let sink = Arc::new(CapturingSink::default());
+    sessions.set_usage_sink(sink.clone());
+    sessions.reseed_from_ledger().await;
+    let admission = sessions
+        .begin_child_admission("sub-a")
+        .await
+        .unwrap()
+        .unwrap();
+    drop(admission); // sent ambiguity or cancellation retains the same durable obligation
+    drop(sessions);
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "rlm_children::usage_emit_tests::retask_restart_process_reader",
+            "--nocapture",
+        ])
+        .env("PA_RETASK_TEST_AGENT", &agent)
+        .env("PA_RETASK_TEST_SOCKET", &supervisor_socket)
+        .env("PA_RETASK_TEST_PARENT", &parent_one)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+    let restarted = SupervisorChildSessions::new(
+        Arc::new(SupervisorLink::new(supervisor_socket)),
+        agent.clone(),
+        "parent-live".into(),
+        Arc::new(crate::model_allowlist::ModelRefusalTelemetry::new(
+            agent.clone(),
+            true,
+        )),
+    );
+    restarted.set_identity(ParentIdentity {
+        session_file: Some(parent_one),
+        ..ParentIdentity::with_default_depth()
+    });
+    restarted.reseed_from_ledger().await;
+    let current = restarted.collect(vec!["sub-a".into()], 100).await.unwrap();
+    assert_eq!(current[0].status, "running");
+    assert!(!current[0].settled);
+    assert_eq!(current[0].answer_text, None);
+    assert!(restarted.has_running_children());
+    let row = restarted.inner.find_record("sub-a").await.unwrap();
+    assert!(row.lock().await.admission_blocked);
+    assert!(!row.lock().await.settled);
+    let legacy = restarted.collect(vec!["sub-b".into()], 0).await.unwrap();
+    assert_eq!(legacy[0].status, "error");
+    assert!(legacy[0].settled);
 }
 
 /// Cancellation after delivery starts retains the exact interval; rows arriving

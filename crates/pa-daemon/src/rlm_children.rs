@@ -139,6 +139,8 @@ struct ChildRecord {
     session_id: Option<String>,
     session_dir: String,
     model: String,
+    thinking_level: Option<String>,
+    progress_note: Option<String>,
     label: String,
     started_at_ms: u64,
     /// Terminal state (`done` | `error` | `cancelled`); running while absent.
@@ -147,6 +149,10 @@ struct ChildRecord {
     /// terminal status flips earlier, so the quiescence predicate waits out the
     /// notice window.
     settled: bool,
+    /// An admission is in flight or unresolved; idle alone cannot close it.
+    admission_blocked: bool,
+    admission_lock: Arc<Mutex<()>>,
+    settle_watch_lock: Arc<Mutex<()>>,
     answer_preview: Option<String>,
     /// The full final-answer text (bounded by
     /// [`ANSWER_TEXT_MAX_CHARS`]), the collect envelope's binding lane:
@@ -200,7 +206,78 @@ struct ChildRecord {
     rename_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
+/// A retained child's delivery claim. Dropping it leaves unresolved work owed.
+pub(crate) struct ChildAdmission {
+    sessions: SupervisorChildSessions,
+    record: Arc<Mutex<ChildRecord>>,
+    _lock: tokio::sync::OwnedMutexGuard<()>,
+    prior: ChildTaskSnapshot,
+    prior_display: crate::rlm_ledger::RlmSubagentDisplayEntry,
+}
+
+struct ChildTaskSnapshot {
+    status: Option<&'static str>,
+    settled: bool,
+    blocked: bool,
+    preview: Option<String>,
+    text: Option<String>,
+    captured: bool,
+    replied: bool,
+    noticed: bool,
+    error: Option<String>,
+}
+
+impl ChildAdmission {
+    pub(crate) async fn rejected(self) -> Result<()> {
+        if !crate::rlm_ledger::write_rlm_subagent_display(&self.prior_display)? {
+            bail!("Child admission display was deleted");
+        }
+        {
+            let mut row = self.record.lock().await;
+            row.settled_status = self.prior.status;
+            row.settled = self.prior.settled;
+            row.admission_blocked = self.prior.blocked;
+            row.answer_preview = self.prior.preview;
+            row.answer_text = self.prior.text;
+            row.answer_captured = self.prior.captured;
+            row.replied_since_task |= self.prior.replied;
+            row.notice_delivered = self.prior.noticed;
+            row.error = self.prior.error;
+        }
+        self.sessions.inner.refresh_running().await;
+        if !self.prior.settled && !self.prior.blocked {
+            let inner = Arc::clone(&self.sessions.inner);
+            let record = Arc::clone(&self.record);
+            tokio::spawn(async move {
+                inner.watch_child_settle(&record).await;
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn accepted(self) {
+        // An earlier unresolved delivery is not closed by a later receipt.
+        self.record.lock().await.admission_blocked = self.prior.blocked;
+        let inner = Arc::clone(&self.sessions.inner);
+        let record = Arc::clone(&self.record);
+        tokio::spawn(async move {
+            inner.watch_child_settle(&record).await;
+        });
+    }
+}
+
 impl ChildRecord {
+    fn observe_summary(&mut self, summary: &Value) {
+        self.thinking_level = summary
+            .get("thinkingLevel")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        self.progress_note = summary
+            .get("progressNote")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+
     /// Raw run status: `running` | `done` | `error` | `cancelled`.
     fn status(&self) -> &'static str {
         self.settled_status.unwrap_or("running")
@@ -218,6 +295,12 @@ impl ChildRecord {
         });
         if !self.model.is_empty() {
             snapshot["model"] = json!(self.model);
+        }
+        if let Some(thinking) = &self.thinking_level {
+            snapshot["thinkingLevel"] = json!(thinking);
+        }
+        if let Some(note) = &self.progress_note {
+            snapshot["progressNote"] = json!(note);
         }
         if let Some(answer) = &self.answer_preview {
             snapshot["answerPreview"] = json!(answer);
@@ -632,6 +715,74 @@ impl SupervisorChildSessions {
         identities
     }
 
+    /// Claim current work before any delivery await. Cancellation is fail-closed.
+    pub(crate) async fn begin_child_admission(
+        &self,
+        target: &str,
+    ) -> Result<Option<ChildAdmission>> {
+        let Some(record) = self.inner.find_record(target).await else {
+            return Ok(None);
+        };
+        let admission_lock = record.lock().await.admission_lock.clone();
+        let lock = admission_lock.lock_owned().await;
+        let prior_display = {
+            let row = record.lock().await;
+            if row.closed_by_parent {
+                bail!("Child admission is closed");
+            }
+            let display = crate::rlm_ledger::read_rlm_subagent_display(Path::new(&row.session_dir))
+                .filter(|display| {
+                    display.child_id == row.rlm_child_id
+                        && display.session_dir == row.session_dir
+                        && Some(display.session_file.as_str()) == row.session_file.as_deref()
+                        && display.status != "deleted"
+                })
+                .ok_or_else(|| anyhow!("Child admission display identity unavailable"))?;
+            let mut pending = display.clone();
+            pending.admission_unresolved = Some(true);
+            if !crate::rlm_ledger::write_rlm_subagent_display(&pending)? {
+                bail!("Child admission display was deleted");
+            }
+            display
+        };
+        let prior = {
+            let mut row = record.lock().await;
+            let prior = ChildTaskSnapshot {
+                status: row.settled_status,
+                settled: row.settled,
+                blocked: row.admission_blocked,
+                preview: row.answer_preview.take(),
+                text: row.answer_text.take(),
+                captured: row.answer_captured,
+                replied: row.replied_since_task,
+                noticed: row.notice_delivered,
+                error: row.error.take(),
+            };
+            row.admission_blocked = true;
+            row.settled_status = None;
+            row.settled = false;
+            row.answer_captured = false;
+            row.replied_since_task = false;
+            row.notice_delivered = false;
+            prior
+        };
+        self.inner.refresh_running().await;
+        Ok(Some(ChildAdmission {
+            sessions: self.clone(),
+            record,
+            _lock: lock,
+            prior,
+            prior_display,
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn child_replied_for_test(&self, target: &str) -> bool {
+        let record = self.inner.find_record(target).await.unwrap();
+        let replied = record.lock().await.replied_since_task;
+        replied
+    }
+
     /// Re-arm usage observation for a child after an agent message was
     /// delivered to it; no-op for non-children or already-observed targets.
     pub async fn observe_child_usage(&self, target: &str) {
@@ -685,10 +836,15 @@ impl SupervisorChildSessions {
                 session_id: identity.session_id,
                 session_dir: String::new(),
                 model: String::new(),
+                thinking_level: None,
+                progress_note: None,
                 label: String::new(),
                 started_at_ms: 0,
                 settled_status: None,
                 settled: false,
+                admission_blocked: false,
+                admission_lock: Arc::new(Mutex::new(())),
+                settle_watch_lock: Arc::new(Mutex::new(())),
                 answer_preview: None,
                 answer_text: None,
                 answer_captured: false,
@@ -710,6 +866,25 @@ impl SupervisorChildSessions {
                 last_emitted_status: None,
                 rename_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             })));
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn prepare_admission_display_for_test(&self, target: &str, dir: &Path) {
+        let record = self.inner.find_record(target).await.unwrap();
+        let mut row = record.lock().await;
+        row.session_dir = dir.to_string_lossy().into_owned();
+        row.session_file = Some(dir.join("child.jsonl").to_string_lossy().into_owned());
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("rlm-subagent.json"),
+            json!({
+                "type": "rlm_subagent", "childId": row.rlm_child_id,
+                "sessionDir": row.session_dir, "sessionFile": row.session_file,
+                "status": "completed"
+            })
+            .to_string(),
+        )
+        .unwrap();
     }
 
     /// Set only the inherited model selector (the engine resolves its
@@ -771,7 +946,7 @@ impl SupervisorChildSessions {
             duration_ms: Some(now_ms().saturating_sub(record.started_at_ms)),
             answer_preview: record.answer_preview.clone(),
             replied_since_task: None,
-            progress_note: None,
+            progress_note: record.progress_note.clone(),
             label: (!record.label.is_empty()).then(|| record.label.clone()),
             last_activity_at: Some(record.started_at_ms),
             activity_stale_ms: None,

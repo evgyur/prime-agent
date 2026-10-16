@@ -207,16 +207,32 @@ impl AgentMessageController for LinkAgentMessageController {
         if input.target == self.active_session_id {
             anyhow::bail!("Agent messaging cannot target the sending session");
         }
-        // A delivery to one of this session's own children starts a follow-up turn there:
-        // re-arm that child's usage observation BEFORE the delivery (a fast child can
-        // settle before the await returns; a late-armed observation never bills).
-        if let Some(children) = &self.children {
+        let admission = if let Some(children) = &self.children {
             children.observe_child_usage(&input.target).await;
-        }
-        let receipt = match self.deliver_direct(&input).await {
-            DirectDelivery::Delivered(receipt) => receipt,
-            DirectDelivery::Unavailable => self.deliver_via_supervisor(input.clone()).await?,
-            DirectDelivery::Failed(error) => return Err(anyhow::anyhow!(error)),
+            children.begin_child_admission(&input.target).await?
+        } else {
+            None
+        };
+        let outcome = match self.deliver_direct(&input).await {
+            DirectDelivery::Delivered(receipt) => Ok(receipt),
+            DirectDelivery::Unavailable => self.deliver_via_supervisor(input.clone()).await,
+            DirectDelivery::Rejected(error) => Err(DeliveryFailure::Rejected(error)),
+            DirectDelivery::Unknown(error) => Err(DeliveryFailure::Unknown(error)),
+        };
+        let receipt = match outcome {
+            Ok(receipt) => {
+                if let Some(admission) = admission {
+                    admission.accepted().await;
+                }
+                receipt
+            }
+            Err(DeliveryFailure::Rejected(error)) => {
+                if let Some(admission) = admission {
+                    admission.rejected().await?;
+                }
+                return Err(anyhow::anyhow!(error));
+            }
+            Err(DeliveryFailure::Unknown(error)) => return Err(anyhow::anyhow!(error)),
         };
         Ok(receipt)
     }
@@ -231,7 +247,13 @@ enum DirectDelivery {
     Unavailable,
     /// The attempt reached the target and is final: the grant burned, so
     /// the error surfaces instead of a fallback.
-    Failed(String),
+    Rejected(String),
+    Unknown(String),
+}
+
+enum DeliveryFailure {
+    Rejected(String),
+    Unknown(String),
 }
 
 impl LinkAgentMessageController {
@@ -269,13 +291,13 @@ impl LinkAgentMessageController {
         .await
         {
             crate::peer_client::PeerDeliveryOutcome::NotEstablished => DirectDelivery::Unavailable,
-            crate::peer_client::PeerDeliveryOutcome::Lost => DirectDelivery::Failed(
+            crate::peer_client::PeerDeliveryOutcome::Lost => DirectDelivery::Unknown(
                 "Peer delivery to the target session was sent but not acknowledged".to_string(),
             ),
             crate::peer_client::PeerDeliveryOutcome::Answered(response) => {
                 let response = *response;
                 if !response.success {
-                    return DirectDelivery::Failed(
+                    return DirectDelivery::Rejected(
                         response
                             .error
                             .unwrap_or_else(|| "Agent message was not accepted".to_string()),
@@ -287,7 +309,7 @@ impl LinkAgentMessageController {
                     .and_then(|data| receipt_from_wire(data, input.clone()))
                 {
                     Some(receipt) => DirectDelivery::Delivered(receipt),
-                    None => DirectDelivery::Failed(
+                    None => DirectDelivery::Unknown(
                         "Target session returned an invalid agent-message receipt".to_string(),
                     ),
                 }
@@ -299,10 +321,10 @@ impl LinkAgentMessageController {
     async fn deliver_via_supervisor(
         &self,
         input: AgentMessageSendInput,
-    ) -> anyhow::Result<AgentMessageReceipt> {
-        let data = self
+    ) -> Result<AgentMessageReceipt, DeliveryFailure> {
+        let response = self
             .link
-            .request_success(
+            .request(
                 json!({
                     "type": "send_message",
                     "targetActiveSessionId": input.target,
@@ -312,9 +334,24 @@ impl LinkAgentMessageController {
                 }),
                 std::time::Duration::from_secs(30),
             )
-            .await?;
-        receipt_from_wire(&data, input)
-            .ok_or_else(|| anyhow::anyhow!("Supervisor returned an invalid agent-message receipt"))
+            .await
+            .map_err(|error| DeliveryFailure::Unknown(error.to_string()))?;
+        if !response.success {
+            return Err(DeliveryFailure::Rejected(
+                response
+                    .error
+                    .unwrap_or_else(|| "Agent message was not accepted".to_string()),
+            ));
+        }
+        response
+            .data
+            .as_ref()
+            .and_then(|data| receipt_from_wire(data, input))
+            .ok_or_else(|| {
+                DeliveryFailure::Unknown(
+                    "Supervisor returned an invalid agent-message receipt".to_string(),
+                )
+            })
     }
 
     /// This session's durable family identity from its own pushed summary.

@@ -644,6 +644,7 @@ fn display_entries_round_trip_and_tombstones_stick() {
         spawn_code: None,
         model: Some(json!({"provider": "p", "modelId": "m"})),
         status: "running".into(),
+        admission_unresolved: None,
         created_at: 1,
     };
     assert!(write_rlm_subagent_display(&entry).unwrap());
@@ -672,6 +673,7 @@ fn display_entry_file_is_owner_only() {
         spawn_code: None,
         model: None,
         status: "running".into(),
+        admission_unresolved: None,
         created_at: 1,
     };
     assert!(write_rlm_subagent_display(&entry).unwrap());

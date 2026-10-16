@@ -22,6 +22,12 @@ enum FakeKill {
 #[derive(Clone, Copy)]
 enum FakeChild {
     Healthy,
+    GatedAnswer,
+    GatedFailureAnswer,
+    GatedNotice,
+    ProgressSummary,
+    /// A state read never answers; collect must enforce its own deadline.
+    StateHangs,
     PromptFails,
     Unreachable,
     /// The first `get_last_assistant_text` reads no text (the settle raced
@@ -41,6 +47,15 @@ enum FakeChild {
 /// deliveries). `idle_delay_ms` paces `wait_for_idle` so a test can act
 /// while the child is still "running". `child` scripts the child link
 /// (`FakeChild`).
+static RETASK_NOTICE_STARTED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+static RETASK_NOTICE_RELEASE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+static RETASK_FAILURE_ANSWER_STARTED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+static RETASK_FAILURE_ANSWER_RELEASE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+static RETASK_ANSWER_STARTED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+static RETASK_ANSWER_RELEASE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
 async fn spawn_fake_supervisor(
     socket: std::path::PathBuf,
     follow_up_tx: mpsc::UnboundedSender<Value>,
@@ -102,6 +117,10 @@ async fn spawn_fake_supervisor(
                     let command = value["command"].clone();
                     let command_type: &str = command["type"].as_str().unwrap_or_default();
                     let response = match command_type {
+                        "get_state" if matches!(child, FakeChild::StateHangs) => {
+                            std::future::pending::<()>().await;
+                            unreachable!("the scripted state read never returns");
+                        }
                         _ if matches!(
                             (child, command_type),
                             (FakeChild::PromptFails, "prompt")
@@ -164,6 +183,17 @@ async fn spawn_fake_supervisor(
                             }
                             response_success(Some(&id), command_type, None)
                         }
+                        "get_state" if matches!(child, FakeChild::ProgressSummary) => {
+                            let notes =
+                                pa_core::session_engine::rlm_host::RlmProgressNotes::default();
+                            assert!(notes.note("checking the consumer", 7).accepted);
+                            let mut summary =
+                                json!({"isStreaming": true, "thinkingLevel": "medium"});
+                            if state_reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                                summary["progressNote"] = json!(notes.latest_note().unwrap().0);
+                            }
+                            response_success(Some(&id), command_type, Some(summary))
+                        }
                         "get_state" => response_success(
                             Some(&id),
                             command_type,
@@ -174,6 +204,14 @@ async fn spawn_fake_supervisor(
                             })),
                         ),
                         "get_last_assistant_text" => {
+                            if matches!(child, FakeChild::GatedAnswer) {
+                                RETASK_ANSWER_STARTED.notify_one();
+                                RETASK_ANSWER_RELEASE.notified().await;
+                            }
+                            if matches!(child, FakeChild::GatedFailureAnswer) {
+                                RETASK_FAILURE_ANSWER_STARTED.notify_one();
+                                RETASK_FAILURE_ANSWER_RELEASE.notified().await;
+                            }
                             // The settle capture: with the knob set, the
                             // worker leaves right after its final answer.
                             if matches!(child, FakeChild::LeavesAfterSettle) {
@@ -215,6 +253,10 @@ async fn spawn_fake_supervisor(
                             }
                         }
                         "follow_up" => {
+                            if matches!(child, FakeChild::GatedNotice) {
+                                RETASK_NOTICE_STARTED.notify_one();
+                                RETASK_NOTICE_RELEASE.notified().await;
+                            }
                             let _ = follow_up_tx.send(command.clone());
                             response_success(
                                 Some(&id),
@@ -340,6 +382,237 @@ async fn roster_snapshot_does_not_wait_for_a_slow_child_worker() {
         .expect("roster snapshot");
     assert_eq!(roster.len(), 1);
     assert_eq!(roster[0].status, "running");
+}
+
+#[tokio::test]
+async fn collect_zero_timeout_returns_a_cached_snapshot_without_worker_rpc() {
+    let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
+    let (sessions, _kill_rx) =
+        sessions_with_fake_supervisor(follow_up_tx, 0, FakeKill::Success, FakeChild::StateHangs)
+            .await;
+    sessions
+        .push_test_child(RlmChildIdentity {
+            rlm_child_id: "child-id".to_string(),
+            active_session_id: "child-live".to_string(),
+            session_id: Some("child-file".to_string()),
+            session_name: "slow-child".to_string(),
+        })
+        .await;
+    let results = tokio::time::timeout(
+        Duration::from_millis(100),
+        sessions.collect(vec!["child-id".to_string()], 0),
+    )
+    .await
+    .expect("zero-timeout collect must not wait for a worker")
+    .expect("collect cached child");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].status, "running");
+}
+
+#[tokio::test]
+async fn collect_positive_timeout_bounds_worker_refresh() {
+    let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
+    let (sessions, _kill_rx) =
+        sessions_with_fake_supervisor(follow_up_tx, 0, FakeKill::Success, FakeChild::StateHangs)
+            .await;
+    sessions
+        .push_test_child(RlmChildIdentity {
+            rlm_child_id: "child-id".to_string(),
+            active_session_id: "child-live".to_string(),
+            session_id: Some("child-file".to_string()),
+            session_name: "slow-child".to_string(),
+        })
+        .await;
+    sessions
+        .push_test_child(RlmChildIdentity {
+            rlm_child_id: "child-two".to_string(),
+            active_session_id: "child-two-live".to_string(),
+            session_id: Some("child-two-file".to_string()),
+            session_name: "second-slow-child".to_string(),
+        })
+        .await;
+    let results =
+        tokio::time::timeout(Duration::from_millis(250), sessions.collect(Vec::new(), 10))
+            .await
+            .expect("collect deadline must include worker refresh")
+            .expect("collect timed-out child snapshot");
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|result| result.status == "running"));
+}
+
+#[tokio::test]
+async fn retask_admission_waits_for_unreachable_exit_capture_and_tail() {
+    let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
+    let (sessions, _) = sessions_with_fake_supervisor(
+        follow_up_tx,
+        0,
+        FakeKill::Success,
+        FakeChild::GatedFailureAnswer,
+    )
+    .await;
+    sessions
+        .push_test_child(RlmChildIdentity {
+            rlm_child_id: "failed-gated".into(),
+            active_session_id: "child-live".into(),
+            session_id: Some("child-file".into()),
+            session_name: "failed-gated".into(),
+        })
+        .await;
+    let dir = tempfile::TempDir::new().unwrap();
+    sessions
+        .prepare_admission_display_for_test("failed-gated", dir.path())
+        .await;
+    let record = sessions.inner.find_record("failed-gated").await.unwrap();
+    let inner = Arc::clone(&sessions.inner);
+    let row = Arc::clone(&record);
+    let failure = tokio::spawn(async move {
+        inner
+            .settle_failed(
+                &row,
+                "unreachable".into(),
+                super::lifecycle::FailedArm::Unreachable,
+            )
+            .await
+    });
+    RETASK_FAILURE_ANSWER_STARTED.notified().await;
+    let mut begin = Box::pin(sessions.begin_child_admission("failed-gated"));
+    assert!(matches!(
+        futures::poll!(begin.as_mut()),
+        std::task::Poll::Pending
+    ));
+    RETASK_FAILURE_ANSWER_RELEASE.notify_one();
+    assert!(failure.await.unwrap());
+    let admission = begin.await.unwrap().unwrap();
+    let current = sessions.collect(vec![], 0).await.unwrap();
+    assert!(!current[0].settled);
+    assert_eq!(current[0].answer_text, None);
+    assert_eq!(current[0].error, None);
+    drop(admission);
+}
+
+#[tokio::test]
+async fn retask_unreachable_failure_cannot_capture_or_settle_an_unresolved_admission() {
+    let (follow_up_tx, mut follow_up_rx) = mpsc::unbounded_channel();
+    let (sessions, _) =
+        sessions_with_fake_supervisor(follow_up_tx, 0, FakeKill::Success, FakeChild::Healthy).await;
+    sessions
+        .push_test_child(RlmChildIdentity {
+            rlm_child_id: "unknown".into(),
+            active_session_id: "child-live".into(),
+            session_id: Some("child-file".into()),
+            session_name: "unknown".into(),
+        })
+        .await;
+    let dir = tempfile::TempDir::new().unwrap();
+    sessions
+        .prepare_admission_display_for_test("unknown", dir.path())
+        .await;
+    let admission = sessions
+        .begin_child_admission("unknown")
+        .await
+        .unwrap()
+        .unwrap();
+    let record = sessions.inner.find_record("unknown").await.unwrap();
+    let inner = Arc::clone(&sessions.inner);
+    let row = Arc::clone(&record);
+    let mut failure = tokio::spawn(async move {
+        inner
+            .settle_failed(
+                &row,
+                "unreachable".into(),
+                super::lifecycle::FailedArm::Unreachable,
+            )
+            .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut failure)
+            .await
+            .is_err()
+    );
+    drop(admission);
+    assert!(!failure.await.unwrap());
+    let row = record.lock().await;
+    assert!(!row.settled);
+    assert_eq!(row.settled_status, None);
+    assert_eq!(row.answer_text, None);
+    assert!(!row.notice_delivered);
+    assert!(follow_up_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn retask_admission_waits_for_old_answer_capture_then_invalidates_it() {
+    let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
+    let (sessions, _kill_rx) =
+        sessions_with_fake_supervisor(follow_up_tx, 0, FakeKill::Success, FakeChild::GatedAnswer)
+            .await;
+    sessions
+        .push_test_child(RlmChildIdentity {
+            rlm_child_id: "gated-child".to_string(),
+            active_session_id: "child-live".to_string(),
+            session_id: Some("child-file".to_string()),
+            session_name: "gated-child".to_string(),
+        })
+        .await;
+    let display_dir = tempfile::TempDir::new().unwrap();
+    sessions
+        .prepare_admission_display_for_test("gated-child", display_dir.path())
+        .await;
+    let observer = sessions.clone();
+    let collecting = tokio::spawn(async move { observer.collect(vec![], 1_000).await.unwrap() });
+    RETASK_ANSWER_STARTED.notified().await;
+    let mut begin = Box::pin(sessions.begin_child_admission("gated-child"));
+    assert!(matches!(
+        futures::poll!(begin.as_mut()),
+        std::task::Poll::Pending
+    ));
+    RETASK_ANSWER_RELEASE.notify_one();
+    collecting.await.unwrap();
+    let admission = begin.await.unwrap().unwrap();
+    let current = sessions.collect(vec![], 0).await.unwrap();
+    assert_eq!(current[0].status, "running");
+    assert_eq!(current[0].answer_text, None);
+    drop(admission);
+    let unresolved = sessions.collect(vec![], 10).await.unwrap();
+    assert!(
+        !unresolved[0].settled,
+        "cancelled admission cannot close from idle old answer"
+    );
+}
+
+#[tokio::test]
+async fn retask_admission_waits_for_old_notice_tail_before_reopening() {
+    let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
+    let (sessions, _kill_rx) =
+        sessions_with_fake_supervisor(follow_up_tx, 0, FakeKill::Success, FakeChild::GatedNotice)
+            .await;
+    let child = spawn_child(&sessions).await;
+    let (hook_tx, mut hook_rx) = mpsc::unbounded_channel();
+    sessions.set_settle_hook(Arc::new(move || {
+        let _ = hook_tx.send(());
+    }));
+    sessions.notify_turn_done();
+    RETASK_NOTICE_STARTED.notified().await;
+    let display_dir = tempfile::TempDir::new().unwrap();
+    sessions
+        .prepare_admission_display_for_test(&child.rlm_child_id, display_dir.path())
+        .await;
+    let mut begin = Box::pin(sessions.begin_child_admission(&child.rlm_child_id));
+    assert!(matches!(
+        futures::poll!(begin.as_mut()),
+        std::task::Poll::Pending
+    ));
+    RETASK_NOTICE_RELEASE.notify_one();
+    let admission = begin.await.unwrap().unwrap();
+    hook_rx.recv().await.unwrap();
+    let current = sessions.collect(vec![], 0).await.unwrap();
+    assert_eq!(current[0].status, "running");
+    assert!(!current[0].settled);
+    assert_eq!(current[0].answer_text, None);
+    drop(admission);
+    assert!(matches!(
+        hook_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
 }
 
 #[tokio::test]
@@ -648,7 +921,7 @@ async fn a_collect_inside_the_prompt_failure_window_does_not_swallow_the_failure
         .await
         .prompt_admitted = true;
     let misread = sessions
-        .collect(vec![handle.rlm_child_id.clone()], 0)
+        .collect(vec![handle.rlm_child_id.clone()], 1_000)
         .await
         .expect("collect inside the window");
     assert_eq!(
@@ -1118,10 +1391,10 @@ async fn a_none_first_answer_capture_recovers_on_a_later_collect() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    // A later collect refreshes the row and the answer lands: the settle
-    // verdict is one-shot, the capture is not.
+    // A positive-budget collect refreshes the row and the answer lands;
+    // zero-budget collection only reads the cached snapshot.
     let results = sessions
-        .collect(vec![handle.rlm_child_id.clone()], 0)
+        .collect(vec![handle.rlm_child_id.clone()], 1_000)
         .await
         .expect("collect the settled child");
     assert_eq!(results[0].status, "done");
@@ -1244,10 +1517,15 @@ fn an_already_settled_child_never_re_scores_as_an_unreachable_error() {
         session_id: Some("child-file".to_string()),
         session_dir: "/tmp".to_string(),
         model: String::new(),
+        thinking_level: None,
+        progress_note: None,
         label: "task".to_string(),
         started_at_ms: 0,
         settled_status: None,
         settled: false,
+        admission_blocked: false,
+        admission_lock: Arc::new(Mutex::new(())),
+        settle_watch_lock: Arc::new(Mutex::new(())),
         answer_preview: None,
         answer_text: None,
         answer_captured: false,
@@ -1312,10 +1590,15 @@ async fn the_unreachable_give_up_skips_the_exit_capture_when_a_capture_stands() 
         session_id: Some("child-file".to_string()),
         session_dir: "/tmp".to_string(),
         model: String::new(),
+        thinking_level: None,
+        progress_note: None,
         label: "task".to_string(),
         started_at_ms: 0,
         settled_status: None,
         settled: false,
+        admission_blocked: false,
+        admission_lock: Arc::new(Mutex::new(())),
+        settle_watch_lock: Arc::new(Mutex::new(())),
         answer_preview: Some("the captured say".to_string()),
         answer_text: Some("the captured say".to_string()),
         answer_captured: true,
@@ -1364,4 +1647,67 @@ async fn the_unreachable_give_up_skips_the_exit_capture_when_a_capture_stands() 
     assert_eq!(record.answer_preview.as_deref(), Some("the captured say"));
     assert_eq!(record.answer_text.as_deref(), Some("the captured say"));
     assert!(record.answer_captured);
+}
+
+#[tokio::test]
+async fn child_progress_projection_retains_real_note_and_clears_on_fresh_summary() {
+    let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
+    let (sessions, _) = sessions_with_fake_supervisor(
+        follow_up_tx,
+        0,
+        FakeKill::Success,
+        FakeChild::ProgressSummary,
+    )
+    .await;
+    sessions
+        .push_test_child(RlmChildIdentity {
+            rlm_child_id: "child-id".into(),
+            active_session_id: "child-live".into(),
+            session_id: Some("child-file".into()),
+            session_name: "note-child".into(),
+        })
+        .await;
+    assert!(sessions.inner.child_busy("child-live").await.unwrap());
+    let wire = sessions.child_snapshots().await;
+    assert_eq!(wire[0]["thinkingLevel"], "medium");
+    assert_eq!(wire[0]["progressNote"], "checking the consumer");
+    assert_eq!(
+        sessions.list_subagents().await.unwrap()[0]
+            .progress_note
+            .as_deref(),
+        Some("checking the consumer")
+    );
+    assert!(sessions.inner.child_busy("child-live").await.unwrap());
+    assert!(sessions.child_snapshots().await[0]
+        .get("progressNote")
+        .is_none());
+    assert!(sessions.list_subagents().await.unwrap()[0]
+        .progress_note
+        .is_none());
+}
+
+#[tokio::test]
+async fn failed_child_summary_retains_cached_progress_without_new_freshness() {
+    let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
+    let (sessions, _) =
+        sessions_with_fake_supervisor(follow_up_tx, 0, FakeKill::Success, FakeChild::Unreachable)
+            .await;
+    sessions
+        .push_test_child(RlmChildIdentity {
+            rlm_child_id: "child-id".into(),
+            active_session_id: "child-live".into(),
+            session_id: Some("child-file".into()),
+            session_name: "note-child".into(),
+        })
+        .await;
+    let record = sessions.inner.find_record("child-live").await.unwrap();
+    record
+        .lock()
+        .await
+        .observe_summary(&json!({"thinkingLevel":"high", "progressNote":"last observation"}));
+    assert!(sessions.inner.child_busy("child-live").await.is_err());
+    let wire = sessions.child_snapshots().await;
+    assert_eq!(wire[0]["progressNote"], "last observation");
+    assert_eq!(wire[0]["thinkingLevel"], "high");
+    assert!(wire[0].get("lastActivityAt").is_none());
 }

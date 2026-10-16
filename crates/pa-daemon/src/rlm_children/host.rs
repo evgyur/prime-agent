@@ -156,10 +156,15 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     session_id: created.session_id.clone(),
                     session_dir: created.session_dir.clone(),
                     model: model.clone(),
+                    thinking_level: None,
+                    progress_note: None,
                     label: rlm_child_label(&request.prompt),
                     started_at_ms: now_ms(),
                     settled_status: None,
                     settled: false,
+                    admission_blocked: false,
+                    admission_lock: Arc::new(Mutex::new(())),
+                    settle_watch_lock: Arc::new(Mutex::new(())),
                     answer_preview: None,
                     answer_text: None,
                     answer_captured: false,
@@ -538,24 +543,27 @@ impl RlmSubagentHost for SupervisorChildSessions {
             let deadline = Instant::now() + Duration::from_millis(timeout_ms);
             let mut results = Vec::with_capacity(records.len());
             for record in &records {
-                this.refresh_record(record).await;
-                // A settled child that is busy again runs a follow-up turn:
-                // re-arm usage observation (the task-run watcher retired at
-                // its settle).
-                if record.lock().await.settled_status.is_some() {
-                    let active_session_id = record.lock().await.active_session_id.clone();
-                    if matches!(this.child_busy(&active_session_id).await, Ok(true)) {
-                        SupervisorChildSessionsInner::arm_usage_watch(&this, record).await;
-                    }
-                }
-                let still_running = record.lock().await.settled_status.is_none();
-                if still_running {
-                    // Wait inside the shared budget, then re-read the child:
-                    // a timeout yields the current snapshot, never an error.
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    let active_session_id = record.lock().await.active_session_id.clone();
-                    this.wait_for_child(&active_session_id, remaining).await;
-                    this.refresh_record(record).await;
+                // A zero budget is a cached snapshot. All worker observation for a
+                // positive budget shares one deadline, including answer capture.
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if !remaining.is_zero() {
+                    let _ = tokio::time::timeout(remaining, async {
+                        this.refresh_record(record).await;
+                        // A settled child may be running a follow-up turn.
+                        if record.lock().await.settled_status.is_some() {
+                            let active_session_id = record.lock().await.active_session_id.clone();
+                            if matches!(this.child_busy(&active_session_id).await, Ok(true)) {
+                                SupervisorChildSessionsInner::arm_usage_watch(&this, record).await;
+                            }
+                        }
+                        if record.lock().await.settled_status.is_none() {
+                            let remaining = deadline.saturating_duration_since(Instant::now());
+                            let active_session_id = record.lock().await.active_session_id.clone();
+                            this.wait_for_child(&active_session_id, remaining).await;
+                            this.refresh_record(record).await;
+                        }
+                    })
+                    .await;
                 }
                 let result = {
                     let record = record.lock().await;

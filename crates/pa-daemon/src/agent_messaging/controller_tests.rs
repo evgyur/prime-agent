@@ -166,6 +166,372 @@ fn input() -> AgentMessageSendInput {
     }
 }
 
+/// Follow-up admissions through the real controller, with a retained first
+/// task completed through the real collect consumer before each delivery.
+#[derive(Clone, Copy)]
+enum RetaskAdmission {
+    Queued,
+    Rejected,
+    LostAck,
+    MalformedAck,
+    CancelAfterSend,
+    FastFinish,
+}
+
+async fn retask_controller_fixture(
+    admission: RetaskAdmission,
+) -> (
+    tempfile::TempDir,
+    LinkAgentMessageController,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let socket = dir.path().join("retask.sock");
+    let listener = bind_transport(&socket).await.unwrap();
+    let busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let answer = Arc::new(std::sync::Mutex::new("FIRST".to_string()));
+    let sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let send_count = Arc::clone(&sends);
+    let child_registry = Arc::new(std::sync::Mutex::new(
+        None::<Arc<crate::rlm_children::SupervisorChildSessions>>,
+    ));
+    let reply_registry = Arc::clone(&child_registry);
+    tokio::spawn(async move {
+        loop {
+            let Ok(stream) = listener.accept().await else {
+                return;
+            };
+            let busy = Arc::clone(&busy);
+            let answer = Arc::clone(&answer);
+            let sends = Arc::clone(&send_count);
+            let reply_registry = Arc::clone(&reply_registry);
+            tokio::spawn(async move {
+                let (reader, mut writer) = stream.split();
+                let mut reader = BufReader::new(reader);
+                writer
+                    .write_all(b"{\"type\":\"daemon_hello\"}\n")
+                    .await
+                    .unwrap();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap() == 0 {
+                        return;
+                    }
+                    let value: Value = serde_json::from_str(&line).unwrap();
+                    let id = value["id"].as_str().unwrap();
+                    let command = &value["command"];
+                    let kind = command["type"].as_str().unwrap();
+                    let response = match kind {
+                        "get_worker_peer_transport" => {
+                            response_failure(Some(id), kind, "no peer", None)
+                        }
+                        "get_state" => response_success(
+                            Some(id),
+                            kind,
+                            Some(json!({
+                                "isStreaming": false,
+                                "sessionActions": { "queuedCount": usize::from(busy.load(std::sync::atomic::Ordering::SeqCst)) }
+                            })),
+                        ),
+                        "get_last_assistant_text" => response_success(
+                            Some(id),
+                            kind,
+                            Some(json!({
+                                "text": answer.lock().unwrap().clone()
+                            })),
+                        ),
+                        "wait_for_idle" => {
+                            if busy.load(std::sync::atomic::Ordering::SeqCst) {
+                                std::future::pending::<()>().await;
+                            }
+                            response_success(Some(id), kind, None)
+                        }
+                        "send_message" => {
+                            sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            match admission {
+                                RetaskAdmission::Rejected => {
+                                    response_failure(Some(id), kind, "admission rejected", None)
+                                }
+                                RetaskAdmission::LostAck => {
+                                    busy.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    return;
+                                }
+                                RetaskAdmission::MalformedAck => {
+                                    busy.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    response_success(
+                                        Some(id),
+                                        kind,
+                                        Some(json!({ "invalid": true })),
+                                    )
+                                }
+                                RetaskAdmission::CancelAfterSend => {
+                                    busy.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    std::future::pending::<()>().await;
+                                    unreachable!("delivery acknowledgement is gated forever");
+                                }
+                                RetaskAdmission::Queued | RetaskAdmission::FastFinish => {
+                                    let fast = matches!(admission, RetaskAdmission::FastFinish);
+                                    busy.store(!fast, std::sync::atomic::Ordering::SeqCst);
+                                    if fast {
+                                        *answer.lock().unwrap() = "SECOND".to_string();
+                                        let registry =
+                                            reply_registry.lock().unwrap().clone().unwrap();
+                                        registry.mark_replied("bbb222").await;
+                                    }
+                                    response_success(
+                                        Some(id),
+                                        kind,
+                                        Some(json!({
+                                            "id": "retask-receipt", "target": { "activeSessionId": "bbb222", "sessionId": "sess-b" },
+                                            "deliveryStatus": if fast { "delivered" } else { "queued" },
+                                            "message": command["message"]
+                                        })),
+                                    )
+                                }
+                            }
+                        }
+                        other => response_failure(Some(id), other, "unexpected command", None),
+                    };
+                    let mut encoded = serde_json::to_string(&response).unwrap();
+                    encoded.push('\n');
+                    if writer.write_all(encoded.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    let controller = controller_with_children(socket, own_summary());
+    *child_registry.lock().unwrap() = controller.children.clone();
+    admit_child(
+        &controller,
+        RlmChildIdentity {
+            rlm_child_id: "sub-retask".to_string(),
+            active_session_id: "bbb222".to_string(),
+            session_id: Some("sess-b".to_string()),
+            session_name: "retask-child".to_string(),
+        },
+    )
+    .await;
+    let children = controller.children.as_ref().unwrap();
+    children
+        .prepare_admission_display_for_test("sub-retask", &dir.path().join("child"))
+        .await;
+    let first = pa_core::session_engine::rlm_host::RlmSubagentHost::collect(
+        children.as_ref(),
+        vec!["sub-retask".to_string()],
+        100,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first[0].status, "done");
+    assert_eq!(first[0].answer_text.as_deref(), Some("FIRST"));
+    (dir, controller, sends)
+}
+
+#[tokio::test]
+async fn retask_controller_display_write_failure_prevents_send() {
+    let (dir, controller, sends) = retask_controller_fixture(RetaskAdmission::Queued).await;
+    let display = dir.path().join("child/rlm-subagent.json");
+    use std::os::unix::fs::PermissionsExt;
+    let child_dir = display.parent().unwrap();
+    std::fs::set_permissions(child_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let result = controller.send_agent_message(input()).await;
+    std::fs::set_permissions(child_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(result.is_err());
+    assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let current = pa_core::session_engine::rlm_host::RlmSubagentHost::collect(
+        controller.children.as_ref().unwrap().as_ref(),
+        vec!["sub-retask".into()],
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(current[0].answer_text.as_deref(), Some("FIRST"));
+    assert!(current[0].settled);
+}
+
+#[tokio::test]
+async fn retask_controller_identity_mismatch_prevents_send() {
+    let (dir, controller, sends) = retask_controller_fixture(RetaskAdmission::Queued).await;
+    let mut display =
+        crate::rlm_ledger::read_rlm_subagent_display(&dir.path().join("child")).unwrap();
+    display.child_id = "foreign-child".into();
+    crate::rlm_ledger::write_rlm_subagent_display(&display).unwrap();
+    assert!(controller.send_agent_message(input()).await.is_err());
+    assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn retask_controller_qualified_settle_clears_marker() {
+    let (dir, controller, _) = retask_controller_fixture(RetaskAdmission::FastFinish).await;
+    let children = controller.children.as_ref().unwrap();
+    let settled = children.settle_notified();
+    controller.send_agent_message(input()).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), settled)
+        .await
+        .unwrap();
+    let display = crate::rlm_ledger::read_rlm_subagent_display(&dir.path().join("child")).unwrap();
+    assert_eq!(display.admission_unresolved, None);
+    assert_eq!(display.status, "completed");
+}
+
+#[tokio::test]
+async fn retask_controller_tombstone_prevents_send() {
+    let (dir, controller, sends) = retask_controller_fixture(RetaskAdmission::Queued).await;
+    let mut display =
+        crate::rlm_ledger::read_rlm_subagent_display(&dir.path().join("child")).unwrap();
+    display.status = "deleted".into();
+    crate::rlm_ledger::write_rlm_subagent_display(&display).unwrap();
+    assert!(controller.send_agent_message(input()).await.is_err());
+    assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn retask_controller_queued_admission_invalidates_prior_completion() {
+    let (_dir, controller, sends) = retask_controller_fixture(RetaskAdmission::Queued).await;
+    controller.send_agent_message(input()).await.unwrap();
+    let children = controller.children.as_ref().unwrap();
+    let result = pa_core::session_engine::rlm_host::RlmSubagentHost::collect(
+        children.as_ref(),
+        vec!["sub-retask".to_string()],
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(result[0].status, "running");
+    assert!(!result[0].settled);
+    assert_eq!(result[0].answer_text, None);
+}
+
+#[tokio::test]
+async fn retask_controller_rejected_admission_preserves_prior_completion() {
+    let (dir, controller, sends) = retask_controller_fixture(RetaskAdmission::Rejected).await;
+    assert!(controller.send_agent_message(input()).await.is_err());
+    let children = controller.children.as_ref().unwrap();
+    let result = pa_core::session_engine::rlm_host::RlmSubagentHost::collect(
+        children.as_ref(),
+        vec!["sub-retask".to_string()],
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(result[0].status, "done");
+    assert_eq!(result[0].answer_text.as_deref(), Some("FIRST"));
+    assert_eq!(
+        crate::rlm_ledger::read_rlm_subagent_display(&dir.path().join("child"))
+            .unwrap()
+            .admission_unresolved,
+        None
+    );
+}
+
+#[tokio::test]
+async fn retask_controller_lost_ack_is_not_retried_or_reported_as_prior_completion() {
+    let (dir, controller, sends) = retask_controller_fixture(RetaskAdmission::LostAck).await;
+    assert!(controller.send_agent_message(input()).await.is_err());
+    let children = controller.children.as_ref().unwrap();
+    let result = pa_core::session_engine::rlm_host::RlmSubagentHost::collect(
+        children.as_ref(),
+        vec!["sub-retask".to_string()],
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sends.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "ambiguous send must not repeat"
+    );
+    assert!(
+        !result[0].settled,
+        "lost acknowledgement leaves new work owed"
+    );
+    assert_eq!(result[0].answer_text, None);
+    assert_eq!(
+        crate::rlm_ledger::read_rlm_subagent_display(&dir.path().join("child"))
+            .unwrap()
+            .admission_unresolved,
+        Some(true)
+    );
+}
+
+#[tokio::test]
+async fn retask_controller_fast_finish_captures_new_answer_without_busy_edge() {
+    let (_dir, controller, sends) = retask_controller_fixture(RetaskAdmission::FastFinish).await;
+    controller.send_agent_message(input()).await.unwrap();
+    let children = controller.children.as_ref().unwrap();
+    assert!(
+        children.child_replied_for_test("bbb222").await,
+        "reply callback before receipt must survive accepted admission"
+    );
+    let result = pa_core::session_engine::rlm_host::RlmSubagentHost::collect(
+        children.as_ref(),
+        vec!["sub-retask".to_string()],
+        100,
+    )
+    .await
+    .unwrap();
+    assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(result[0].answer_text.as_deref(), Some("SECOND"));
+}
+
+#[tokio::test]
+async fn retask_controller_malformed_ack_does_not_restore_prior_completion() {
+    let (_dir, controller, sends) = retask_controller_fixture(RetaskAdmission::MalformedAck).await;
+    assert!(controller.send_agent_message(input()).await.is_err());
+    let children = controller.children.as_ref().unwrap();
+    let result = pa_core::session_engine::rlm_host::RlmSubagentHost::collect(
+        children.as_ref(),
+        vec!["sub-retask".to_string()],
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(!result[0].settled);
+    assert_eq!(result[0].answer_text, None);
+}
+
+#[tokio::test]
+async fn retask_controller_cancel_after_send_keeps_work_unresolved() {
+    let (dir, controller, sends) =
+        retask_controller_fixture(RetaskAdmission::CancelAfterSend).await;
+    let mut send = Box::pin(controller.send_agent_message(input()));
+    // Poll the actual send until the fake has received its command; no timer
+    // infers admission and the acknowledgement is never released.
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(send.as_mut(), cx).is_pending());
+        if sends.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+            std::task::Poll::Ready(())
+        } else {
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await;
+    drop(send);
+    let children = controller.children.as_ref().unwrap();
+    let result = pa_core::session_engine::rlm_host::RlmSubagentHost::collect(
+        children.as_ref(),
+        vec!["sub-retask".to_string()],
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(!result[0].settled);
+    assert_eq!(result[0].answer_text, None);
+    assert_eq!(
+        crate::rlm_ledger::read_rlm_subagent_display(&dir.path().join("child"))
+            .unwrap()
+            .admission_unresolved,
+        Some(true)
+    );
+}
+
 #[tokio::test]
 async fn family_reads_siblings_from_the_supervisor_roster() {
     let dir = tempfile::TempDir::new().unwrap();
