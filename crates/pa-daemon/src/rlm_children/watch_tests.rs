@@ -26,6 +26,7 @@ enum FakeChild {
     GatedFailureAnswer,
     GatedNotice,
     ProgressSummary,
+    HeldProgressSummary,
     /// A state read never answers; collect must enforce its own deadline.
     StateHangs,
     PromptFails,
@@ -47,6 +48,11 @@ enum FakeChild {
 /// deliveries). `idle_delay_ms` paces `wait_for_idle` so a test can act
 /// while the child is still "running". `child` scripts the child link
 /// (`FakeChild`).
+static HELD_PROGRESS_WAIT_STARTED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+static HELD_PROGRESS_WAIT_RELEASE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+static HELD_PROGRESS_READY: AtomicBool = AtomicBool::new(false);
+static HELD_PROGRESS_STATE_READS: AtomicU32 = AtomicU32::new(0);
+
 static RETASK_NOTICE_STARTED: tokio::sync::Notify = tokio::sync::Notify::const_new();
 static RETASK_NOTICE_RELEASE: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
@@ -169,6 +175,10 @@ async fn spawn_fake_supervisor(
                         ),
                         "prompt" => response_success(Some(&id), command_type, None),
                         "wait_for_idle" => {
+                            if matches!(child, FakeChild::HeldProgressSummary) {
+                                HELD_PROGRESS_WAIT_STARTED.notify_one();
+                                HELD_PROGRESS_WAIT_RELEASE.notified().await;
+                            }
                             tokio::time::sleep(std::time::Duration::from_millis(idle_delay_ms))
                                 .await;
                             // The quiescence arm also waits out the
@@ -182,6 +192,15 @@ async fn spawn_fake_supervisor(
                                 }
                             }
                             response_success(Some(&id), command_type, None)
+                        }
+                        "get_state" if matches!(child, FakeChild::HeldProgressSummary) => {
+                            HELD_PROGRESS_STATE_READS.fetch_add(1, Ordering::SeqCst);
+                            let mut summary = json!({"isStreaming": true});
+                            if HELD_PROGRESS_READY.load(Ordering::SeqCst) {
+                                summary["thinkingLevel"] = json!("medium");
+                                summary["progressNote"] = json!("note emitted after initial state");
+                            }
+                            response_success(Some(&id), command_type, Some(summary))
                         }
                         "get_state" if matches!(child, FakeChild::ProgressSummary) => {
                             let notes =
@@ -1647,6 +1666,71 @@ async fn the_unreachable_give_up_skips_the_exit_capture_when_a_capture_stands() 
     assert_eq!(record.answer_preview.as_deref(), Some("the captured say"));
     assert_eq!(record.answer_text.as_deref(), Some("the captured say"));
     assert!(record.answer_captured);
+}
+
+#[tokio::test]
+async fn watcher_projects_progress_while_its_existing_idle_wait_is_held() {
+    HELD_PROGRESS_READY.store(false, Ordering::SeqCst);
+    HELD_PROGRESS_STATE_READS.store(0, Ordering::SeqCst);
+    let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
+    let (sessions, _) = sessions_with_fake_supervisor(
+        follow_up_tx,
+        0,
+        FakeKill::Success,
+        FakeChild::HeldProgressSummary,
+    )
+    .await;
+    sessions
+        .push_test_child(RlmChildIdentity {
+            rlm_child_id: "held-progress".into(),
+            active_session_id: "child-live".into(),
+            session_id: Some("child-file".into()),
+            session_name: "held-progress".into(),
+        })
+        .await;
+    let record = sessions.inner.find_record("held-progress").await.unwrap();
+    let inner = Arc::clone(&sessions.inner);
+    let row = Arc::clone(&record);
+    let watcher = tokio::spawn(async move {
+        inner.watch_child_settle(&row).await;
+    });
+    HELD_PROGRESS_WAIT_STARTED.notified().await;
+    let first_observation = tokio::time::timeout(Duration::from_secs(5), async {
+        while HELD_PROGRESS_STATE_READS.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if first_observation.is_err() {
+        watcher.abort();
+        panic!("watcher must observe running state before its held idle wait completes");
+    }
+    assert!(sessions.child_snapshots().await[0]
+        .get("progressNote")
+        .is_none());
+    HELD_PROGRESS_READY.store(true, Ordering::SeqCst);
+    let observed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshots = sessions.child_snapshots().await;
+            if snapshots[0]["progressNote"] == "note emitted after initial state" {
+                assert_eq!(snapshots[0]["thinkingLevel"], "medium");
+                assert_eq!(snapshots[0]["status"], "running");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    watcher.abort();
+    observed.expect("later progress must refresh while the same idle wait stays held");
+    let roster = sessions.list_subagents().await.unwrap();
+    assert_eq!(roster[0].status, "running");
+    assert_eq!(
+        roster[0].progress_note.as_deref(),
+        Some("note emitted after initial state")
+    );
+    assert!(!record.lock().await.settled);
+    assert!(record.lock().await.answer_text.is_none());
 }
 
 #[tokio::test]

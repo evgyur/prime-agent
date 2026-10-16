@@ -488,11 +488,20 @@ impl SupervisorChildSessionsInner {
             let active_session_id = record.lock().await.active_session_id.clone();
             // One bounded idle-wait slice: a timeout while the child still
             // runs re-slices; a returned slice means the queue drained.
-            self.wait_for_child(
+            let idle_wait = self.wait_for_child(
                 &active_session_id,
                 Duration::from_millis(WATCH_WAIT_SLICE_MS),
-            )
-            .await;
+            );
+            tokio::pin!(idle_wait);
+            // Keep live summaries fresh without restarting the outstanding idle wait.
+            loop {
+                tokio::select! {
+                    () = &mut idle_wait => break,
+                    () = tokio::time::sleep(Duration::from_millis(WATCH_POLL_INTERVAL_MS)) => {
+                        self.refresh_record(record).await;
+                    }
+                }
+            }
             self.refresh_record(record).await;
             let settled = record.lock().await.settled_status.is_some();
             if settled {
