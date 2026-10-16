@@ -327,27 +327,31 @@ pub(crate) fn build_headers(
     compat: &ResolvedCompat,
     conversation_id: Option<&str>,
 ) -> Vec<(String, String)> {
+    fn set_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
+        headers.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+        headers.push((name.to_string(), value.to_string()));
+    }
+
     let mut headers: Vec<(String, String)> = Vec::new();
+    set_header(&mut headers, "Authorization", &format!("Bearer {api_key}"));
     for (name, value) in model.headers.iter().flatten() {
-        headers.push((name.clone(), value.clone()));
+        set_header(&mut headers, name, value);
     }
 
     if let Some(session_id) = cache_session_id {
         if compat.send_session_affinity_headers {
-            headers.push(("session_id".into(), session_id.to_string()));
-            headers.push(("x-client-request-id".into(), session_id.to_string()));
-            headers.push(("x-session-affinity".into(), session_id.to_string()));
+            set_header(&mut headers, "session_id", session_id);
+            set_header(&mut headers, "x-client-request-id", session_id);
+            set_header(&mut headers, "x-session-affinity", session_id);
         }
     }
 
     if let Some(options_headers) = options_headers {
         for (name, value) in options_headers {
-            headers.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
-            headers.push((name.clone(), value.clone()));
+            set_header(&mut headers, name, value);
         }
     }
 
-    headers.insert(0, ("Authorization".into(), format!("Bearer {api_key}")));
     let _ = conversation_id;
     headers
 }
@@ -388,6 +392,59 @@ mod tests {
                 name.eq_ignore_ascii_case("X-Prime-Team-ID") && value == "auth-owner-team"
             }),
             "the auth owner's header must ship: {headers:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_authorization_overrides_default_without_case_duplicates() {
+        let mut model = models_generated::get_model("prime-inference", "z-ai/glm-5.3")
+            .expect("the catalog carries a prime-inference model")
+            .clone();
+        model.headers = Some(std::collections::BTreeMap::from([
+            ("Authorization".to_string(), "model-upper".to_string()),
+            ("authorization".to_string(), "model-lower".to_string()),
+            ("X-Probe".to_string(), "model-probe".to_string()),
+        ]));
+        let compat = crate::providers::openai_completions::get_compat(&model);
+
+        let model_headers = build_headers(&model, "default-key", None, None, &compat, None);
+        let model_auth: Vec<_> = model_headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .collect();
+        assert_eq!(model_auth.len(), 1);
+        assert_eq!(model_auth[0].1.as_str(), "model-lower");
+
+        let caller = HashMap::from([
+            ("authorization".to_string(), "caller-token".to_string()),
+            ("x-probe".to_string(), "caller-probe".to_string()),
+        ]);
+        let headers = build_headers(&model, "default-key", Some(&caller), None, &compat, None);
+        let values_for = |key: &str| {
+            headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case(key))
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(values_for("authorization"), vec!["caller-token"]);
+        assert_eq!(values_for("x-probe"), vec!["caller-probe"]);
+
+        let defaults = build_headers(
+            models_generated::get_model("prime-inference", "z-ai/glm-5.3").unwrap(),
+            "default-key",
+            None,
+            None,
+            &compat,
+            None,
+        );
+        assert_eq!(
+            defaults
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Bearer default-key"]
         );
     }
 

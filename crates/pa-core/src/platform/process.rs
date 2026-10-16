@@ -528,6 +528,9 @@ pub fn termination_signal(_status: &std::process::ExitStatus) -> Option<i32> {
 /// The kernel32 termination surface for [`kill_pid`], hand-declared (repo
 /// policy: pinned constants and externs, no windows-sys dependency).
 #[cfg(windows)]
+pub use win32::HeldProcess;
+
+#[cfg(windows)]
 mod win32 {
     #![allow(non_snake_case)]
 
@@ -535,6 +538,17 @@ mod win32 {
 
     /// `winnt.h`: the right to terminate the process.
     const PROCESS_TERMINATE: u32 = 0x0001;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const WAIT_OBJECT_0: u32 = 0;
+    const WAIT_TIMEOUT: u32 = 0x0000_0102;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileTime {
+        dwLowDateTime: u32,
+        dwHighDateTime: u32,
+    }
 
     type Handle = *mut c_void;
 
@@ -542,6 +556,123 @@ mod win32 {
         fn OpenProcess(access: u32, inherit_handle: i32, process_id: usize) -> Handle;
         fn CloseHandle(handle: Handle) -> i32;
         fn TerminateProcess(handle: Handle, exit_code: u32) -> i32;
+        fn GetProcessTimes(
+            handle: Handle,
+            creation_time: *mut FileTime,
+            exit_time: *mut FileTime,
+            kernel_time: *mut FileTime,
+            user_time: *mut FileTime,
+        ) -> i32;
+        fn WaitForSingleObject(handle: Handle, milliseconds: u32) -> u32;
+    }
+
+    /// One exact Windows process pinned by a kernel handle. Keep it through
+    /// identity comparison, termination and exit confirmation: a recycled
+    /// numeric pid cannot redirect an operation on this handle.
+    pub struct HeldProcess {
+        handle: usize,
+        pid: u32,
+    }
+
+    impl HeldProcess {
+        /// Open a query, wait and terminate handle for a process id.
+        #[must_use]
+        pub fn open(pid: u32) -> Option<Self> {
+            if pid == 0 {
+                return None;
+            }
+            let handle = unsafe {
+                OpenProcess(
+                    PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+                    0,
+                    pid as usize,
+                )
+            };
+            (!handle.is_null()).then_some(Self {
+                handle: handle as usize,
+                pid,
+            })
+        }
+
+        fn raw(&self) -> Handle {
+            self.handle as Handle
+        }
+
+        /// Creation-time identity in the same format as `process_start_id`.
+        #[must_use]
+        pub fn start_id(&self) -> Option<String> {
+            let mut creation = FileTime::default();
+            let mut exit = FileTime::default();
+            let mut kernel = FileTime::default();
+            let mut user = FileTime::default();
+            let ok = unsafe {
+                GetProcessTimes(
+                    self.raw(),
+                    &raw mut creation,
+                    &raw mut exit,
+                    &raw mut kernel,
+                    &raw mut user,
+                )
+            };
+            (ok != 0).then(|| {
+                let ticks =
+                    (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+                format!("win:{ticks}")
+            })
+        }
+
+        /// `None` means the kernel wait failed, so death is unproven.
+        #[must_use]
+        pub fn has_exited(&self) -> Option<bool> {
+            match unsafe { WaitForSingleObject(self.raw(), 0) } {
+                WAIT_OBJECT_0 => Some(true),
+                WAIT_TIMEOUT => Some(false),
+                _ => None,
+            }
+        }
+
+        /// Wait up to the stated budget for this exact process to exit.
+        pub async fn wait_for_exit(&self, budget: std::time::Duration) -> bool {
+            let deadline = tokio::time::Instant::now() + budget;
+            loop {
+                match self.has_exited() {
+                    Some(true) => return true,
+                    Some(false) if tokio::time::Instant::now() < deadline => {
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    }
+                    _ => return false,
+                }
+            }
+        }
+
+        /// Request forced termination on the held process; exit still needs
+        /// confirming through `wait_for_exit`.
+        #[must_use]
+        pub fn terminate(&self) -> bool {
+            unsafe { TerminateProcess(self.raw(), 1) != 0 }
+        }
+
+        /// Ask Windows to stop this process and descendants. The verified
+        /// process handle remains open across `taskkill /T`, so its PID cannot
+        /// be reused for a different process during the command. The caller
+        /// must still confirm the root's exit through this handle.
+        pub async fn terminate_tree(&self) -> bool {
+            if self.has_exited() != Some(false) {
+                return false;
+            }
+            let Ok(pid) = i32::try_from(self.pid) else {
+                return false;
+            };
+            tokio::task::spawn_blocking(move || super::kill_process_group_or_pid(pid))
+                .await
+                .unwrap_or(false)
+        }
+    }
+
+    impl Drop for HeldProcess {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.raw()) };
+        }
     }
 
     /// Terminate exactly the pid; false when it could not be proven

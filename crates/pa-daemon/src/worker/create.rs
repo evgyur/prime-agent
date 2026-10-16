@@ -760,10 +760,16 @@ pub(super) fn active_session_id_of(payload: &[u8]) -> String {
         .unwrap_or_default()
 }
 
-pub(super) fn worker_server_capabilities(agent_dir: &std::path::Path) -> Vec<String> {
+pub(super) fn worker_server_capabilities(
+    agent_dir: &std::path::Path,
+    session_scoped_preferences: bool,
+) -> Vec<String> {
     // The factory lane advertises only while its opt-in gate reads
     // enabled (`factory.enabled`, default off).
-    crate::factory_activity::advertised_server_capabilities(agent_dir)
+    crate::protocol::studio_server_capabilities(
+        crate::factory_activity::advertised_server_capabilities(agent_dir),
+        session_scoped_preferences,
+    )
 }
 
 /// RLM depth fields of a create payload: `(depth, max_depth)`. Values must

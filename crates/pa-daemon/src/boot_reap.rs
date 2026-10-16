@@ -18,6 +18,7 @@ const KILL_VERIFY: Duration = Duration::from_secs(1);
 /// Hard deadline after SIGKILL on the intentional-stop path (TS `STOP_FORCE_TIMEOUT`):
 /// a killed worker's teardown may still take before the stop reports the survivor.
 const STOP_FORCE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(not(windows))]
 const POLL: Duration = Duration::from_millis(25);
 
 /// One reap target discovered on this socket.
@@ -45,11 +46,11 @@ pub(crate) enum ReapKind {
 pub(crate) enum ReapOutcome {
     /// The process was gone before any signal.
     AlreadyGone,
-    /// The process exited inside the SIGTERM grace.
+    /// The process exited inside the graceful-stop window.
     Term,
-    /// The process died to SIGKILL.
+    /// The process died to forced termination.
     Kill,
-    /// The process outlived SIGKILL (a D-state wedged task): its lease
+    /// The process could not be proven gone after escalation: its lease
     /// stays held; the operator-facing refusal keeps naming the holder.
     Survived,
 }
@@ -106,7 +107,7 @@ pub(crate) async fn reap_predecessors(supervisor: &Arc<Supervisor>) {
 
 /// Stop one worker process by identity: the terminal-stop escalation (a worker that missed
 /// its routed `shutdown`) on the `STOP_FORCE_TIMEOUT` budget, not the boot reap's fast
-/// verify. `None` as the start id trusts liveness alone.
+/// verify. An unknown start id never authorizes signaling a live process.
 pub(crate) async fn stop_process(pid: u32, start_id: Option<String>) -> ReapOutcome {
     stop_target_within(
         &ReapTarget {
@@ -172,6 +173,7 @@ pub(crate) async fn reap_abandoned_workers(supervisor: &Arc<Supervisor>, worker_
 /// Whether the pid still names the discovered process (the identity gate: a
 /// recycled pid is never signaled). An UNVERIFIABLE identity never signals -
 /// safe for lease retention, not for termination.
+#[cfg(not(windows))]
 fn identity_current(target: &ReapTarget) -> bool {
     match &target.start_id {
         Some(expected) => {
@@ -186,9 +188,10 @@ async fn stop_target(target: &ReapTarget) -> ReapOutcome {
     stop_target_within(target, TERM_GRACE, KILL_VERIFY).await
 }
 
-/// Stop one target with explicit escalation budgets: gone check, SIGTERM,
+/// Stop one Unix target with explicit escalation budgets: gone check, SIGTERM,
 /// grace, SIGKILL, verify. The signals ride the kernel-held pidfd: a pid
 /// recycled in the check-then-signal window never receives the signal.
+#[cfg(not(windows))]
 async fn stop_target_within(
     target: &ReapTarget,
     term_grace: Duration,
@@ -233,6 +236,7 @@ async fn stop_target_within(
 }
 
 /// Poll until the identity-gated pid is gone or the budget runs out.
+#[cfg(not(windows))]
 async fn await_gone(target: &ReapTarget, budget: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + budget;
     loop {
@@ -1030,5 +1034,232 @@ mod tests {
             &interactive,
             "/tmp/sock/daemon.sock"
         ));
+    }
+}
+
+/// Windows has no pidfd. Open one process handle first, compare the creation
+/// timestamp on that same handle, and keep it through exit verification and
+/// termination. A recycled numeric pid can never redirect the termination.
+#[cfg(windows)]
+async fn stop_target_within(
+    target: &ReapTarget,
+    term_grace: Duration,
+    kill_verify: Duration,
+) -> ReapOutcome {
+    use pa_core::platform::process::HeldProcess;
+
+    let Some(process) = HeldProcess::open(target.pid) else {
+        return if crate::lease::is_process_alive(target.pid).unwrap_or(true) {
+            ReapOutcome::Survived
+        } else {
+            ReapOutcome::AlreadyGone
+        };
+    };
+    if process.has_exited() == Some(true) {
+        return ReapOutcome::AlreadyGone;
+    }
+    let Some(expected) = target.start_id.as_deref() else {
+        return ReapOutcome::Survived;
+    };
+    match process.start_id() {
+        Some(actual) if actual == expected => {}
+        Some(_) => return ReapOutcome::AlreadyGone,
+        None => return ReapOutcome::Survived,
+    }
+    // The routed shutdown already asked the worker to exit. Wait for that
+    // grace on the held handle before force termination; Windows has no
+    // SIGTERM equivalent for a detached worker.
+    if process.wait_for_exit(term_grace).await {
+        return ReapOutcome::Term;
+    }
+    // A held process object also pins its numeric PID against reuse while
+    // taskkill traverses the tree. Fall back to the same held root handle if
+    // the Windows tree command cannot run or refuses the process.
+    force_and_verify_held(&process, kill_verify, process.terminate_tree(), || {
+        process.terminate()
+    })
+    .await
+}
+
+/// Force attempts can race natural shutdown. Their return codes are not a
+/// death certificate or a survival certificate: the held process handle is.
+#[cfg(windows)]
+async fn force_and_verify_held<F, C>(
+    process: &pa_core::platform::process::HeldProcess,
+    budget: Duration,
+    terminate_tree: F,
+    terminate_root: C,
+) -> ReapOutcome
+where
+    F: std::future::Future<Output = bool>,
+    C: FnOnce() -> bool,
+{
+    if !terminate_tree.await {
+        let _ = terminate_root();
+    }
+    // taskkill can report failure when a descendant exits during traversal,
+    // and TerminateProcess can refuse a root already tearing down. Neither
+    // status proves survival: wait on the verified handle through the full
+    // deadline before keeping the tombstone.
+    if process.wait_for_exit(budget).await {
+        ReapOutcome::Kill
+    } else {
+        ReapOutcome::Survived
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::os::windows::process::CommandExt;
+
+    struct ReapOnDrop {
+        root: std::process::Child,
+        descendant: Option<pa_core::platform::process::HeldProcess>,
+    }
+
+    impl Drop for ReapOnDrop {
+        fn drop(&mut self) {
+            if let Some(descendant) = &self.descendant {
+                let _ = descendant.terminate();
+            }
+            // The Child owns a process handle, so its pid cannot be recycled
+            // while this fixture-only cleanup asks taskkill to reap children.
+            let _ = pa_core::platform::process::kill_process_group_or_pid(self.root.id() as i32);
+            let _ = self.root.kill();
+            let _ = self.root.wait();
+        }
+    }
+
+    #[test]
+    fn stop_child_fixture() {
+        if std::env::var_os("PRIME_WINDOWS_STOP_CHILD_TREE").is_some() {
+            let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args(["--exact", "boot_reap::windows_tests::stop_child_fixture"])
+                .env_remove("PRIME_WINDOWS_STOP_CHILD_TREE")
+                .env("PRIME_WINDOWS_STOP_CHILD_DESCENDANT", "1")
+                .creation_flags(0x0800_0000)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn descendant");
+            std::fs::write(
+                std::env::var("PRIME_WINDOWS_STOP_CHILD_PID_FILE").expect("pid file"),
+                child.id().to_string(),
+            )
+            .expect("write descendant pid");
+            std::thread::sleep(Duration::from_secs(60));
+        } else if std::env::var_os("PRIME_WINDOWS_STOP_CHILD_FIXTURE").is_some()
+            || std::env::var_os("PRIME_WINDOWS_STOP_CHILD_DESCENDANT").is_some()
+        {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    }
+
+    fn windows_child() -> ReapOnDrop {
+        let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", "boot_reap::windows_tests::stop_child_fixture"])
+            .env("PRIME_WINDOWS_STOP_CHILD_FIXTURE", "1")
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn held Windows child");
+        ReapOnDrop {
+            root: child,
+            descendant: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_live_worker_stops_through_its_held_process_handle() {
+        let guard = windows_child();
+        let pid = guard.root.id();
+        let start_id = crate::lease::get_process_start_id(pid).expect("creation-time identity");
+        assert_eq!(stop_process(pid, Some(start_id)).await, ReapOutcome::Kill);
+        assert!(
+            !crate::lease::is_process_alive(pid).expect("liveness"),
+            "a successful stop proves the held process exited"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_or_unknown_worker_identity_is_never_signaled() {
+        let mut guard = windows_child();
+        let pid = guard.root.id();
+        let stale = format!("{}-stale", crate::lease::get_process_start_id(pid).unwrap());
+        assert_eq!(
+            stop_process(pid, Some(stale)).await,
+            ReapOutcome::AlreadyGone
+        );
+        assert_eq!(stop_process(pid, None).await, ReapOutcome::Survived);
+        assert!(guard.root.try_wait().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn refused_force_commands_still_verify_a_concurrent_exit() {
+        use pa_core::platform::process::HeldProcess;
+
+        let guard = windows_child();
+        let pid = guard.root.id();
+        let held = HeldProcess::open(pid).expect("held worker identity");
+        let killer = HeldProcess::open(pid).expect("fixture cleanup handle");
+        let exit = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                killer.terminate(),
+                "fixture must terminate its exact process"
+            );
+        });
+        assert_eq!(
+            force_and_verify_held(&held, Duration::from_secs(2), async { false }, || false).await,
+            ReapOutcome::Kill,
+            "failed force return codes must not bypass held-handle exit verification"
+        );
+        exit.await.expect("fixture exit task");
+    }
+
+    #[tokio::test]
+    async fn a_forced_stop_reaps_the_worker_descendant_tree() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let pid_file = dir.path().join("descendant.pid");
+        let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", "boot_reap::windows_tests::stop_child_fixture"])
+            .env("PRIME_WINDOWS_STOP_CHILD_TREE", "1")
+            .env("PRIME_WINDOWS_STOP_CHILD_PID_FILE", &pid_file)
+            .creation_flags(0x0800_0000)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn worker fixture");
+        let mut guard = ReapOnDrop {
+            root: child,
+            descendant: None,
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !pid_file.is_file() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "fixture descendant did not start"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let descendant_pid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("descendant pid")
+            .parse()
+            .expect("numeric descendant pid");
+        guard.descendant = pa_core::platform::process::HeldProcess::open(descendant_pid);
+        assert!(
+            guard.descendant.as_ref().and_then(|p| p.has_exited()) == Some(false),
+            "descendant must be live before worker stop"
+        );
+        let pid = guard.root.id();
+        let start_id = crate::lease::get_process_start_id(pid).expect("worker identity");
+        assert_eq!(stop_process(pid, Some(start_id)).await, ReapOutcome::Kill);
+        assert_eq!(
+            guard.descendant.as_ref().and_then(|p| p.has_exited()),
+            Some(true),
+            "forced worker stop must also end its descendant"
+        );
     }
 }

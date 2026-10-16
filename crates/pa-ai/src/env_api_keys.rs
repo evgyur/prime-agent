@@ -11,6 +11,7 @@ pub fn get_api_key_env_vars(provider: &str) -> Option<Vec<&'static str>> {
         other => {
             let env_var = match other {
                 "openai" => "OPENAI_API_KEY",
+                "meta" => "MODEL_API_KEY",
                 "azure-openai-responses" => "AZURE_OPENAI_API_KEY",
                 "prime-inference" => "PRIME_API_KEY",
                 "deepseek" => "DEEPSEEK_API_KEY",

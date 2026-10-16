@@ -11,10 +11,9 @@ use crate::JsonMap;
 
 pub const DAEMON_PROTOCOL_NAME: &str = "prime-agent.daemon";
 pub const DAEMON_PROTOCOL_VERSION: u64 = 7;
-/// Revision 30 publishes `deletedDescendantUsage` on saved-session rows (landing ahead of TS main:
-/// the Rust lifecycle captures the tombstoned child's usage before the unlink).
-pub const DAEMON_SCHEMA_REVISION: u64 = 30;
-pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-30-8e4b17c2a9f5";
+/// Revision 31 adds the compare-and-swap `edit_goal_objective` session command.
+pub const DAEMON_SCHEMA_REVISION: u64 = 31;
+pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-31-d72194ac0355";
 
 pub type DaemonClientId = String;
 pub type DaemonCommandId = String;
@@ -157,6 +156,12 @@ mod tests {
         rt::<DaemonCommandWire>(
             r#"{"type":"command","id":"e1","protocol":{"name":"prime-agent.daemon","version":7},"clientId":"cl","command":{"type":"prompt","activeSessionId":"s1","message":"hi","queueIfBusy":true,"extra":"kept"}}"#,
         );
+        rt::<DaemonCommandWire>(
+            r#"{"type":"edit_goal_objective","activeSessionId":"s1","goalId":"g1","expectedObjective":"old","objective":"new"}"#,
+        );
+        rt::<DaemonCommandWire>(
+            r#"{"type":"control_goal","activeSessionId":"s1","goalId":"g1","expectedObjective":"old","action":"pause"}"#,
+        );
     }
 
     #[test]
@@ -172,8 +177,8 @@ mod tests {
     fn protocol_constants_match_ts() {
         assert_eq!(DAEMON_PROTOCOL_NAME, "prime-agent.daemon");
         assert_eq!(DAEMON_PROTOCOL_VERSION, 7);
-        assert_eq!(DAEMON_SCHEMA_REVISION, 30);
-        assert_eq!(DAEMON_SCHEMA_ID, "protocol-7-schema-30-8e4b17c2a9f5");
+        assert_eq!(DAEMON_SCHEMA_REVISION, 31);
+        assert_eq!(DAEMON_SCHEMA_ID, "protocol-7-schema-31-d72194ac0355");
         assert_eq!(DAEMON_UPDATE_RESTART_FORMAT_VERSION, 1);
     }
 }

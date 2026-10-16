@@ -75,6 +75,42 @@ impl SessionEngine for AgentSessionEngine {
             .unwrap_or(Value::Null)
     }
 
+    fn edit_goal_objective(
+        &self,
+        goal_id: &str,
+        expected_objective: &str,
+        objective: &str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = anyhow::Result<Option<pa_core::goals::GoalState>>>
+                + Send
+                + '_,
+        >,
+    > {
+        let goal_id = goal_id.to_string();
+        let expected_objective = expected_objective.to_string();
+        let objective = objective.to_string();
+        Box::pin(async move {
+            // Create acknowledges before its background prewarm settles. The edit itself
+            // joins that single build gate, without running a model turn.
+            // Mirrored handles exist before adoption restores the durable goal.
+            // Always join the build gate, including that intermediate state.
+            let model = self.resolve_model()?;
+            self.ensure_core_session_async(&model).await?;
+            let handles = self.goal_runtime.lock().expect("goal runtime lock").clone();
+            let handles = handles.ok_or_else(|| {
+                anyhow::anyhow!("Cannot edit objective because this thread has no goal.")
+            })?;
+            let mut driver = handles.driver.lock().await;
+            let mut session = handles.session.lock().await;
+            driver.edit_objective(&mut session, &goal_id, &expected_objective, &objective)
+        })
+    }
+
+    fn mark_goal_edit_published(&self, goal: &pa_core::goals::GoalState) {
+        *self.published_goal.lock().expect("published goal lock") = Some(goal.clone());
+    }
+
     fn mint_post_compaction_goal_continuation(&self) -> Option<crate::engine::GoalContinuation> {
         // The mirrored locks are async, so the mint runs on the engine runtime.
         let handles = self
@@ -577,6 +613,40 @@ impl SessionEngine for AgentSessionEngine {
             "provider": model.provider,
             "reasoning": model.reasoning,
         }))
+    }
+
+    fn control_goal(
+        &self,
+        goal_id: &str,
+        expected_objective: &str,
+        action: pa_core::session_engine::goal_driver::GoalControlAction,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = anyhow::Result<Option<pa_core::goals::GoalState>>>
+                + Send
+                + '_,
+        >,
+    > {
+        let goal_id = goal_id.to_string();
+        let expected_objective = expected_objective.to_string();
+        Box::pin(async move {
+            let model = self.resolve_model()?;
+            self.ensure_core_session_async(&model).await?;
+            let handles = self.goal_runtime.lock().expect("goal runtime lock").clone();
+            let handles = handles.ok_or_else(|| {
+                anyhow::anyhow!("Cannot control goal because this thread has no goal.")
+            })?;
+            let mut driver = handles.driver.lock().await;
+            let mut session = handles.session.lock().await;
+            driver.control_goal(&mut session, &goal_id, &expected_objective, action)
+        })
+    }
+
+    fn session_model_identity(&self) -> (Option<String>, Option<String>) {
+        match self.session_model() {
+            Ok(model) => (Some(model.provider), Some(model.id)),
+            Err(_) => (None, None),
+        }
     }
 
     fn is_quota_parked(&self) -> bool {
@@ -1455,7 +1525,11 @@ impl SessionEngine for AgentSessionEngine {
             return;
         }
         self.run_turns(turn_prompt, aborted, &mut emit);
+        let image_routed = self.armed_image_route().is_some();
         self.clear_image_route();
+        if image_routed {
+            emit(EngineEvent::ModelRestore);
+        }
     }
 
     fn abort_in_flight_turn(&self) {

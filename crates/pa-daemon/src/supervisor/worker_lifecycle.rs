@@ -27,7 +27,7 @@ impl Supervisor {
         self: &Arc<Self>,
         resident: &Arc<ResidentWorker>,
         alive: bool,
-    ) {
+    ) -> bool {
         let kill_stop = resident.descriptor.lock().await.archive_on_stop == Some(true);
         if alive {
             // The worker outlived the stop: connect and forward the ORIGINAL stop intent —
@@ -67,30 +67,48 @@ impl Supervisor {
             // only with a provably-gone process — the settle is not a death certificate.
             let settled = self.finalize_worker_stop(resident, None).await;
             if settled {
-                self.retire_worker_after_stop(resident).await;
-                self.log_line(&format!(
-                    "finished the tombstoned stop of session worker {}",
-                    resident.worker_id
-                ));
+                if self.retire_worker_after_stop(resident).await {
+                    self.log_line(&format!(
+                        "finished the tombstoned stop of session worker {}",
+                        resident.worker_id
+                    ));
+                    true
+                } else {
+                    self.log_line(&format!(
+                        "tombstoned stop of session worker {} remains pending; process still owns its lease",
+                        resident.worker_id
+                    ));
+                    false
+                }
             } else {
                 self.log_line(&format!(
                     "tombstoned stop of session worker {} not settled; descriptor kept",
                     resident.worker_id
                 ));
+                false
             }
         } else {
             // The per-session stop's durable half is the ephemeral schedule cancel (the
             // session stays resumable), and the descriptor dies only with a provably-gone
             // process. Only an owned (ephemeral) stop cancels its tree — a resident RLM
             // child's preserved jobs must survive a parent's stop-driven death.
-            if resident.descriptor.lock().await.owner_client_id.is_some() {
-                self.finalize_owned_stop(resident).await;
+            let ephemeral = resident.descriptor.lock().await.owner_client_id.is_some();
+            if self.retire_worker_after_stop(resident).await {
+                if ephemeral {
+                    self.finalize_owned_stop(resident).await;
+                }
+                self.log_line(&format!(
+                    "finished the tombstoned per-session stop of session worker {}",
+                    resident.worker_id
+                ));
+                true
+            } else {
+                self.log_line(&format!(
+                    "tombstoned per-session stop of session worker {} remains pending; process still owns its lease",
+                    resident.worker_id
+                ));
+                false
             }
-            self.retire_worker_after_stop(resident).await;
-            self.log_line(&format!(
-                "finished the tombstoned per-session stop of session worker {}",
-                resident.worker_id
-            ));
         }
     }
 
@@ -597,17 +615,24 @@ impl Supervisor {
     }
 
     /// The plain kill's stop aftermath, run on every route outcome: TS's root-kill block wraps
-    /// the forward in a `finally`, so a hung worker still completes the stop. The stop's only
-    /// `Err` is the tombstone persist, so the worker stays untouched and the kill retryable.
+    /// the forward in a `finally`, so a hung worker still enters the stop. A failed
+    /// tombstone persist leaves the worker untouched; a surviving process retains
+    /// its tombstoned descriptor and lease for a later retry.
     pub(super) async fn finish_plain_kill_stop(
         self: &Arc<Self>,
         resident: &Arc<ResidentWorker>,
         rest: &Map<String, Value>,
     ) {
         if let Err(error) = self.stop_worker(resident).await {
+            let durable = resident.descriptor.lock().await.stop_requested_at.is_some();
             self.log_line(&format!(
-                "session worker {} stop after kill failed: {error:#}; the stop never durably started and stays retryable",
-                resident.worker_id
+                "session worker {} stop after kill failed: {error:#}; {}",
+                resident.worker_id,
+                if durable {
+                    "tombstone retained for retry"
+                } else {
+                    "stop never durably started and stays retryable"
+                }
             ));
             return;
         }
@@ -771,7 +796,12 @@ impl Supervisor {
         }
         // The per-session stop shares the terminal-stop contract: the descriptor dies only
         // with a provably-gone process — a worker that missed the shutdown stays adoptable.
-        self.retire_worker_after_stop(resident).await;
+        if !self.retire_worker_after_stop(resident).await {
+            return Err(anyhow!(
+                "Session worker {} has not exited; stop tombstone and lease remain held",
+                resident.worker_id
+            ));
+        }
         // A client-owned (ephemeral) worker's scheduled jobs die with the
         // registration (TS `cancelEphemeralWorkerScheduledJobs`).
         let ephemeral = resident.descriptor.lock().await.owner_client_id.is_some();
@@ -795,7 +825,10 @@ impl Supervisor {
     /// Delete one stopped worker's descriptor only after its process is provably gone (TS
     /// `stopWorkerUntracked`'s contract): deleting the descriptor of a live worker orphans
     /// it behind its lease.
-    pub(super) async fn retire_worker_after_stop(self: &Arc<Self>, resident: &Arc<ResidentWorker>) {
+    pub(super) async fn retire_worker_after_stop(
+        self: &Arc<Self>,
+        resident: &Arc<ResidentWorker>,
+    ) -> bool {
         let (pid, start_id, recovery_journal_path) = {
             let descriptor = resident.descriptor.lock().await;
             (
@@ -816,12 +849,14 @@ impl Supervisor {
                     "session worker {} survived the shutdown escalation; descriptor tombstoned for the next boot",
                     resident.worker_id
                 ));
+                false
             }
             _ if alive_unverified => {
                 self.log_line(&format!(
                     "session worker {} cannot be identity-verified; descriptor tombstoned for the next boot",
                     resident.worker_id
                 ));
+                false
             }
             _ => {
                 // The worker is provably gone, so its kernels can no longer
@@ -844,6 +879,7 @@ impl Supervisor {
                 let _ = crate::descriptor::clear_identity_pending(&resident.descriptor_path);
                 // The reaper alone owns orphan-journal removal. A read or
                 // identity-verified kill failure must preserve its retry records.
+                true
             }
         }
     }
@@ -1081,6 +1117,50 @@ mod tests {
                 "liveness={alive:?}, expected={expected:?}, current={current:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn an_unverified_live_worker_keeps_its_tombstone_and_registry_lease() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let supervisor = supervisor_in(dir.path());
+        let descriptor_path = supervisor.descriptor_dir.join("w-live.json");
+        let descriptor: DaemonWorkerDescriptor = serde_json::from_value(json!({
+            "version": 2,
+            "workerId": "w-live",
+            "pid": std::process::id(),
+            "socketPath": dir.path().join("unreachable.sock").to_string_lossy(),
+            "recoveryJournalPath": dir.path().join("w-live.recovery.jsonl").to_string_lossy(),
+            "supervisorSocketPath": supervisor.options.socket_path.to_string_lossy(),
+            "authenticationToken": "token",
+            "rootActiveSessionId": "w-live",
+            "ownerClientId": "owner-1",
+            "createdAt": "2026-10-07T00:00:00Z",
+            "updatedAt": "2026-10-07T00:00:00Z",
+            "lifecycle": "ready",
+            "createCommand": {},
+            "consecutiveFailures": 0
+        }))
+        .expect("descriptor");
+        persist_worker(&descriptor_path, &descriptor).expect("persist descriptor");
+        let resident =
+            ResidentWorker::new("w-live".to_string(), descriptor, descriptor_path.clone());
+        supervisor.registry.insert(Arc::clone(&resident)).await;
+
+        let error = supervisor
+            .stop_worker(&resident)
+            .await
+            .expect_err("live worker must not retire");
+        assert!(error.to_string().contains("has not exited"));
+        assert!(
+            descriptor_path.exists(),
+            "retryable tombstone remains on disk"
+        );
+        assert!(resident.descriptor.lock().await.stop_requested_at.is_some());
+        assert!(
+            supervisor.registry.get("w-live").await.is_some(),
+            "registry lease stays held"
+        );
+        assert!(crate::lease::is_process_alive(std::process::id()).unwrap());
     }
 
     #[tokio::test]

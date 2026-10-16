@@ -98,6 +98,10 @@ use crate::types::{AgentConnectionState, SessionActionSnapshot};
 
 pub struct Worker {
     pub(crate) config: WorkerConfig,
+    /// Studio owns defaults per conversation. Its daemon workers keep model
+    /// and thinking switches in the session file without rewriting the
+    /// shared settings.json (including recentModels). Unset for CLI parity.
+    pub(crate) session_scoped_preferences: bool,
     /// The bind-time filesystem identity of this worker's own socket file
     /// (TS daemon-mode captures `socketIdentity` in the listen callback,
     /// daemon-mode.ts:718): the exit cleanups pass it as the unlink's
@@ -125,6 +129,10 @@ pub struct Worker {
     pub(crate) supervisor_claims: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) core: Arc<Mutex<SessionCore>>,
     pub(crate) engine: std::sync::Arc<dyn SessionEngine>,
+    /// A goal edit whose durable append failed may have changed the in-memory
+    /// driver (or reached disk without a confirmed sync). Never acknowledge a
+    /// later no-op from that state; a new worker must re-read the file.
+    pub(crate) goal_edit_dirty: std::sync::atomic::AtomicBool,
     /// The concrete agent engine behind `engine` for the create command's
     /// eager session build (the kernel prewarm).
     pub(crate) agent_engine: Option<std::sync::Arc<crate::agent_engine::AgentSessionEngine>>,
@@ -749,6 +757,7 @@ impl Worker {
         );
         Worker {
             config,
+            session_scoped_preferences: crate::protocol::studio_session_preferences_enabled(),
             bound_socket_identity: std::sync::Mutex::new(None),
             listener_close_requested: tokio::sync::Notify::new(),
             listener_closed: tokio::sync::Notify::new(),
@@ -756,6 +765,7 @@ impl Worker {
             supervisor_claims,
             core,
             engine,
+            goal_edit_dirty: std::sync::atomic::AtomicBool::new(false),
             agent_engine,
             roster_link: Arc::clone(&roster_link),
             roster_delta_sequence,

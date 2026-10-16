@@ -223,7 +223,23 @@ impl AuthStorage {
                 refreshed = Some(credential);
                 return Ok(((), None));
             }
-            data.insert(provider_id, &new_credential);
+            if provider_id == crate::auth::provider_oauth::MUSE_CODE_PROVIDER_ID {
+                // The Studio device-login record includes `email`, while the
+                // shared OAuth enum carries only auth-critical fields. Keep
+                // that display metadata when rotating the minted Muse key.
+                let email = data
+                    .get(provider_id)
+                    .and_then(|value| value.get("email"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                let mut value = serde_json::to_value(&new_credential)?;
+                if let (Some(email), Some(fields)) = (email, value.as_object_mut()) {
+                    fields.insert("email".to_string(), serde_json::Value::String(email));
+                }
+                data.0.insert(provider_id.to_string(), value);
+            } else {
+                data.insert(provider_id, &new_credential);
+            }
             let content = serde_json::to_string_pretty(&data.0)?;
             Ok(((), Some(content)))
         });

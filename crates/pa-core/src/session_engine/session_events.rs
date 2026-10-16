@@ -182,12 +182,13 @@ pub fn agent_event_json(event: &AgentEvent) -> Option<serde_json::Value> {
             tool_call_id,
             tool_name,
             result,
-            ..
+            is_error,
         } => serde_json::json!({
             "type": "tool_execution_end",
             "toolCallId": tool_call_id,
             "toolName": tool_name,
             "result": json_round_trip(result).unwrap_or(serde_json::Value::Null),
+            "isError": is_error,
         }),
     };
     Some(value)
@@ -198,7 +199,8 @@ mod tests {
     use super::*;
     use pa_agent::stream::AssistantMessageEvent;
     use pa_agent::types::{
-        AgentEvent, AgentMessage, AssistantContent, AssistantMessage, TextContent, ToolCall, Usage,
+        AgentEvent, AgentMessage, AgentToolResult, AssistantContent, AssistantMessage, TextContent,
+        ToolCall, Usage,
     };
 
     /// A minimal partial assistant message (the faux wire fields).
@@ -243,6 +245,27 @@ mod tests {
             value["assistantMessageEvent"],
             serde_json::json!({"type": "text_delta", "contentIndex": 0, "delta": "first reply"})
         );
+    }
+
+    #[test]
+    fn tool_execution_end_wire_preserves_success_and_failure_flags() {
+        for (is_error, result) in [
+            (false, AgentToolResult::text("ok")),
+            (true, AgentToolResult::error("tool failed")),
+        ] {
+            let event = AgentEvent::ToolExecutionEnd {
+                tool_call_id: "call-1".to_string(),
+                tool_name: "python_repl".to_string(),
+                result: result.clone(),
+                is_error,
+            };
+            let value = agent_event_json(&event).expect("a tool_execution_end json line");
+            assert_eq!(value["type"], "tool_execution_end");
+            assert_eq!(value["toolCallId"], "call-1");
+            assert_eq!(value["toolName"], "python_repl");
+            assert_eq!(value["result"], serde_json::to_value(result).unwrap());
+            assert_eq!(value["isError"], is_error);
+        }
     }
     #[test]
     fn assistant_message_event_wire_shapes_match_ts() {

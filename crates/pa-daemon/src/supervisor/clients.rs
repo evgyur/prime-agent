@@ -112,7 +112,10 @@ impl Supervisor {
         // `/factory on` toggle surfaces on the next client start.
         let agent_dir = self.options.agent_dir.clone();
         let factory_capabilities = tokio::task::spawn_blocking(move || {
-            crate::factory_activity::advertised_server_capabilities(&agent_dir)
+            crate::protocol::studio_server_capabilities(
+                crate::factory_activity::advertised_server_capabilities(&agent_dir),
+                crate::protocol::studio_session_preferences_enabled(),
+            )
         })
         .await
         .map_err(|error| anyhow::anyhow!("the factory settings read failed: {error:#}"))?;

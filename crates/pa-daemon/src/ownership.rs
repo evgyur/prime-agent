@@ -77,7 +77,7 @@ impl Supervisor {
             return Self::owned_failure(
                 command_id,
                 type_name,
-                &format!("Failed to persist the session stop: {error:#}"),
+                &format!("Failed to stop the session worker: {error:#}"),
             );
         }
         (
@@ -286,9 +286,10 @@ impl Supervisor {
 mod tests {
     use std::sync::Arc;
 
-    use pa_types::daemon::DaemonWorkerDescriptor;
+    use pa_types::daemon::{DaemonCommand, DaemonWorkerDescriptor};
     use serde_json::json;
 
+    use crate::descriptor::{descriptor_dir, persist_worker};
     use crate::registry::ResidentWorker;
     use crate::supervisor::Supervisor;
     use crate::supervisor_roster::WorkerRosterDelta;
@@ -404,5 +405,65 @@ mod tests {
             "the superseded durable id never resolves again"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn complete_owned_session_refuses_success_while_its_worker_is_unverified_and_live() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let supervisor = Arc::new(
+            Supervisor::new(crate::supervisor::SupervisorOptions {
+                socket_path: dir.path().join("daemon.sock"),
+                agent_dir: dir.path().join("agent"),
+            })
+            .expect("supervisor"),
+        );
+        let descriptor_path = descriptor_dir(
+            &supervisor.options.agent_dir,
+            &supervisor.options.socket_path,
+        )
+        .join("w-live.json");
+        let descriptor: DaemonWorkerDescriptor = serde_json::from_value(json!({
+            "version": 2,
+            "workerId": "w-live",
+            "pid": std::process::id(),
+            "socketPath": dir.path().join("missing.sock").to_string_lossy(),
+            "recoveryJournalPath": dir.path().join("recovery.jsonl").to_string_lossy(),
+            "supervisorSocketPath": supervisor.options.socket_path.to_string_lossy(),
+            "authenticationToken": "token",
+            "rootActiveSessionId": "w-live",
+            "ownerClientId": "owner-1",
+            "createdAt": "2026-10-07T00:00:00Z",
+            "updatedAt": "2026-10-07T00:00:00Z",
+            "lifecycle": "ready",
+            "createCommand": {},
+            "consecutiveFailures": 0
+        }))
+        .expect("descriptor");
+        persist_worker(&descriptor_path, &descriptor).expect("persist descriptor");
+        let resident =
+            ResidentWorker::new("w-live".to_string(), descriptor, descriptor_path.clone());
+        supervisor.registry.insert(Arc::clone(&resident)).await;
+
+        let command = DaemonCommand::CompleteOwnedSession {
+            id: None,
+            active_session_id: "w-live".to_string(),
+            rest: serde_json::Map::default(),
+        };
+        let (reply, _) = supervisor
+            .handle_complete_owned_session(
+                &command,
+                "owner-1",
+                "complete",
+                "complete_owned_session",
+            )
+            .await;
+        assert_eq!(reply[0]["success"], false);
+        assert!(reply[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("has not exited"));
+        assert!(descriptor_path.exists(), "durable tombstone remains");
+        assert!(resident.descriptor.lock().await.stop_requested_at.is_some());
+        assert!(supervisor.registry.get("w-live").await.is_some());
     }
 }

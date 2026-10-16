@@ -31,6 +31,83 @@ fn persisted_session() -> SessionManager {
     session
 }
 
+#[test]
+fn error_resume_preserves_goal_identity_and_all_accounting() {
+    let mut session = persisted_session();
+    let saved = GoalState {
+        active: false,
+        status: GoalStatus::Error,
+        goal_id: Some("failed-goal".to_string()),
+        objective: Some("Continue the saved work".to_string()),
+        token_budget: Some(9_000_000),
+        tokens_used: 7_404_706,
+        time_used_seconds: 39_600,
+        continuations_used: 115,
+        created_at: Some(1_000),
+        no_progress_streak: Some(2),
+        no_progress_turn_ms: Some(900),
+        last_reason: Some("Provider overloaded".to_string()),
+        last_error: Some("Provider overloaded".to_string()),
+        ..empty_goal_state()
+    };
+    let mut driver = GoalDriver::restore_persisted(saved.clone());
+    assert!(driver.resume(&mut session).unwrap().is_some());
+    let resumed = driver.state();
+    assert_eq!(resumed.status, GoalStatus::Active);
+    assert!(resumed.active);
+    assert_eq!(resumed.goal_id, saved.goal_id);
+    assert_eq!(resumed.objective, saved.objective);
+    assert_eq!(resumed.token_budget, saved.token_budget);
+    assert_eq!(resumed.tokens_used, saved.tokens_used);
+    assert_eq!(resumed.time_used_seconds, saved.time_used_seconds);
+    assert_eq!(resumed.continuations_used, saved.continuations_used);
+    assert_eq!(resumed.created_at, saved.created_at);
+    assert_eq!(resumed.no_progress_streak, saved.no_progress_streak);
+    assert_eq!(resumed.no_progress_turn_ms, saved.no_progress_turn_ms);
+    assert!(resumed.last_error.is_none());
+    assert!(resumed.last_reason.is_none());
+    assert_eq!(session.active_goal_state().unwrap(), resumed.clone());
+}
+
+#[test]
+fn error_resume_keeps_exhausted_budget_limited_and_no_progress_streak() {
+    let mut session = persisted_session();
+    let saved = GoalState {
+        active: false,
+        status: GoalStatus::Error,
+        goal_id: Some("budget-goal".to_string()),
+        objective: Some("Saved objective".to_string()),
+        token_budget: Some(100),
+        tokens_used: 100,
+        no_progress_streak: Some(3),
+        ..empty_goal_state()
+    };
+    let mut driver = GoalDriver::restore_persisted(saved.clone());
+    assert!(driver.resume(&mut session).unwrap().is_none());
+    assert_eq!(driver.state().status, GoalStatus::BudgetLimited);
+    assert!(!driver.state().active);
+    assert_eq!(driver.state().goal_id, saved.goal_id);
+    assert_eq!(driver.state().tokens_used, 100);
+    assert_eq!(driver.state().token_budget, Some(100));
+    assert_eq!(driver.state().no_progress_streak, Some(3));
+}
+
+#[test]
+fn error_resume_extension_does_not_resume_completed_or_empty_goals() {
+    for status in [GoalStatus::Complete, GoalStatus::Idle] {
+        let mut session = persisted_session();
+        let saved = GoalState {
+            status,
+            objective: (status == GoalStatus::Complete).then(|| "Completed objective".to_string()),
+            ..empty_goal_state()
+        };
+        let mut driver = GoalDriver::restore_persisted(saved);
+        let before = driver.state().clone();
+        assert!(driver.resume(&mut session).unwrap().is_none());
+        assert_eq!(driver.state(), &before);
+    }
+}
+
 /// A failed provider turn in the pa-agent wire shape, carrying the
 /// `provider_stream_failure` diagnostic.
 fn test_error_turn(
@@ -227,6 +304,223 @@ fn start_resume_pause_lifecycle() {
     driver.clear(&mut session).unwrap();
     assert_eq!(driver.state().status, GoalStatus::Idle);
     assert_eq!(driver.state().objective, None);
+}
+
+#[test]
+fn objective_edit_is_cas_durable_and_preserves_accounting() {
+    let mut session = persisted_session();
+    let mut driver = GoalDriver::new();
+    let before = driver
+        .start(&mut session, "old objective", Some(1000))
+        .unwrap();
+    let id = before.goal_id.as_deref().unwrap();
+    let original = session.active_goal_state().unwrap();
+    let initial_entries = session.get_entries().len();
+    assert!(driver
+        .edit_objective(&mut session, id, "old objective", "  ")
+        .is_err());
+    assert!(driver
+        .edit_objective(&mut session, "wrong", "old objective", "new")
+        .is_err());
+    assert!(driver
+        .edit_objective(&mut session, id, "stale", "new")
+        .is_err());
+    assert_eq!(session.active_goal_state(), Some(original.clone()));
+    assert_eq!(session.get_entries().len(), initial_entries);
+
+    assert!(driver
+        .edit_objective(&mut session, id, "old objective", " old objective ")
+        .unwrap()
+        .is_none());
+    assert_eq!(session.active_goal_state(), Some(original.clone()));
+    assert_eq!(session.get_entries().len(), initial_entries);
+    let updated = driver
+        .edit_objective(&mut session, id, "old objective", "new objective")
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.get_entries().len(), initial_entries + 1);
+    assert_eq!(updated.objective.as_deref(), Some("new objective"));
+    assert_eq!(updated.goal_id, original.goal_id);
+    assert_eq!(updated.status, original.status);
+    assert_eq!(updated.token_budget, original.token_budget);
+    assert_eq!(updated.tokens_used, original.tokens_used);
+    assert_eq!(updated.continuations_used, original.continuations_used);
+    assert_eq!(
+        session.active_goal_state().unwrap().objective,
+        updated.objective
+    );
+    assert!(driver
+        .edit_objective(&mut session, id, "old objective", "third")
+        .is_err());
+    assert_eq!(
+        GoalDriver::load_persisted(&session)
+            .state()
+            .objective
+            .as_deref(),
+        Some("new objective")
+    );
+
+    driver.pause(&mut session, "Paused by user").unwrap();
+    let paused = driver.state().clone();
+    let edited_paused = driver
+        .edit_objective(&mut session, id, "new objective", "paused objective")
+        .unwrap()
+        .unwrap();
+    assert_eq!(edited_paused.status, GoalStatus::Paused);
+    assert_eq!(edited_paused.tokens_used, paused.tokens_used);
+    assert_eq!(edited_paused.continuations_used, paused.continuations_used);
+    assert!(!edited_paused.active);
+    assert_eq!(
+        GoalDriver::load_persisted(&session)
+            .state()
+            .objective
+            .as_deref(),
+        Some("paused objective")
+    );
+}
+
+#[test]
+fn direct_goal_control_checks_cas_and_preserves_pause_accounting() {
+    let mut session = persisted_session();
+    let mut driver = GoalDriver::new();
+    let started = driver
+        .start(&mut session, "ship the mission", Some(1000))
+        .unwrap();
+    let goal_id = started.goal_id.as_deref().unwrap();
+    let entries = session.get_entries().len();
+    assert!(driver
+        .control_goal(
+            &mut session,
+            "wrong",
+            "ship the mission",
+            GoalControlAction::Pause
+        )
+        .is_err());
+    assert!(driver
+        .control_goal(&mut session, goal_id, "stale", GoalControlAction::Clear)
+        .is_err());
+    assert_eq!(session.get_entries().len(), entries);
+
+    let paused = driver
+        .control_goal(
+            &mut session,
+            goal_id,
+            "ship the mission",
+            GoalControlAction::Pause,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(paused.status, GoalStatus::Paused);
+    assert_eq!(paused.goal_id, started.goal_id);
+    assert_eq!(paused.objective, started.objective);
+    assert_eq!(paused.token_budget, started.token_budget);
+    assert_eq!(paused.tokens_used, started.tokens_used);
+    assert_eq!(paused.continuations_used, started.continuations_used);
+    assert_eq!(session.get_entries().len(), entries + 1);
+    assert!(driver
+        .control_goal(
+            &mut session,
+            goal_id,
+            "ship the mission",
+            GoalControlAction::Pause,
+        )
+        .is_err());
+    assert!(driver
+        .control_goal(
+            &mut session,
+            goal_id,
+            "ship the mission",
+            GoalControlAction::Clear,
+        )
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        GoalDriver::load_persisted(&session).state().status,
+        GoalStatus::Idle
+    );
+    assert_eq!(GoalDriver::load_persisted(&session).state().objective, None);
+    assert_eq!(session.get_entries().len(), entries + 2);
+    assert!(driver
+        .control_goal(
+            &mut session,
+            goal_id,
+            "ship the mission",
+            GoalControlAction::Clear,
+        )
+        .is_err());
+}
+
+#[test]
+fn active_objective_edit_settles_elapsed_once_and_keeps_fractional_anchor() {
+    let mut session = persisted_session();
+    let mut driver = GoalDriver::new();
+    let id = driver
+        .start(&mut session, "first", None)
+        .unwrap()
+        .goal_id
+        .unwrap();
+    driver.accounting_started_at = Some(now_millis().saturating_sub(2_000));
+    let edited = driver
+        .edit_objective(&mut session, &id, "first", "second")
+        .unwrap()
+        .unwrap();
+    assert!((2..=20).contains(&edited.time_used_seconds));
+    assert_eq!(driver.state().time_used_seconds, edited.time_used_seconds);
+    assert_eq!(
+        session.active_goal_state().unwrap().time_used_seconds,
+        edited.time_used_seconds
+    );
+    // No completed second: a subsequent edit must keep the fractional
+    // active interval rather than dropping it at each metadata write.
+    let future_anchor = now_millis().saturating_add(10_000);
+    driver.accounting_started_at = Some(future_anchor);
+    driver
+        .edit_objective(&mut session, &id, "second", "third")
+        .unwrap();
+    assert_eq!(driver.accounting_started_at, Some(future_anchor));
+    assert_eq!(driver.state().time_used_seconds, edited.time_used_seconds);
+}
+
+#[test]
+fn legacy_paused_goal_edit_preserves_exact_saved_usage() {
+    let fixture = serde_json::json!({
+        "active": false,
+        "status": "paused",
+        "goalId": "goal-smoke-native",
+        "objective": "Original objective",
+        "tokenBudget": 9000,
+        "tokensUsed": 234,
+        "timeUsedSeconds": 12,
+        "continuationsUsed": 2,
+        "createdAt": 1_780_000_000_000_u64,
+        "updatedAt": 1_780_000_000_000_u64
+    });
+    let original: GoalState = serde_json::from_value(fixture).unwrap();
+    let mut session = persisted_session();
+    append_goal_row(&mut session, &original);
+    let mut driver = GoalDriver::load_persisted(&session);
+    let initial_entries = session.get_entries().len();
+    let changed = driver
+        .edit_objective(
+            &mut session,
+            "goal-smoke-native",
+            "Original objective",
+            "Updated objective",
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.get_entries().len(), initial_entries + 1);
+    assert_eq!(changed.status, GoalStatus::Paused);
+    assert!(!changed.active);
+    assert_eq!(changed.goal_id.as_deref(), Some("goal-smoke-native"));
+    assert_eq!(changed.objective.as_deref(), Some("Updated objective"));
+    assert_eq!(changed.token_budget, Some(9000));
+    assert_eq!(changed.tokens_used, 234);
+    assert_eq!(changed.time_used_seconds, 12);
+    assert_eq!(changed.continuations_used, 2);
+    assert_eq!(changed.created_at, Some(1_780_000_000_000));
+    assert_eq!(driver.state(), &changed);
+    assert_eq!(session.active_goal_state(), Some(changed));
 }
 
 #[test]
@@ -1089,6 +1383,24 @@ fn same_timeline_reload_never_regresses_the_same_goal() {
 }
 
 #[test]
+fn same_timeline_reload_settles_live_time_and_retains_subsecond_anchor() {
+    let mut session = persisted_session();
+    let mut driver = GoalDriver::new();
+    driver.start(&mut session, "do work", None).unwrap();
+    driver.accounting_started_at = Some(now_millis().saturating_sub(2_000));
+    let original = driver.state().clone();
+    append_goal_row(&mut session, &original);
+    driver.reload_from_branch(&session, GoalBranchReload::SameTimeline);
+    assert!((2..=20).contains(&driver.state().time_used_seconds));
+    let settled = driver.state().time_used_seconds;
+    let future_anchor = now_millis().saturating_add(10_000);
+    driver.accounting_started_at = Some(future_anchor);
+    driver.reload_from_branch(&session, GoalBranchReload::SameTimeline);
+    assert_eq!(driver.state().time_used_seconds, settled);
+    assert_eq!(driver.accounting_started_at, Some(future_anchor));
+}
+
+#[test]
 fn same_timeline_reload_keeps_a_fired_budget_gate() {
     let mut session = persisted_session();
     let mut driver = GoalDriver::new();
@@ -1207,24 +1519,24 @@ fn reload_skips_invalid_rows() {
     assert_eq!(driver.state(), &empty_goal_state());
 }
 
-/// The operator's exact case (2026-09-28): a goal created ~2 hours
-/// ago reads ~2 hours, and no accounting write compounds it.
+/// Restored active goals keep saved usage and accrue only since restore.
 #[test]
-fn creation_based_timer_reads_the_goals_age() {
+fn active_timer_uses_live_anchor_not_historical_creation() {
     let mut session = persisted_session();
     let mut driver = GoalDriver::new();
     driver
         .start(&mut session, "make the visualizer", None)
         .unwrap();
-    // The goal was created 2 hours ago (a rehydrated driver adopts the
-    // persisted `created_at`).
+    // The old creation timestamp is identity, not an accounting anchor.
     let two_hours_ago = now_millis().saturating_sub(2 * 60 * 60 * 1000);
     let mut reloaded = GoalDriver::restore_persisted(GoalState {
         created_at: Some(two_hours_ago),
+        time_used_seconds: 12,
         ..GoalDriver::latest_persisted_state(&session)
     });
-    // A dozen accounting events must not compound the timer: the read
-    // recomputes `now - created_at` fresh every time.
+    assert!((12..=13).contains(&reloaded.state_with_creation_elapsed().time_used_seconds));
+    // Simulate two seconds active; the first write settles those seconds.
+    reloaded.accounting_started_at = Some(now_millis().saturating_sub(2_000));
     for index in 0..12 {
         let mut usage = usage(30, 10);
         usage.output += index;
@@ -1237,28 +1549,23 @@ fn creation_based_timer_reads_the_goals_age() {
     }
     let elapsed = reloaded.state_with_creation_elapsed();
     assert_eq!(elapsed.status, GoalStatus::Active);
-    // The generous upper bound tolerates a descheduled CI worker
-    // between the fabricated anchor and the read.
     assert!(
-        (7_190..=7_260).contains(&elapsed.time_used_seconds),
-        "a 2h-old goal reads ~2h, got {}",
+        (14..=30).contains(&elapsed.time_used_seconds),
+        "only active time should accrue, got {}",
         elapsed.time_used_seconds
     );
-    // The persisted rows carry the age at write, never an accumulated
-    // value.
     assert!(
-        (7_190..=7_260).contains(&reloaded.state().time_used_seconds),
-        "the durable row carries the age: {}",
+        (14..=30).contains(&reloaded.state().time_used_seconds),
+        "the durable row carries settled active time: {}",
         reloaded.state().time_used_seconds
     );
     let idle = GoalDriver::new();
     assert_eq!(idle.state_with_creation_elapsed().time_used_seconds, 0);
 }
 
-/// The paused goal displays the same creation-based age (the
-/// operator's ruling).
+/// A paused goal does not charge time between reads or across a resume.
 #[test]
-fn paused_goal_reads_its_age() {
+fn paused_goal_preserves_accounting_until_resumed() {
     let mut session = persisted_session();
     let mut driver = GoalDriver::new();
     driver.start(&mut session, "ship it", None).unwrap();
@@ -1270,16 +1577,23 @@ fn paused_goal_reads_its_age() {
         "a freshly paused goal reads its (small) age"
     );
     let two_hours_ago = now_millis().saturating_sub(2 * 60 * 60 * 1000);
-    let reloaded = GoalDriver::restore_persisted(GoalState {
+    let mut reloaded = GoalDriver::restore_persisted(GoalState {
         created_at: Some(two_hours_ago),
+        time_used_seconds: 12,
         ..GoalDriver::latest_persisted_state(&session)
     });
     let elapsed = reloaded.state_with_creation_elapsed();
     assert_eq!(elapsed.status, GoalStatus::Paused);
-    assert!(
-        (7_190..=7_260).contains(&elapsed.time_used_seconds),
-        "a paused 2h-old goal reads its age, got {}",
-        elapsed.time_used_seconds
+    assert_eq!(elapsed.time_used_seconds, 12);
+    reloaded.resume(&mut session).unwrap();
+    assert_eq!(reloaded.state().time_used_seconds, 12);
+    assert!((12..=13).contains(&reloaded.state_with_creation_elapsed().time_used_seconds));
+    reloaded.accounting_started_at = Some(now_millis().saturating_sub(2_000));
+    reloaded.pause(&mut session, "pause again").unwrap();
+    assert!((14..=30).contains(&reloaded.state().time_used_seconds));
+    assert_eq!(
+        reloaded.state_with_creation_elapsed(),
+        reloaded.state().clone()
     );
 }
 
@@ -1306,11 +1620,7 @@ fn rows_without_created_at_backfill_from_updated_at() {
         "the legacy goal backfills created_at from updated_at"
     );
     let elapsed = driver.state_with_creation_elapsed();
-    assert!(
-        (3_590..=3_660).contains(&elapsed.time_used_seconds),
-        "a legacy 1h-old goal reads ~1h, got {}",
-        elapsed.time_used_seconds
-    );
+    assert_eq!(elapsed.time_used_seconds, 900);
     let mut fresh = persisted_session();
     fresh
         .append_message(pa_types::session::AgentMessage::User(

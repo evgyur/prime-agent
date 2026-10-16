@@ -2,6 +2,7 @@
 //! (`spawn`, `create_session`, `list_subagents`, `delete_subagent`,
 //! `collect`, `rename`) over the supervisor's child-sessions registry,
 //! with the spawn-admission helpers only this surface uses.
+use super::subagent_policy;
 use super::{
     assert_thinking_supported, bail, create_default_rlm_subagent_session_name, json, now_ms,
     resolve_child_model, rlm_child_label, rlm_depth_limit_error, spawn_name_unavailable_error, Arc,
@@ -110,17 +111,16 @@ impl RlmSubagentHost for SupervisorChildSessions {
             let admission = async {
                 this.assert_name_available(&name, identity.rlm_depth + 1)
                     .await?;
-                let model = resolve_child_model_allowlisted(
-                    &this,
-                    request.model.as_deref(),
-                    "spawn",
-                    "subagent",
-                )
-                .await?;
-                assert_thinking_supported(&this.agent_dir, request.thinking.as_deref(), &model)?;
-                let thinking = request.thinking.as_deref().or(identity.thinking.as_deref());
-                let child_dir = this.child_session_dir(&child_id, &identity)?;
                 let cwd = identity.cwd.clone().unwrap_or_else(|| "/".to_string());
+                let policy = subagent_policy::policy_for(&cwd).await?;
+                let (requested_model, requested_thinking) =
+                    policy.apply(request.model.as_deref(), request.thinking.as_deref());
+                let model =
+                    resolve_child_model_allowlisted(&this, requested_model, "spawn", "subagent")
+                        .await?;
+                assert_thinking_supported(&this.agent_dir, requested_thinking, &model)?;
+                let thinking = requested_thinking.or(identity.thinking.as_deref());
+                let child_dir = this.child_session_dir(&child_id, &identity)?;
                 let runtime_metadata = json!({
                     "kind": "subagent",
                     "rlmChildId": child_id,

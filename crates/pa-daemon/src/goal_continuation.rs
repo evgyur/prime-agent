@@ -18,6 +18,14 @@ pub enum GoalBoundary {
     Proceed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeadlessGoalWait {
+    Settled,
+    Pending,
+    Retrying,
+    RetryOwed,
+}
+
 impl AgentSessionEngine {
     /// Wire the worker's session-input probe, goal admission sink, and
     /// queued-goal-context purge, and register the RLM settle hook; the
@@ -115,9 +123,73 @@ impl AgentSessionEngine {
     /// Deliver the continuation owed behind descendant work once the
     /// descendants settle (the engine's runtime keeps callers non-blocking).
     pub fn retry_owed_goal_continuation(self: &Arc<Self>) {
+        self.goal_retry_in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let engine = Arc::clone(self);
-        self.runtime
-            .spawn(async move { engine.goal_children_settled().await });
+        self.runtime.spawn(async move {
+            engine.goal_children_settled().await;
+            engine
+                .goal_retry_in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            engine.goal_retry_notify.notify_waiters();
+        });
+    }
+
+    /// A headless owner waits only for goal work with a real wake source. An
+    /// unwoken owed flag gets one explicit retry before the owner settles.
+    pub(crate) async fn headless_goal_wait_state(&self) -> HeadlessGoalWait {
+        if self.session_is_closed() {
+            return HeadlessGoalWait::Settled;
+        }
+        let handles = self.goal_runtime.lock().expect("goal runtime lock").clone();
+        let Some(handles) = handles else {
+            return HeadlessGoalWait::Settled;
+        };
+        let driver = handles.driver.lock().await;
+        if !driver.owns_continuation_wakeup() {
+            return HeadlessGoalWait::Settled;
+        }
+        let owed = driver.owes_continuation();
+        let minted = driver.pending_continuation();
+        drop(driver);
+        let backoff = self
+            .goal_backoff_wake_job_id
+            .lock()
+            .expect("goal backoff wake lock")
+            .is_some();
+        if minted || backoff {
+            return HeadlessGoalWait::Pending;
+        }
+        if !owed {
+            return HeadlessGoalWait::Settled;
+        }
+        if self.has_live_background_bash_handles()
+            || self.has_unsettled_rlm_work().await
+            || self.session_input_queued()
+        {
+            return HeadlessGoalWait::Pending;
+        }
+        if self
+            .goal_retry_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            return HeadlessGoalWait::Retrying;
+        }
+        // The retry may have minted and admitted between the first driver
+        // read and the liveness probes. Re-read before reporting an unwoken
+        // debt; the worker then drains an admitted turn through its idle gate.
+        let driver = handles.driver.lock().await;
+        if !driver.owns_continuation_wakeup() {
+            return HeadlessGoalWait::Settled;
+        }
+        if driver.pending_continuation() {
+            return HeadlessGoalWait::Pending;
+        }
+        if !driver.owes_continuation() {
+            return HeadlessGoalWait::Settled;
+        }
+        HeadlessGoalWait::RetryOwed
     }
 
     /// The settle-site body: exactly-once delivery under the driver lock,
@@ -504,6 +576,10 @@ mod tests {
         // The first prompt builds the session; the probe then stands in
         // for a kernel running a background bash handle.
         admit(&engine, "warm".to_string(), &mut events);
+        assert_eq!(
+            engine.runtime.block_on(engine.headless_goal_wait_state()),
+            HeadlessGoalWait::Settled
+        );
         set_background_bash_probe(&engine, Arc::new(|| true));
         admit(
             &engine,
@@ -529,6 +605,10 @@ mod tests {
                 .block_on(async { handles.driver.lock().await.owes_continuation() }),
             "the held continuation must be owed"
         );
+        assert_eq!(
+            engine.runtime.block_on(engine.headless_goal_wait_state()),
+            HeadlessGoalWait::Pending
+        );
         engine
             .runtime
             .block_on(async { engine.goal_children_settled().await });
@@ -546,6 +626,10 @@ mod tests {
             "a live handle must keep the deferral owed"
         );
         set_background_bash_probe(&engine, Arc::new(|| false));
+        assert_eq!(
+            engine.runtime.block_on(engine.headless_goal_wait_state()),
+            HeadlessGoalWait::RetryOwed
+        );
         engine
             .runtime
             .block_on(async { engine.goal_children_settled().await });
@@ -568,6 +652,52 @@ mod tests {
                 .runtime
                 .block_on(async { handles.driver.lock().await.owes_continuation() }),
             "the delivered continuation consumed the owed slot"
+        );
+        assert_eq!(
+            engine.runtime.block_on(engine.headless_goal_wait_state()),
+            HeadlessGoalWait::Settled
+        );
+        // A normal no-progress refusal arms a backoff wake without setting
+        // the owed flag. The actual scheduled job still owns headless life.
+        *engine.goal_backoff_wake_job_id.lock().unwrap() = Some("armed-wake".to_string());
+        assert_eq!(
+            engine.runtime.block_on(engine.headless_goal_wait_state()),
+            HeadlessGoalWait::Pending
+        );
+        *engine.goal_backoff_wake_job_id.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn closed_goal_wakes_a_headless_waiter() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (engine, _dir) = faux_engine_with_settings(
+            &serde_json::json!({ "responses": [{"text": "warm ok"}, {"text": "goal turn"}] }),
+            u64::MAX,
+        );
+        let engine = Arc::new(engine);
+        let mut events = Vec::new();
+        admit(&engine, "warm".to_string(), &mut events);
+        set_background_bash_probe(&engine, Arc::new(|| true));
+        admit(&engine, "/goal wait behind Bash".to_string(), &mut events);
+        assert_eq!(
+            engine.runtime.block_on(engine.headless_goal_wait_state()),
+            HeadlessGoalWait::Pending
+        );
+
+        engine.runtime.block_on(async {
+            let notified = engine.goal_retry_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            engine.mark_session_closed();
+            tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+                .await
+                .expect("close did not wake the headless waiter");
+        });
+        assert_eq!(
+            engine.runtime.block_on(engine.headless_goal_wait_state()),
+            HeadlessGoalWait::Settled
         );
     }
 }

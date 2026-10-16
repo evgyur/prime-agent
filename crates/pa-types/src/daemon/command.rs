@@ -588,6 +588,26 @@ pub enum DaemonCommand {
         #[serde(flatten)]
         rest: JsonMap,
     },
+    EditGoalObjective {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        goal_id: String,
+        expected_objective: String,
+        objective: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    ControlGoal {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        goal_id: String,
+        expected_objective: String,
+        action: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
     GetConnectionState {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,

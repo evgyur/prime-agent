@@ -43,6 +43,37 @@ pub trait SessionEngine: Send + Sync {
         serde_json::to_value(pa_core::goals::empty_goal_state()).unwrap_or(Value::Null)
     }
 
+    /// Compare and replace the owning session's goal objective. `None` means an unchanged edit.
+    fn edit_goal_objective(
+        &self,
+        _goal_id: &str,
+        _expected_objective: &str,
+        _objective: &str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<pa_core::goals::GoalState>>> + Send + '_,
+        >,
+    > {
+        Box::pin(async { anyhow::bail!("Goal objective editing is unavailable") })
+    }
+
+    /// Compare and apply a direct goal lifecycle change; `None` means the goal was cleared.
+    fn control_goal(
+        &self,
+        _goal_id: &str,
+        _expected_objective: &str,
+        _action: pa_core::session_engine::goal_driver::GoalControlAction,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<pa_core::goals::GoalState>>> + Send + '_,
+        >,
+    > {
+        Box::pin(async { anyhow::bail!("Goal lifecycle control is unavailable") })
+    }
+
+    /// Record the edit's externally published goal to suppress a later duplicate turn event.
+    fn mark_goal_edit_published(&self, _goal: &pa_core::goals::GoalState) {}
+
     /// Purge the queued goal-context turns: withdraw minted continuations
     /// waiting to run; engines without a queue do nothing.
     fn purge_queued_goal_contexts(&self) {}
@@ -305,6 +336,12 @@ pub trait SessionEngine: Send + Sync {
     /// provider and model id from the same selection the resolver reads.
     fn model_identity(&self) -> (Option<String>, Option<String>) {
         (None, None)
+    }
+
+    /// The resolved serving model, including implicit settings defaults. After
+    /// a temporary image route settles this identifies the session target again.
+    fn session_model_identity(&self) -> (Option<String>, Option<String>) {
+        self.model_identity()
     }
 
     /// The engine's resolved model as connection-state wire data

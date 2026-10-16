@@ -69,6 +69,9 @@ pub enum EngineEvent {
     },
     /// The final assistant message (recorded into the session store).
     AssistantMessage(Value),
+    /// Restore the selected model after a temporary image route. The worker
+    /// owns the durable file; the core's in-memory marker alone cannot resume it.
+    ModelRestore,
     ToolExecutionStart {
         tool_call_id: String,
         tool_name: String,

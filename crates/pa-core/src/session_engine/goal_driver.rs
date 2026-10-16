@@ -24,13 +24,10 @@ pub enum GoalBranchReload {
     FaithfulBranch,
 }
 
-/// The goal timer's contract (operator ruling 2026-09-28): `time_used_seconds` is
-/// the goal's AGE — the wall clock since `created_at`, computed fresh on every read.
-/// TS divergence (`_goalWithAccountedWallClock`): TS re-baselines an anchor at
-/// each fold and charges only active-status wall clock.
+/// Whole active seconds since the current in-memory accounting anchor.
 #[must_use]
-pub fn creation_elapsed_seconds(created_at: Option<u64>, now: u64) -> u64 {
-    created_at.map_or(0, |created| now.saturating_sub(created) / 1000)
+fn active_elapsed_seconds(started_at: Option<u64>, now: u64) -> u64 {
+    started_at.map_or(0, |started| now.saturating_sub(started) / 1000)
 }
 
 /// What happened after accounting one assistant turn's usage.
@@ -41,8 +38,18 @@ pub enum UsageOutcome {
     Ignored,
 }
 
+/// A direct, compare-and-swap lifecycle change requested by a session client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalControlAction {
+    Pause,
+    Clear,
+}
+
 pub struct GoalDriver {
     state: GoalState,
+    /// Active time is charged from this live anchor. A restored active goal
+    /// starts at restore time, never at its historical `created_at`.
+    accounting_started_at: Option<u64>,
     /// Ids of assistant messages already counted (double-counting guard).
     accounted_messages: std::collections::HashSet<String>,
     /// A continuation is owed behind unsettled RLM descendant work.
@@ -85,6 +92,7 @@ impl GoalDriver {
     pub fn new() -> Self {
         Self {
             state: empty_goal_state(),
+            accounting_started_at: None,
             accounted_messages: std::collections::HashSet::default(),
             owed_continuation_for_rlm_work: false,
             pending_continuation: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -124,48 +132,60 @@ impl GoalDriver {
     /// branch's latest persisted entry adopts under [`rule`].
     pub fn reload_from_branch(&mut self, session: &SessionManager, rule: GoalBranchReload) {
         let previous = self.state.clone();
+        let previous_time = previous.time_used_seconds;
+        let served_previous = self.state_with_creation_elapsed();
+        let previous_anchor = self.accounting_started_at;
         let reloaded = Self::latest_persisted_state(session);
-        self.state = match rule {
-            GoalBranchReload::SameTimeline
-                if reloaded.goal_id.is_some() && reloaded.goal_id == previous.goal_id =>
-            {
-                // The counters clamp to the max; every other field keeps the in-memory state.
-                GoalState {
-                    tokens_used: previous.tokens_used.max(reloaded.tokens_used),
-                    continuations_used: previous
-                        .continuations_used
-                        .max(reloaded.continuations_used),
-                    time_used_seconds: previous.time_used_seconds.max(reloaded.time_used_seconds),
-                    ..previous
-                }
+        let same_timeline = matches!(rule, GoalBranchReload::SameTimeline)
+            && reloaded.goal_id.is_some()
+            && reloaded.goal_id == previous.goal_id;
+        self.state = if same_timeline {
+            // The counters clamp to the max; every other field keeps the in-memory state.
+            GoalState {
+                tokens_used: previous.tokens_used.max(reloaded.tokens_used),
+                continuations_used: previous.continuations_used.max(reloaded.continuations_used),
+                time_used_seconds: served_previous
+                    .time_used_seconds
+                    .max(reloaded.time_used_seconds),
+                ..previous
             }
-            _ => {
-                // A different goal (or none) adopts: the previous goal's pending
-                // mint and deferral would block the adopted goal's continuations.
-                self.continuation_consumed();
-                self.owed_continuation_for_rlm_work = false;
-                // The adopted goal's own durable streak applies; the backoff
-                // window does not survive the move.
-                self.no_progress_streak = reloaded.no_progress_streak.unwrap_or(0);
-                self.no_progress_backoff_until_ms = 0;
-                self.parked_refusal_until_ms = 0;
-                self.counted_no_progress_turn_ms = reloaded.no_progress_turn_ms;
-                // The restore-resurrection guard applies here as in `load_persisted`.
-                if reloaded.status == GoalStatus::Active {
-                    match session.stale_active_goal_failure() {
-                        Some(error) => GoalState {
-                            active: false,
-                            status: GoalStatus::Error,
-                            last_reason: Some(error.clone()),
-                            last_error: Some(error),
-                            ..reloaded
-                        },
-                        None => reloaded,
-                    }
-                } else {
-                    reloaded
+        } else {
+            // A different goal (or none) adopts: the previous goal's pending
+            // mint and deferral would block the adopted goal's continuations.
+            self.continuation_consumed();
+            self.owed_continuation_for_rlm_work = false;
+            // The adopted goal's own durable streak applies; the backoff
+            // window does not survive the move.
+            self.no_progress_streak = reloaded.no_progress_streak.unwrap_or(0);
+            self.no_progress_backoff_until_ms = 0;
+            self.parked_refusal_until_ms = 0;
+            self.counted_no_progress_turn_ms = reloaded.no_progress_turn_ms;
+            // The restore-resurrection guard applies here as in `load_persisted`.
+            if reloaded.status == GoalStatus::Active {
+                match session.stale_active_goal_failure() {
+                    Some(error) => GoalState {
+                        active: false,
+                        status: GoalStatus::Error,
+                        last_reason: Some(error.clone()),
+                        last_error: Some(error),
+                        ..reloaded
+                    },
+                    None => reloaded,
                 }
+            } else {
+                reloaded
             }
+        };
+        self.accounting_started_at = if self.state.status == GoalStatus::Active {
+            if same_timeline && self.state.time_used_seconds == previous_time {
+                // The previous anchor is still useful only when no whole
+                // second was folded and no newer persisted counter won.
+                previous_anchor.or_else(|| Some(now_millis()))
+            } else {
+                Some(now_millis())
+            }
+        } else {
+            None
         };
     }
 
@@ -182,6 +202,7 @@ impl GoalDriver {
     /// state without re-persisting or resetting the double-counting guard.
     pub fn restore_from_persisted(&mut self, state: GoalState) {
         self.state = normalize_goal_state(state);
+        self.accounting_started_at = (self.state.status == GoalStatus::Active).then(now_millis);
         // The no-progress streak is durable (a restart cannot reset it
         // and un-cap a degenerate loop); the backoff window is not.
         self.no_progress_streak = self.state.no_progress_streak.unwrap_or(0);
@@ -196,16 +217,22 @@ impl GoalDriver {
         &self.state
     }
 
-    /// The served goal state: `time_used_seconds` reads the age fresh from
-    /// `created_at`; a state without `created_at` keeps its persisted value.
+    /// The served goal includes whole seconds since the current active
+    /// anchor. Paused and terminal goals return their saved accounting.
     #[must_use]
     pub fn state_with_creation_elapsed(&self) -> GoalState {
-        match self.state.created_at {
-            Some(created_at) => GoalState {
-                time_used_seconds: creation_elapsed_seconds(Some(created_at), now_millis()),
-                ..self.state.clone()
-            },
-            None => self.state.clone(),
+        if self.state.status != GoalStatus::Active {
+            return self.state.clone();
+        }
+        GoalState {
+            time_used_seconds: self
+                .state
+                .time_used_seconds
+                .saturating_add(active_elapsed_seconds(
+                    self.accounting_started_at,
+                    now_millis(),
+                )),
+            ..self.state.clone()
         }
     }
 
@@ -290,20 +317,102 @@ impl GoalDriver {
         Ok(())
     }
 
+    /// Replace the objective only when the editor's goal identity and old text still match.
+    /// Returns `None` for an unchanged objective, without writing a goal row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an absent or stale goal, invalid objective, or failed persistence.
+    pub fn edit_objective(
+        &mut self,
+        session: &mut SessionManager,
+        goal_id: &str,
+        expected_objective: &str,
+        objective_text: &str,
+    ) -> anyhow::Result<Option<GoalState>> {
+        if self.state.goal_id.is_none()
+            || self.state.objective.is_none()
+            || self.state.status == GoalStatus::Idle
+        {
+            anyhow::bail!("Cannot edit objective because this thread has no goal.");
+        }
+        if self.state.goal_id.as_deref() != Some(goal_id)
+            || self.state.objective.as_deref() != Some(expected_objective)
+        {
+            anyhow::bail!("Goal objective changed; refresh the goal before editing.");
+        }
+        let objective = validate_goal_objective(objective_text)?;
+        if self.state.objective.as_deref() == Some(objective.as_str()) {
+            return Ok(None);
+        }
+        self.set_state(
+            session,
+            GoalState {
+                objective: Some(objective),
+                ..self.state.clone()
+            },
+        )?;
+        Ok(Some(self.state_with_creation_elapsed()))
+    }
+
+    /// Change the selected goal only while both its identity and objective still match.
+    /// A clear returns `None`; a pause returns the retained goal state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an absent or stale goal, or failed persistence.
+    pub fn control_goal(
+        &mut self,
+        session: &mut SessionManager,
+        goal_id: &str,
+        expected_objective: &str,
+        action: GoalControlAction,
+    ) -> anyhow::Result<Option<GoalState>> {
+        if self.state.goal_id.is_none()
+            || self.state.objective.is_none()
+            || self.state.status == GoalStatus::Idle
+        {
+            anyhow::bail!("Cannot control goal because this thread has no goal.");
+        }
+        if self.state.goal_id.as_deref() != Some(goal_id)
+            || self.state.objective.as_deref() != Some(expected_objective)
+        {
+            anyhow::bail!("Goal changed; refresh the goal before controlling it.");
+        }
+        match action {
+            GoalControlAction::Pause => {
+                if self.state.status != GoalStatus::Active {
+                    anyhow::bail!("Cannot pause goal because it is no longer active.");
+                }
+                self.pause(session, "Paused by user")?;
+                Ok(Some(self.state_with_creation_elapsed()))
+            }
+            GoalControlAction::Clear => {
+                self.clear(session)?;
+                Ok(None)
+            }
+        }
+    }
+
     fn set_state(&mut self, session: &mut SessionManager, next: GoalState) -> anyhow::Result<()> {
         let now = now_millis();
         let normalized = normalize_goal_state(GoalState {
             updated_at: Some(now),
             ..next
         });
-        // Every durable row carries the goal's age at the write:
-        // `time_used_seconds` recomputes from `created_at`, never accumulates.
-        let normalized = match normalized.created_at {
-            Some(created_at) => GoalState {
-                time_used_seconds: creation_elapsed_seconds(Some(created_at), now),
-                ..normalized
-            },
-            None => normalized,
+        // Only the same active goal may accrue time. A new goal starts at
+        // zero; a paused goal's persisted seconds survive edits and resume.
+        let elapsed = if self.state.status == GoalStatus::Active
+            && self.state.goal_id.is_some()
+            && self.state.goal_id == normalized.goal_id
+        {
+            active_elapsed_seconds(self.accounting_started_at, now)
+        } else {
+            0
+        };
+        let normalized = GoalState {
+            time_used_seconds: normalized.time_used_seconds.saturating_add(elapsed),
+            ..normalized
         };
         let value = serde_json::to_value(&normalized)?;
         session.append_custom_entry(GOAL_STATE_CUSTOM_TYPE, Some(value))?;
@@ -313,6 +422,18 @@ impl GoalDriver {
         if normalized.status != GoalStatus::Active {
             self.continuation_consumed();
         }
+        self.accounting_started_at = if normalized.status == GoalStatus::Active {
+            if elapsed > 0
+                || self.accounting_started_at.is_none()
+                || self.state.goal_id != normalized.goal_id
+            {
+                Some(now)
+            } else {
+                self.accounting_started_at
+            }
+        } else {
+            None
+        };
         self.state = normalized;
         Ok(())
     }
@@ -395,7 +516,7 @@ impl GoalDriver {
         Ok(())
     }
 
-    /// Resume a paused/budget-limited goal. Returns the continuation context
+    /// Explicitly resume a paused, budget-limited, or failed goal. Returns the continuation context
     /// message when the goal becomes active again.
     ///
     /// # Errors
@@ -410,7 +531,7 @@ impl GoalDriver {
         }
         if !matches!(
             self.state.status,
-            GoalStatus::Paused | GoalStatus::BudgetLimited
+            GoalStatus::Paused | GoalStatus::BudgetLimited | GoalStatus::Error
         ) {
             return Ok(None);
         }

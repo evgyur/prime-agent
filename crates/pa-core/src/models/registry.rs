@@ -22,6 +22,8 @@ use super::private_auth::{
     PRIVATE_PRIME_AUTHORIZATION_CACHE_TTL_MS,
 };
 
+mod studio_providers;
+
 /// Request-auth bits a provider can configure in models.json.
 #[derive(Debug, Clone, Default)]
 pub struct ProviderRequestConfig {
@@ -93,6 +95,7 @@ pub struct ModelRegistry {
     authorized_private_ids: HashSet<String>,
     authorized_private_models: Vec<Model>,
     authorized_team_id: Option<String>,
+    canonical_muse_code: bool,
     /// The process-shared live catalog chain (`catalog_chain::catalog_for`);
     /// `resolve()` sources built-ins from it.
     catalog: std::sync::Arc<pa_models::ModelCatalog>,
@@ -182,6 +185,7 @@ impl ModelRegistry {
             authorized_private_ids: HashSet::new(),
             authorized_private_models: Vec::new(),
             authorized_team_id: None,
+            canonical_muse_code: false,
             catalog,
         };
         registry.load_models();
@@ -244,6 +248,17 @@ impl ModelRegistry {
     }
 
     pub fn has_configured_auth(&self, model: &Model) -> bool {
+        if self.canonical_muse_code && model.provider == "muse-code" {
+            return self.auth.get_auth_status("muse-code").source
+                == Some(crate::auth::types::AuthSource::Stored)
+                && self
+                    .auth
+                    .get_all()
+                    .credential("muse-code")
+                    .as_ref()
+                    .and_then(crate::auth::provider_oauth::muse_inference_key)
+                    .is_some();
+        }
         self.auth.has_auth(&model.provider)
             || self.has_configured_provider_request_auth(&model.provider)
     }
@@ -406,6 +421,14 @@ impl ModelRegistry {
         let credentials = self.prime_credentials();
         let mut built_in = self.load_built_in_models(&result, credentials.as_ref());
         built_in.extend(private_models.into_values());
+        let studio_defaults = studio_providers::studio_provider_defaults(
+            std::env::var("PRIME_STUDIO_PROVIDER_EXTENSIONS").as_deref() == Ok("1"),
+            self.models_json_path.as_deref(),
+            &built_in,
+            self.auth.get_all().credential("muse-code").as_ref(),
+        );
+        self.canonical_muse_code = studio_defaults.canonical_muse;
+        built_in.extend(studio_defaults.models);
         self.models = Self::merge_custom_models(built_in, result.models);
         self.apply_subscription_model_adaptations();
     }
@@ -818,7 +841,29 @@ impl ModelRegistry {
         let stored = self
             .auth
             .get_api_key_with_source_token(&model.provider, false);
-        let mut api_key = stored.api_key;
+        let mut api_key = if self.canonical_muse_code && model.provider == "muse-code" {
+            if stored.credential_type == Some("oauth")
+                && stored.source_token.as_ref().map(|token| token.source)
+                    == Some(crate::auth::types::AuthSource::Stored)
+            {
+                self.auth
+                    .get_all()
+                    .credential("muse-code")
+                    .as_ref()
+                    .and_then(crate::auth::provider_oauth::muse_inference_key)
+            } else {
+                None
+            }
+        } else {
+            stored.api_key
+        };
+        if self.canonical_muse_code && model.provider == "muse-code" && api_key.is_none() {
+            return ResolvedRequestAuth {
+                ok: false,
+                error: Some("Muse Code requires a valid stored OAuth credential".to_string()),
+                ..Default::default()
+            };
+        }
         let provider_config = self.provider_request_configs.get(&model.provider).cloned();
         if api_key.is_none() {
             if let Some(config) = &provider_config {

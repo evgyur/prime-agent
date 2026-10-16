@@ -162,7 +162,7 @@ impl AgentSessionEngine {
     /// to read (the next emitted event re-checks). The served state reads the
     /// creation-based age fresh from `created_at` (no anchor, no
     /// compounding).
-    pub(super) fn current_goal_state(&self) -> Option<pa_core::goals::GoalState> {
+    pub(crate) fn current_goal_state(&self) -> Option<pa_core::goals::GoalState> {
         let handles = self
             .goal_runtime
             .lock()

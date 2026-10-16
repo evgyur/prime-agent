@@ -167,6 +167,7 @@ impl Worker {
         let engine = std::sync::Arc::clone(&self.engine);
         let core = std::sync::Arc::clone(&self.core);
         let agent_dir = self.config.agent_dir.clone();
+        let session_scoped_preferences = self.session_scoped_preferences;
         let switched = tokio::task::spawn_blocking(move || {
             if !engine.switch_model(EngineModelSelection {
                 provider: Some(provider.clone()),
@@ -195,9 +196,12 @@ impl Worker {
                 }
                 core.cwd.clone()
             };
-            // Persist the default so the next session starts here.
-            let mut settings = pa_core::settings::SettingsManager::create(&cwd, &agent_dir);
-            let _ = settings.set_default_model_and_provider(&provider, &model_id);
+            // Studio scopes the choice to the durable session row; CLI
+            // workers continue to update their shared startup default.
+            if !session_scoped_preferences {
+                let mut settings = pa_core::settings::SettingsManager::create(&cwd, &agent_dir);
+                let _ = settings.set_default_model_and_provider(&provider, &model_id);
+            }
             Some(())
         })
         .await

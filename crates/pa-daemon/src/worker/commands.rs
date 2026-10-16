@@ -1,9 +1,10 @@
 //! The dispatch surface: command routing, the command handlers,
 //! and the abort family.
 use super::{
-    clear_withdrawn_progress_note, json, persist_custom_row, response_failure, response_success,
-    KillCloseReason, Lane, QueueCheckpoint, QueuedItem, Result, SessionFile, TurnSettle, VecDeque,
-    Worker, PROMPT_ABORTED_BEFORE_DELIVERY, SIDE_QUESTION_SETTLE_TIMEOUT,
+    checkpoint_queue_recovery, clear_withdrawn_progress_note, enqueue_priority, json,
+    persist_custom_row, response_failure, response_success, KillCloseReason, Lane, QueueCheckpoint,
+    QueuePriority, QueuedItem, Result, SessionFile, TurnPolicy, TurnSettle, VecDeque, Worker,
+    PROMPT_ABORTED_BEFORE_DELIVERY, SIDE_QUESTION_SETTLE_TIMEOUT,
 };
 
 use serde_json::Value;
@@ -94,6 +95,8 @@ impl Worker {
                 self.handle_wait_for_headless_completion(payload).await
             }
             "get_state" => self.handle_get_state(),
+            "edit_goal_objective" => self.handle_edit_goal_objective(payload).await,
+            "control_goal" => self.handle_control_goal(payload).await,
             "get_messages" => self.handle_get_messages(payload),
             "get_session_header" => self.handle_get_session_header(),
             "get_session_stats" => self.handle_get_session_stats(),
@@ -391,6 +394,9 @@ impl Worker {
         self.engine.abort_in_flight_turn();
         // An idle withdrawal has no turn-end event to refresh the roster.
         self.push_roster_delta();
+        // An idle headless goal may be waiting behind background Bash or a
+        // backoff wake; no turn boundary will signal its abort.
+        self.idle_notify.notify_waiters();
     }
 
     fn handle_abort(&self) -> DaemonResponse {
@@ -415,6 +421,281 @@ impl Worker {
             None,
             "get_state",
             Some(serde_json::to_value(&summary).unwrap_or(Value::Null)),
+        )
+    }
+
+    async fn handle_edit_goal_objective(&self, payload: &Value) -> DaemonResponse {
+        const COMMAND: &str = "edit_goal_objective";
+        // Connection tasks dispatch concurrently. Keep CAS, the worker-owned
+        // append, and publication in one mutation lane, including no-ops.
+        let _edit_gate = self.replacement_gate.lock().await;
+        if let Err(response) = self.require_created(COMMAND) {
+            return response;
+        }
+        if self
+            .goal_edit_dirty
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return response_failure(
+                None,
+                COMMAND,
+                "Goal objective persistence is uncertain; close and reopen this session before editing.",
+                None,
+            );
+        }
+        {
+            let core = self.core.lock().unwrap();
+            if core.compacting {
+                return response_failure(
+                    None,
+                    COMMAND,
+                    "Goal objective cannot be edited during compaction.",
+                    None,
+                );
+            }
+        }
+        let (Some(goal_id), Some(expected_objective), Some(objective)) = (
+            payload.get("goalId").and_then(Value::as_str),
+            payload.get("expectedObjective").and_then(Value::as_str),
+            payload.get("objective").and_then(Value::as_str),
+        ) else {
+            return response_failure(
+                None,
+                COMMAND,
+                "Goal identity, expected objective, and objective must be strings.",
+                None,
+            );
+        };
+        let changed = match self
+            .engine
+            .edit_goal_objective(goal_id, expected_objective, objective)
+            .await
+        {
+            Ok(changed) => changed,
+            Err(error) => return response_failure(None, COMMAND, &format!("{error:#}"), None),
+        };
+        let Some(goal) = changed else {
+            return response_success(None, COMMAND, Some(self.engine.goal_state_value()));
+        };
+        // The core session manager is intentionally in-memory. The worker's
+        // leased SessionFile is the only durable owner of this JSONL, just as
+        // it is for goal updates emitted by model turns. Persist before the
+        // edit is announced or acknowledged so a fresh owned create sees it.
+        let (persisted, goal) = {
+            let mut core = self.core.lock().unwrap();
+            // A model turn may advance counters after the CAS and before this
+            // append. Read the actual driver while holding the store lane so
+            // that an earlier turn row cannot be followed by stale counters.
+            // If the driver is mid-mutation, that mutation's goal event will
+            // follow this row through the same store lock.
+            let latest = self
+                .agent_engine
+                .as_ref()
+                .and_then(|engine| engine.current_goal_state())
+                .unwrap_or(goal);
+            let persisted = core.store.as_mut().map(|store| {
+                store.persist_entry(
+                    "custom",
+                    json!({
+                        "customType": pa_core::goals::GOAL_STATE_CUSTOM_TYPE,
+                        "data": &latest,
+                    }),
+                )
+            });
+            if persisted.as_ref().is_some_and(Result::is_ok) {
+                // Publish before releasing the store lock: a delayed model
+                // event then sees this objective as the latest baseline.
+                self.engine.mark_goal_edit_published(&latest);
+            }
+            (persisted, latest)
+        };
+        match persisted {
+            Some(Ok(_)) => {}
+            Some(Err(error)) => {
+                self.goal_edit_dirty
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                return response_failure(
+                    None,
+                    COMMAND,
+                    &format!(
+                        "Goal objective changed in memory but could not be persisted: {error:#}"
+                    ),
+                    None,
+                );
+            }
+            None => {
+                self.goal_edit_dirty
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                return response_failure(
+                    None,
+                    COMMAND,
+                    "Goal objective changed in memory but this thread has no durable session file.",
+                    None,
+                );
+            }
+        }
+        self.emit_worker_event(json!({ "type": "goal_update", "goal": goal }));
+        if goal.status == pa_core::goals::GoalStatus::Active {
+            let was_busy = self.core.lock().unwrap().busy;
+            if was_busy {
+                self.engine.purge_queued_goal_contexts();
+                if let Ok(message) = pa_core::goals::create_goal_context_message(
+                    &goal,
+                    pa_core::goals::GoalContextKind::ObjectiveUpdated,
+                    &[],
+                ) {
+                    let mut core = self.core.lock().unwrap();
+                    enqueue_priority(
+                        &mut core.follow_up,
+                        QueuedItem {
+                            priority: QueuePriority::Pinned,
+                            preview: None,
+                            message: message.content.text(),
+                            custom_message: Some(crate::session_commands::custom_message_value(
+                                &message,
+                            )),
+                            agent_message: None,
+                            queue_key: None,
+                            admission_id: None,
+                            images: Vec::new(),
+                            done: None,
+                            queue_visible: false,
+                            policy: TurnPolicy::Injected,
+                            forced_batch: false,
+                        },
+                    );
+                    drop(core);
+                    checkpoint_queue_recovery(
+                        &self.recovery,
+                        &self.core,
+                        QueueCheckpoint::Admitted {
+                            operation: "follow_up_queued",
+                        },
+                    );
+                    self.work_notify.notify_one();
+                }
+            }
+        }
+        response_success(None, COMMAND, serde_json::to_value(goal).ok())
+    }
+
+    async fn handle_control_goal(&self, payload: &Value) -> DaemonResponse {
+        use pa_core::session_engine::goal_driver::GoalControlAction;
+
+        const COMMAND: &str = "control_goal";
+        // Serializes the CAS, durable append, and announcement against edits
+        // and other lifecycle requests arriving on separate connections.
+        let _control_gate = self.replacement_gate.lock().await;
+        if let Err(response) = self.require_created(COMMAND) {
+            return response;
+        }
+        if self
+            .goal_edit_dirty
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return response_failure(
+                None,
+                COMMAND,
+                "Goal persistence is uncertain; close and reopen this session before controlling it.",
+                None,
+            );
+        }
+        if self.core.lock().unwrap().compacting {
+            return response_failure(
+                None,
+                COMMAND,
+                "Goal cannot be controlled during compaction.",
+                None,
+            );
+        }
+        let (Some(goal_id), Some(expected_objective), Some(action)) = (
+            payload.get("goalId").and_then(Value::as_str),
+            payload.get("expectedObjective").and_then(Value::as_str),
+            payload.get("action").and_then(Value::as_str),
+        ) else {
+            return response_failure(
+                None,
+                COMMAND,
+                "Goal identity, expected objective, and action must be strings.",
+                None,
+            );
+        };
+        let action = match action {
+            "pause" => GoalControlAction::Pause,
+            "clear" => GoalControlAction::Clear,
+            _ => {
+                return response_failure(None, COMMAND, "Unknown goal control action.", None);
+            }
+        };
+        let changed = match self
+            .engine
+            .control_goal(goal_id, expected_objective, action)
+            .await
+        {
+            Ok(changed) => changed,
+            Err(error) => return response_failure(None, COMMAND, &format!("{error:#}"), None),
+        };
+        let (persisted, goal) = {
+            let mut core = self.core.lock().unwrap();
+            let goal = self
+                .agent_engine
+                .as_ref()
+                .and_then(|engine| engine.current_goal_state())
+                .unwrap_or_else(|| {
+                    changed
+                        .clone()
+                        .unwrap_or_else(pa_core::goals::empty_goal_state)
+                });
+            let persisted = core.store.as_mut().map(|store| {
+                store.persist_entry(
+                    "custom",
+                    json!({
+                        "customType": pa_core::goals::GOAL_STATE_CUSTOM_TYPE,
+                        "data": &goal,
+                    }),
+                )
+            });
+            if persisted.as_ref().is_some_and(Result::is_ok) {
+                self.engine.mark_goal_edit_published(&goal);
+            }
+            (persisted, goal)
+        };
+        match persisted {
+            Some(Ok(_)) => {}
+            Some(Err(error)) => {
+                self.goal_edit_dirty
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                return response_failure(
+                    None,
+                    COMMAND,
+                    &format!("Goal changed in memory but could not be persisted: {error:#}"),
+                    None,
+                );
+            }
+            None => {
+                self.goal_edit_dirty
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                return response_failure(
+                    None,
+                    COMMAND,
+                    "Goal changed in memory but this thread has no durable session file.",
+                    None,
+                );
+            }
+        }
+        if let Some(engine) = &self.agent_engine {
+            engine.cancel_goal_backoff_wake();
+        }
+        self.engine.purge_queued_goal_contexts();
+        self.emit_worker_event(json!({ "type": "goal_update", "goal": goal }));
+        response_success(
+            None,
+            COMMAND,
+            Some(
+                changed
+                    .and_then(|_| serde_json::to_value(goal).ok())
+                    .unwrap_or(Value::Null),
+            ),
         )
     }
 
@@ -627,6 +908,7 @@ impl Worker {
         drop(core);
         // And the same eager agent abort.
         self.engine.abort_in_flight_turn();
+        self.idle_notify.notify_waiters();
         response_success(None, "abort_and_clear_queue", cleared.data)
     }
 

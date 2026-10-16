@@ -1,12 +1,13 @@
 //! The built-in subscription providers' OAuth integration: the stored `openai-codex`, `anthropic`,
-//! `github-copilot`, and `xai` credentials refresh at their token endpoints when they expire; every
+//! `github-copilot`, `xai`, and `muse-code` credentials refresh at their token endpoints when they expire; every
 //! other provider serves its access token until expiry.
 
 use std::sync::Arc;
 
 use pa_ai::oauth::{
     refresh_anthropic_token, refresh_github_copilot_token, refresh_openai_codex_token,
-    refresh_xai_token, CodexHttp, ProviderHttp, ReqwestCodexHttp, ReqwestProviderHttp,
+    refresh_xai_token, CodexHttp, ProviderHttp, ProviderHttpMethod, ProviderHttpRequest,
+    ReqwestCodexHttp, ReqwestProviderHttp,
 };
 
 use crate::auth::types::{AuthCredential, AuthStorageData};
@@ -19,6 +20,37 @@ pub const ANTHROPIC_PROVIDER_ID: &str = "anthropic";
 pub const GITHUB_COPILOT_PROVIDER_ID: &str = "github-copilot";
 /// The xAI (Grok) subscription provider id.
 pub const XAI_PROVIDER_ID: &str = "xai";
+pub(crate) const MUSE_CODE_PROVIDER_ID: &str = "muse-code";
+const MUSE_KEY_URL: &str = "https://api.meta.ai/muse-code/key";
+const MUSE_KEY_LIFETIME_MS: i64 = 24 * 60 * 60 * 1000;
+
+fn clean_muse_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= 8192
+        && !token
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control())
+}
+
+fn muse_access_tokens(access: &str) -> Option<(String, String)> {
+    if access.is_empty() || access.len() > 16_384 {
+        return None;
+    }
+    let compound: serde_json::Value = serde_json::from_str(access).ok()?;
+    let identity = compound.get("oauthAccessToken")?.as_str()?;
+    let minted = compound.get("apiKey")?.as_str()?;
+    (clean_muse_token(identity) && clean_muse_token(minted))
+        .then(|| (identity.to_string(), minted.to_string()))
+}
+
+/// Only a typed Muse OAuth credential can supply an inference key. The
+/// identity token and serialized compound value must never become a bearer.
+pub(crate) fn muse_inference_key(credential: &AuthCredential) -> Option<String> {
+    let AuthCredential::Oauth { access, .. } = credential else {
+        return None;
+    };
+    muse_access_tokens(access).map(|(_, minted)| minted)
+}
 
 /// The AI library's oauth registry as the auth storage's default
 /// integration.
@@ -66,16 +98,24 @@ impl ProviderOAuth {
         credential: &AuthCredential,
     ) -> Option<AuthCredential> {
         let AuthCredential::Oauth {
-            refresh: Some(refresh_token),
+            access,
+            refresh,
             enterprise_url,
             ..
         } = credential
         else {
             return None;
         };
+        let refresh_token = if provider_id == MUSE_CODE_PROVIDER_ID {
+            match refresh {
+                Some(token) => clean_muse_token(token).then(|| token.clone())?,
+                None => muse_access_tokens(access).map(|(identity, _)| identity)?,
+            }
+        } else {
+            refresh.clone()?
+        };
         let http = Arc::clone(&self.http);
         let provider_http = Arc::clone(&self.provider_http);
-        let refresh_token = refresh_token.clone();
         let enterprise_url = enterprise_url.clone();
         let provider_id = provider_id.to_string();
         std::thread::Builder::new()
@@ -167,7 +207,88 @@ impl ProviderOAuth {
                             audience_mode: None,
                         })
                     }
-                    // The match arms cover the four subscription ids;
+                    MUSE_CODE_PROVIDER_ID => {
+                        let response = runtime
+                            .block_on(provider_http.request(
+                                ProviderHttpRequest {
+                                    method: ProviderHttpMethod::Post,
+                                    url: MUSE_KEY_URL.to_string(),
+                                    headers: vec![
+                                        ("Accept".to_string(), "application/json".to_string()),
+                                        (
+                                            "Content-Type".to_string(),
+                                            "application/json".to_string(),
+                                        ),
+                                        ("x-api-version".to_string(), "1.0.0".to_string()),
+                                        (
+                                            "Authorization".to_string(),
+                                            format!("Bearer {refresh_token}"),
+                                        ),
+                                    ],
+                                    body: Some("{}".to_string()),
+                                    follow_redirects: false,
+                                },
+                                20_000,
+                            ))
+                            .ok()?;
+                        if !response.ok() {
+                            return None;
+                        }
+                        let body: serde_json::Value = serde_json::from_str(&response.body).ok()?;
+                        if body.get("is_subs_active")?.as_bool() != Some(true)
+                            || body
+                                .get("require_payment")
+                                .and_then(serde_json::Value::as_bool)
+                                == Some(true)
+                            || body
+                                .get("action_url")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|url| !url.trim().is_empty())
+                            || body
+                                .get("require_payment_action_url")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|url| !url.trim().is_empty())
+                        {
+                            return None;
+                        }
+                        let minted = body.get("api_key")?.as_str()?;
+                        if !clean_muse_token(minted) {
+                            return None;
+                        }
+                        let account_id = body
+                            .get("user_id")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|id| !id.trim().is_empty())
+                            .map(|id| id.trim().to_string())
+                            .or_else(|| {
+                                body.get("user_email")
+                                    .and_then(serde_json::Value::as_str)
+                                    .filter(|email| !email.trim().is_empty())
+                                    .map(|email| email.trim().to_lowercase())
+                            })?;
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .ok()?
+                            .as_millis() as i64;
+                        Some(AuthCredential::Oauth {
+                            access: serde_json::json!({
+                                "oauthAccessToken": refresh_token,
+                                "apiKey": minted,
+                            })
+                            .to_string(),
+                            refresh: Some(refresh_token),
+                            expires: now_ms.saturating_add(MUSE_KEY_LIFETIME_MS),
+                            account_id: Some(account_id),
+                            enterprise_url: None,
+                            endpoint: None,
+                            token_endpoint: None,
+                            client_id: None,
+                            resource: None,
+                            issuer: None,
+                            audience_mode: None,
+                        })
+                    }
+                    // The match arms cover the supported subscription ids;
                     // `refresh` never dispatches another.
                     _ => None,
                 };
@@ -180,7 +301,10 @@ impl ProviderOAuth {
 }
 
 impl crate::auth::OAuthIntegration for ProviderOAuth {
-    fn api_key_for(&self, _provider: &str, credential: &AuthCredential) -> Option<String> {
+    fn api_key_for(&self, provider: &str, credential: &AuthCredential) -> Option<String> {
+        if provider == MUSE_CODE_PROVIDER_ID {
+            return muse_inference_key(credential);
+        }
         match credential {
             AuthCredential::Oauth { access, .. } => Some(access.clone()),
             AuthCredential::ApiKey { .. } | AuthCredential::McpStaticToken { .. } => None,
@@ -194,6 +318,7 @@ impl crate::auth::OAuthIntegration for ProviderOAuth {
                 | ANTHROPIC_PROVIDER_ID
                 | GITHUB_COPILOT_PROVIDER_ID
                 | XAI_PROVIDER_ID
+                | MUSE_CODE_PROVIDER_ID
         ) {
             return None;
         }
@@ -209,6 +334,7 @@ mod tests {
     use pa_ai::oauth::{CodexHttpResponse, ProviderHttpRequest, ProviderHttpResponse};
 
     use super::*;
+    use crate::auth::manager::OAuthIntegration;
 
     /// A scripted Codex transport (url -> response); unknown urls fail
     /// the request.
@@ -522,6 +648,159 @@ mod tests {
         assert_eq!(
             auth.get_api_key(OPENAI_CODEX_PROVIDER_ID),
             Some("live-access".to_string())
+        );
+    }
+
+    #[test]
+    fn muse_compound_oauth_never_returns_the_account_token() {
+        let oauth: AuthCredential = serde_json::from_value(serde_json::json!({
+            "type": "oauth",
+            "access": r#"{"oauthAccessToken":"account-token","apiKey":"inference-key"}"#,
+            "expires": i64::MAX,
+        }))
+        .unwrap();
+        let integration = integrations();
+        assert_eq!(
+            integration.api_key_for(MUSE_CODE_PROVIDER_ID, &oauth),
+            Some("inference-key".to_string())
+        );
+        let malformed: AuthCredential = serde_json::from_value(serde_json::json!({
+            "type": "oauth", "access": "account-token", "expires": i64::MAX,
+        }))
+        .unwrap();
+        assert_eq!(
+            integration.api_key_for(MUSE_CODE_PROVIDER_ID, &malformed),
+            None
+        );
+        let wrong_type = AuthCredential::ApiKey {
+            key: "account-token".to_string(),
+            prime_team: None,
+        };
+        assert_eq!(
+            integration.api_key_for(MUSE_CODE_PROVIDER_ID, &wrong_type),
+            None
+        );
+    }
+
+    #[test]
+    fn expired_muse_renews_only_at_its_key_endpoint_then_serves_minted_key() {
+        struct CaptureMuseHttp {
+            seen: std::sync::Mutex<Vec<ProviderHttpRequest>>,
+        }
+        impl ProviderHttp for CaptureMuseHttp {
+            fn request(
+                &self,
+                request: ProviderHttpRequest,
+                _timeout_ms: u64,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<ProviderHttpResponse, String>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                self.seen.lock().unwrap().push(request);
+                Box::pin(async {
+                    Ok(ProviderHttpResponse {
+                        status: 200,
+                        body: serde_json::json!({
+                            "is_subs_active": true,
+                            "require_payment": false,
+                            "api_key": "fresh-inference-key",
+                            "user_id": "account-1",
+                        })
+                        .to_string(),
+                    })
+                })
+            }
+        }
+        let capture = Arc::new(CaptureMuseHttp {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let integration = Arc::new(ProviderOAuth::with_transports(
+            Arc::new(ScriptedHttp(HashMap::new())),
+            capture.clone(),
+        ));
+        let expired: AuthCredential = serde_json::from_value(serde_json::json!({
+            "type": "oauth",
+            "access": r#"{"oauthAccessToken":"account-token","apiKey":"old-inference-key"}"#,
+            "refresh": "account-token",
+            "expires": 1,
+        }))
+        .unwrap();
+        let mut data = AuthStorageData::default();
+        data.insert(MUSE_CODE_PROVIDER_ID, &expired);
+        data.0
+            .get_mut(MUSE_CODE_PROVIDER_ID)
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .insert("email".to_string(), serde_json::json!("member@example.com"));
+        let mut auth = crate::auth::AuthStorage::in_memory_without_env(&data, integration);
+        assert_eq!(
+            auth.get_api_key(MUSE_CODE_PROVIDER_ID),
+            Some("fresh-inference-key".to_string())
+        );
+        let refreshed = auth.get_all().credential(MUSE_CODE_PROVIDER_ID).unwrap();
+        assert_eq!(
+            muse_inference_key(&refreshed).as_deref(),
+            Some("fresh-inference-key")
+        );
+        assert_eq!(
+            auth.get_all().get(MUSE_CODE_PROVIDER_ID).unwrap()["email"],
+            "member@example.com"
+        );
+        let AuthCredential::Oauth { expires, .. } = refreshed else {
+            panic!("Muse refresh must persist OAuth");
+        };
+        assert!(expires > 1);
+        let requests = capture.seen.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url, MUSE_KEY_URL);
+        assert_eq!(requests[0].body.as_deref(), Some("{}"));
+        assert!(!requests[0].follow_redirects);
+        assert!(requests[0].headers.contains(&(
+            "Authorization".to_string(),
+            "Bearer account-token".to_string()
+        )));
+        assert!(!requests[0]
+            .headers
+            .iter()
+            .any(|(_, value)| value.contains("old-inference-key")));
+    }
+
+    #[test]
+    fn inactive_muse_subscription_does_not_disclose_or_persist_a_key() {
+        let mut responses = HashMap::new();
+        responses.insert(
+            MUSE_KEY_URL.to_string(),
+            ProviderHttpResponse {
+                status: 200,
+                body: serde_json::json!({
+                    "is_subs_active": false,
+                    "api_key": "must-not-be-served",
+                    "user_id": "account-1",
+                })
+                .to_string(),
+            },
+        );
+        let integration = Arc::new(ProviderOAuth::with_transports(
+            Arc::new(ScriptedHttp(HashMap::new())),
+            Arc::new(ScriptedProviderHttp(responses)),
+        ));
+        let expired: AuthCredential = serde_json::from_value(serde_json::json!({
+            "type": "oauth",
+            "access": r#"{"oauthAccessToken":"account-token","apiKey":"old-inference-key"}"#,
+            "refresh": "account-token",
+            "expires": 1,
+        }))
+        .unwrap();
+        let mut data = AuthStorageData::default();
+        data.insert(MUSE_CODE_PROVIDER_ID, &expired);
+        let mut auth = crate::auth::AuthStorage::in_memory_without_env(&data, integration);
+        assert_eq!(auth.get_api_key(MUSE_CODE_PROVIDER_ID), None);
+        assert_eq!(
+            auth.get_all().credential(MUSE_CODE_PROVIDER_ID),
+            Some(expired)
         );
     }
 }

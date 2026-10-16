@@ -1,6 +1,145 @@
 //! The goal tests (recovery, continuation minting, the goal loop's turn-end accounting).
 use super::*;
 
+#[tokio::test(flavor = "current_thread")]
+// Serializes the global faux provider across independent test runtimes;
+// no task in this current-thread runtime acquires this test-only mutex.
+#[allow(clippy::await_holding_lock)]
+async fn objective_edit_joins_unfinished_create_prewarm_without_a_turn() {
+    let _faux = FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::TempDir::new().unwrap();
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let session_path = dir.path().join("session.jsonl");
+    let mut store = crate::session_store::SessionFile::create("/tmp", None, 0);
+    store.set_path(session_path.clone());
+    store.append_entry(
+        "custom",
+        json!({
+            "customType": pa_core::goals::GOAL_STATE_CUSTOM_TYPE,
+            "data": {
+                "active": false,
+                "status": "paused",
+                "goalId": "goal-1",
+                "objective": "old objective",
+                "tokensUsed": 34,
+                "timeUsedSeconds": 9,
+                "continuationsUsed": 2,
+            },
+        }),
+    );
+    store.rewrite().unwrap();
+    let engine = AgentSessionEngine::new(AgentEngineConfig {
+        cwd: dir.path().to_path_buf(),
+        agent_dir,
+        provider: None,
+        model: None,
+        api_key: None,
+        thinking: None,
+        session_dir: None,
+        session_file: Some(session_path),
+        faux_script: Some(r#"{"responses": [{"text": "should not run"}]}"#.to_string()),
+        supervisor_link: None,
+        telemetry_disabled: None,
+        cron_store: None,
+        queued_steering_probe: None,
+    })
+    .unwrap();
+    assert!(engine.goal_runtime.lock().unwrap().is_none());
+    let edited = engine
+        .edit_goal_objective("goal-1", "old objective", "new objective")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(edited.status, pa_core::goals::GoalStatus::Paused);
+    assert_eq!(edited.tokens_used, 34);
+    assert_eq!(edited.continuations_used, 2);
+    assert_eq!(engine.goal_state_value()["objective"], "new objective");
+    let core = engine.session.lock().await.clone().unwrap();
+    assert!(!core.session.agent().state().await.is_streaming);
+    assert!(!core.session.agent().has_queued_messages());
+}
+
+#[tokio::test(flavor = "current_thread")]
+// The same cross-test faux registry guard is deliberately held for this runtime.
+#[allow(clippy::await_holding_lock)]
+async fn objective_edit_waits_for_published_handles_to_finish_adoption() {
+    let _faux = FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::TempDir::new().unwrap();
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let session_path = dir.path().join("session.jsonl");
+    let mut store = crate::session_store::SessionFile::create("/tmp", None, 0);
+    store.set_path(session_path.clone());
+    store.append_entry(
+        "custom",
+        json!({
+            "customType": pa_core::goals::GOAL_STATE_CUSTOM_TYPE,
+            "data": {
+                "active": false,
+                "status": "paused",
+                "goalId": "goal-1",
+                "objective": "old objective",
+                "tokensUsed": 34,
+                "timeUsedSeconds": 9,
+                "continuationsUsed": 2,
+            },
+        }),
+    );
+    store.rewrite().unwrap();
+    let engine = AgentSessionEngine::new(AgentEngineConfig {
+        cwd: dir.path().to_path_buf(),
+        agent_dir,
+        provider: None,
+        model: None,
+        api_key: None,
+        thinking: None,
+        session_dir: None,
+        session_file: Some(session_path),
+        faux_script: Some(r#"{"responses": [{"text": "should not run"}]}"#.to_string()),
+        supervisor_link: None,
+        telemetry_disabled: None,
+        cron_store: None,
+        queued_steering_probe: None,
+    })
+    .unwrap();
+    let build_guard = engine.session_build.lock().await;
+    let model = engine.resolve_model().unwrap();
+    let built = engine.build_session(&model).await.unwrap();
+    engine.mirror_goal_runtime(&built).await;
+    assert!(engine.session.lock().await.is_none());
+    assert!(engine.goal_runtime.lock().unwrap().is_some());
+    assert!(built.goal_driver.lock().await.state().goal_id.is_none());
+
+    let mut edit = engine.edit_goal_objective("goal-1", "old objective", "new objective");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(10), &mut edit)
+            .await
+            .is_err(),
+        "the edit must wait for the build gate despite published idle handles"
+    );
+    drop(build_guard);
+    let edited = edit.await.unwrap().unwrap();
+    assert_eq!(edited.goal_id.as_deref(), Some("goal-1"));
+    assert_eq!(edited.objective.as_deref(), Some("new objective"));
+    assert_eq!(edited.status, pa_core::goals::GoalStatus::Paused);
+    assert_eq!(edited.tokens_used, 34);
+    assert_eq!(edited.time_used_seconds, 9);
+    assert_eq!(edited.continuations_used, 2);
+    let core = engine.session.lock().await.clone().unwrap();
+    let state = core.session.agent().state().await;
+    assert!(!state.is_streaming);
+    assert!(
+        state.messages.is_empty(),
+        "objective edit invoked a model turn"
+    );
+    assert!(!core.session.agent().has_queued_messages());
+}
+
 #[test]
 fn recovery_rebuild_rehydrates_the_goal_from_the_session_file() {
     let _faux = FAUX_TEST_LOCK

@@ -192,6 +192,8 @@ pub async fn handle_command(state: &Arc<RpcState>, command: protocol::RpcCommand
         }
         "new_session" => new_session(state, &payload).await,
         "get_state" => get_state(state).await,
+        "edit_goal_objective" => edit_goal_objective(state, &payload).await,
+        "control_goal" => control_goal(state, &payload).await,
         "set_model" => model_commands::set_model(state, &payload).await,
         "cycle_model" => model_commands::cycle_model(state).await,
         "get_available_models" => model_commands::get_available_models(state).await,
@@ -213,6 +215,102 @@ pub async fn handle_command(state: &Arc<RpcState>, command: protocol::RpcCommand
         Ok(data) => protocol::success(id.as_ref(), name, data),
         Err(message) => protocol::error(id.as_ref(), name, &message),
     }
+}
+
+async fn edit_goal_objective(
+    state: &Arc<RpcState>,
+    payload: &Value,
+) -> Result<ResponseData, String> {
+    let (Some(goal_id), Some(expected_objective), Some(objective)) = (
+        payload.get("goalId").and_then(Value::as_str),
+        payload.get("expectedObjective").and_then(Value::as_str),
+        payload.get("objective").and_then(Value::as_str),
+    ) else {
+        return Err(
+            "Goal identity, expected objective, and objective must be strings.".to_string(),
+        );
+    };
+    let handle = state.session.handle().await;
+    let engine = &handle.engine;
+    let changed = {
+        let persistence = engine.session.shared_persistence();
+        let mut driver = engine.goal_driver.lock().await;
+        let mut session = persistence.lock().await;
+        driver
+            .edit_objective(&mut session, goal_id, expected_objective, objective)
+            .map_err(|error| format!("{error:#}"))?
+    };
+    let Some(goal) = changed else {
+        return Ok(ResponseData::Present(
+            serde_json::to_value(engine.goal_state().await).unwrap_or(Value::Null),
+        ));
+    };
+    state.publish_goal_update_for(&goal).await;
+    if goal.status == pa_core::goals::GoalStatus::Active
+        && engine.session.agent().state().await.is_streaming
+    {
+        let agent = engine.session.agent();
+        agent.remove_queued_messages(|message| {
+            matches!(message, pa_agent::types::AgentMessage::Custom(custom)
+                if custom.payload.get("customType").and_then(Value::as_str)
+                    == Some(pa_core::goals::GOAL_CONTEXT_CUSTOM_TYPE))
+        });
+        let message = pa_core::goals::create_goal_context_message(
+            &goal,
+            pa_core::goals::GoalContextKind::ObjectiveUpdated,
+            &[],
+        )
+        .map_err(|error| format!("{error:#}"))?;
+        if let Some(row) =
+            pa_core::session_engine::goal_boundary::custom_message_to_loop_row(&message)
+        {
+            agent.follow_up(row);
+        }
+    }
+    Ok(ResponseData::Present(
+        serde_json::to_value(goal).unwrap_or(Value::Null),
+    ))
+}
+
+async fn control_goal(state: &Arc<RpcState>, payload: &Value) -> Result<ResponseData, String> {
+    use pa_core::session_engine::goal_driver::GoalControlAction;
+
+    let (Some(goal_id), Some(expected_objective), Some(action)) = (
+        payload.get("goalId").and_then(Value::as_str),
+        payload.get("expectedObjective").and_then(Value::as_str),
+        payload.get("action").and_then(Value::as_str),
+    ) else {
+        return Err("Goal identity, expected objective, and action must be strings.".to_string());
+    };
+    let action = match action {
+        "pause" => GoalControlAction::Pause,
+        "clear" => GoalControlAction::Clear,
+        _ => return Err("Unknown goal control action.".to_string()),
+    };
+    if state.compacting.load(Ordering::SeqCst) != 0 {
+        return Err("Goal cannot be controlled during compaction.".to_string());
+    }
+    let handle = state.session.handle().await;
+    let engine = &handle.engine;
+    let changed = {
+        let persistence = engine.session.shared_persistence();
+        let mut driver = engine.goal_driver.lock().await;
+        let mut session = persistence.lock().await;
+        driver
+            .control_goal(&mut session, goal_id, expected_objective, action)
+            .map_err(|error| format!("{error:#}"))?
+    };
+    let goal = changed.unwrap_or_else(pa_core::goals::empty_goal_state);
+    state.publish_goal_update_for(&goal).await;
+    engine.session.agent().remove_queued_messages(|message| {
+        matches!(message, pa_agent::types::AgentMessage::Custom(custom)
+            if custom.payload.get("customType").and_then(Value::as_str)
+                == Some(pa_core::goals::GOAL_CONTEXT_CUSTOM_TYPE))
+    });
+    Ok(ResponseData::Present(match action {
+        GoalControlAction::Pause => serde_json::to_value(goal).unwrap_or(Value::Null),
+        GoalControlAction::Clear => Value::Null,
+    }))
 }
 
 /// `new_session`: a fresh session, optionally under a parent session.

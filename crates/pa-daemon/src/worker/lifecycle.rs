@@ -5,6 +5,7 @@ use super::{
     DaemonResponse, QueueCheckpoint, QueuePriority, QueuedItem, SessionFile, TurnPolicy, Value,
     Worker, SIDE_QUESTION_SETTLE_TIMEOUT,
 };
+use crate::goal_continuation::HeadlessGoalWait;
 
 impl Worker {
     /// `update_snapshot` (supervisor plane, update flow spec §8): a read-only
@@ -608,7 +609,76 @@ impl Worker {
         if let Err(response) = self.require_created("wait_for_headless_completion") {
             return response;
         }
-        self.wait_until_quiescent(payload).await;
+        // A natural turn can end while a kernel background Bash handle owns
+        // its goal continuation. The worker is idle then, but the settle hook
+        // has not yet admitted the next turn. Keep this headless-only barrier
+        // across that handoff and across an armed goal backoff wake.
+        let mut retried_unwoken = false;
+        loop {
+            let Some(engine) = self.agent_engine.as_ref() else {
+                self.wait_until_quiescent(payload).await;
+                break;
+            };
+            let idle = self.idle_notify.notified();
+            let retry = engine.goal_retry_notify.notified();
+            tokio::pin!(idle);
+            tokio::pin!(retry);
+            idle.as_mut().enable();
+            retry.as_mut().enable();
+            self.wait_until_quiescent(payload).await;
+            let aborted_while_idle = {
+                let core = self.core.lock().unwrap();
+                core.abort_requested && core.queued_input_suspended
+            };
+            if aborted_while_idle {
+                break;
+            }
+            let mut settled_candidate = false;
+            match engine.headless_goal_wait_state().await {
+                HeadlessGoalWait::Settled => {
+                    // A retry can admit a turn after the prior idle read.
+                    self.wait_until_quiescent(payload).await;
+                    if engine.headless_goal_wait_state().await == HeadlessGoalWait::Settled {
+                        settled_candidate = true;
+                    }
+                }
+                HeadlessGoalWait::RetryOwed if !retried_unwoken => {
+                    // Bash settlement can precede its callback by a few
+                    // instructions. Consult the owed continuation ourselves
+                    // once; a failed persist must not keep this wait alive.
+                    retried_unwoken = true;
+                    engine.retry_owed_goal_continuation();
+                }
+                HeadlessGoalWait::RetryOwed => {
+                    self.wait_until_quiescent(payload).await;
+                    if matches!(
+                        engine.headless_goal_wait_state().await,
+                        HeadlessGoalWait::RetryOwed | HeadlessGoalWait::Settled
+                    ) {
+                        settled_candidate = true;
+                    }
+                }
+                HeadlessGoalWait::Pending => retried_unwoken = false,
+                HeadlessGoalWait::Retrying => {}
+            }
+            if settled_candidate {
+                // The goal sink clears its pending guard only after queue
+                // admission. A turn may have started since the last idle
+                // read, so check the worker lane once more before returning.
+                let core = self.core.lock().unwrap();
+                if !core.busy
+                    && (core.steering.is_empty() && core.follow_up.is_empty()
+                        || self.input_pauses.paused())
+                {
+                    break;
+                }
+                continue;
+            }
+            tokio::select! {
+                () = &mut idle => {},
+                () = &mut retry => {},
+            }
+        }
         // The idle wait finished, so no turn holds the accounting state;
         // the snapshot read cannot interleave with a running turn.
         let status = self

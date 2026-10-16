@@ -228,7 +228,7 @@ impl AgentSessionEngine {
         // last leaves the newest store standing. This runs on the turn's
         // blocking thread (the worker parks the turn there), so the
         // synchronous resolution never touches an async executor worker.
-        let _reload_serialized = self
+        let reload_serialized = self
             .reload_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -268,6 +268,44 @@ impl AgentSessionEngine {
         if let Some(target) = target.take() {
             *self.provider_target.write().expect("provider target lock") = Some(target);
         }
+        drop(reload_serialized);
+        self.restore_image_route_provenance(&route.target.model);
+    }
+
+    /// A routed assistant row records the vision model that served it. Add a
+    /// durable return-to-text marker so a fresh process restores the session
+    /// model, including after a compaction that removed the assistant row.
+    fn restore_image_route_provenance(&self, image_model: &pa_types::ai::Model) {
+        let Some(primary) = self
+            .provider_target
+            .read()
+            .expect("provider target lock")
+            .as_ref()
+            .map(|target| target.model.clone())
+        else {
+            return;
+        };
+        if primary.provider == image_model.provider && primary.id == image_model.id {
+            return;
+        }
+        let core = self.session.blocking_lock().clone();
+        let Some(core) = core else {
+            return;
+        };
+        let persistence = core.session.shared_persistence();
+        self.runtime.block_on(async move {
+            let mut manager = persistence.lock().await;
+            if manager.active_context().model.as_ref()
+                != Some(&(image_model.provider.clone(), image_model.id.clone()))
+            {
+                return;
+            }
+            if let Err(error) = manager.append_model_change(&primary.provider, &primary.id) {
+                eprintln!(
+                    "pa-daemon: image route model provenance restore failed: {error}; a resumed session may select the image model"
+                );
+            }
+        });
     }
 
     /// Whether an image-model route is armed for the running episode (the
@@ -512,6 +550,11 @@ mod tests {
         assert_eq!(turn_end["model"], serde_json::json!("mock-vision"));
         assert_eq!(turn_end["provider"], serde_json::json!("battery"));
         assert_eq!(engine.session_model().unwrap().id, "mock-1");
+        assert_eq!(
+            events.last(),
+            Some(&EngineEvent::ModelRestore),
+            "the daemon-owned session must receive the restoration after the vision row"
+        );
         let agent = engine
             .turn_agent
             .lock()
@@ -519,6 +562,83 @@ mod tests {
             .clone()
             .expect("session built by the routed turn");
         assert!(agent.model_override().is_none());
+        let core = engine
+            .session
+            .blocking_lock()
+            .clone()
+            .expect("the routed turn built a core session");
+        let persistence = core.session.shared_persistence();
+        let session_path = engine.runtime.block_on(async {
+            let mut manager = persistence.lock().await;
+            assert_eq!(
+                manager.active_context().model,
+                Some(("battery".to_string(), "mock-1".to_string()))
+            );
+            assert!(matches!(
+                manager.retained_entries().last(),
+                Some(pa_types::session::FileEntry::ModelChange { payload, .. })
+                    if payload.provider == "battery" && payload.model_id == "mock-1"
+            ));
+            manager.materialize_session_file(Some(dir.path().join("sessions")))
+        });
+        let saved = pa_core::session::manager::SessionManager::open(
+            dir.path(),
+            &dir.path().join("sessions"),
+            &session_path,
+        )
+        .active_context();
+        assert_eq!(
+            saved.model,
+            Some(("battery".to_string(), "mock-1".to_string()))
+        );
+        // A compaction can hide the vision assistant from prompt context,
+        // but its model provenance still controls resume until the return
+        // marker is appended after the compacted branch.
+        engine.runtime.block_on(async {
+            let mut manager = persistence.lock().await;
+            let image_assistant = manager
+                .retained_entries()
+                .iter()
+                .find_map(|entry| match entry {
+                    pa_types::session::FileEntry::Message {
+                        message: pa_types::session::AgentMessage::Assistant(message),
+                        ..
+                    } if message.model == "mock-vision" => {
+                        Some(pa_types::session::AgentMessage::Assistant(message.clone()))
+                    }
+                    _ => None,
+                })
+                .expect("routed assistant is retained");
+            let kept_id = manager.append_message(image_assistant).unwrap();
+            manager
+                .append_compaction(pa_types::session::CompactionEntry {
+                    summary: "vision turn summarized".to_string(),
+                    first_kept_entry_id: kept_id,
+                    tokens_before: 100,
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(
+                manager.active_context().model,
+                Some(("battery".to_string(), "mock-vision".to_string()))
+            );
+        });
+        let image_model = engine
+            .resolve_image_turn_route(true)
+            .unwrap()
+            .unwrap()
+            .model;
+        engine.restore_image_route_provenance(&image_model);
+        assert_eq!(
+            pa_core::session::manager::SessionManager::open(
+                dir.path(),
+                &dir.path().join("sessions"),
+                &session_path,
+            )
+            .active_context()
+            .model,
+            Some(("battery".to_string(), "mock-1".to_string()))
+        );
         registration.unregister();
     }
 

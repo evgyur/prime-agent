@@ -323,10 +323,12 @@ impl Worker {
         // daemon's other settings reads, and the same fresh-per-connection
         // read the supervisor's hello does.
         let agent_dir = self.config.agent_dir.clone();
-        let factory_capabilities =
-            tokio::task::spawn_blocking(move || worker_server_capabilities(&agent_dir))
-                .await
-                .map_err(|error| anyhow::anyhow!("the factory settings read failed: {error:#}"))?;
+        let session_scoped_preferences = self.session_scoped_preferences;
+        let factory_capabilities = tokio::task::spawn_blocking(move || {
+            worker_server_capabilities(&agent_dir, session_scoped_preferences)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("the factory settings read failed: {error:#}"))?;
         let hello = DaemonOutbound::DaemonHello {
             socket_path: self.config.socket_path.to_string_lossy().to_string(),
             protocol: current_protocol_info(),

@@ -1,7 +1,7 @@
 //! The live model/thinking switches (`set_model`, `set_thinking_level`).
 //! The engine owns the runtime switch; this module owns the wire
 //! contract: registry resolution, the durable `model_change` /
-//! `thinking_level_change` rows, and the persisted settings defaults.
+//! `thinking_level_change` rows, and optional shared settings defaults.
 
 use serde_json::Value;
 
@@ -16,7 +16,7 @@ impl Worker {
     /// `set_model { provider, modelId }`: resolve through the registry's
     /// available catalog, enforce the daemon model allowlist (outside it
     /// fails loudly, never a fallback), switch the engine, record the
-    /// durable `model_change` row, and persist the settings default. The
+    /// durable `model_change` row, and normally persist the settings default. The
     /// switch parks the runtime, so it runs on the blocking pool.
     pub(crate) async fn handle_set_model(&self, payload: &Value) -> DaemonResponse {
         if let Err(response) = self.require_created("set_model") {
@@ -84,6 +84,7 @@ impl Worker {
         let engine = std::sync::Arc::clone(&self.engine);
         let core = std::sync::Arc::clone(&self.core);
         let agent_dir = self.config.agent_dir.clone();
+        let session_scoped_preferences = self.session_scoped_preferences;
         let provider = provider.to_string();
         let model_id = model_id.to_string();
         let switched = tokio::task::spawn_blocking(move || {
@@ -107,10 +108,12 @@ impl Worker {
                 }
                 core.cwd.clone()
             };
-            // TS `session.setModel` persists the default provider/model so
-            // the next session starts on the switched model.
-            let mut settings = pa_core::settings::SettingsManager::create(&cwd, &agent_dir);
-            let _ = settings.set_default_model_and_provider(&provider, &model_id);
+            // Studio stores this choice in the durable session row above;
+            // normal CLI workers retain the TS shared-default behavior.
+            if !session_scoped_preferences {
+                let mut settings = pa_core::settings::SettingsManager::create(&cwd, &agent_dir);
+                let _ = settings.set_default_model_and_provider(&provider, &model_id);
+            }
             Some(())
         })
         .await
@@ -139,7 +142,7 @@ impl Worker {
     /// `set_thinking_level { level }`: apply the requested level through
     /// the engine (clamped to the model's supported levels) and record the
     /// durable `thinking_level_change` row only when the effective level
-    /// changed; the settings default follows.
+    /// changed; the settings default follows outside Studio's session scope.
     pub(crate) async fn handle_set_thinking_level(&self, payload: &Value) -> DaemonResponse {
         if let Err(response) = self.require_created("set_thinking_level") {
             return response;
@@ -170,6 +173,7 @@ impl Worker {
         let engine = std::sync::Arc::clone(&self.engine);
         let core = std::sync::Arc::clone(&self.core);
         let agent_dir = self.config.agent_dir.clone();
+        let session_scoped_preferences = self.session_scoped_preferences;
         let reasoning = self
             .engine
             .model_metadata()
@@ -200,7 +204,7 @@ impl Worker {
             // TS persists the default when the model can think or the level
             // is a real reasoning request; the persisted value is the
             // clamped effective level, not the raw request.
-            if reasoning || effective != "off" {
+            if !session_scoped_preferences && (reasoning || effective != "off") {
                 let effective_level = pa_ai::models::thinking_level_from_str(&effective)
                     .expect("the engine reports a valid wire level");
                 let mut settings = pa_core::settings::SettingsManager::create(&cwd, &agent_dir);
@@ -250,6 +254,86 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    struct SwitchingPreferencesEngine {
+        model: std::sync::Mutex<String>,
+        thinking: std::sync::Mutex<String>,
+    }
+
+    impl crate::engine::SessionEngine for SwitchingPreferencesEngine {
+        fn run_prompt(
+            &self,
+            _: usize,
+            _: crate::engine::PromptRequest,
+            _: &dyn Fn() -> bool,
+            _: &mut dyn FnMut(crate::engine::EngineEvent) -> bool,
+        ) {
+        }
+
+        fn run_side_question(
+            &self,
+            request: crate::engine::SideQuestionRequest,
+            signal: &pa_agent::abort::AbortSignal,
+            sink: &pa_core::session_engine::side_question::SideQuestionSink,
+        ) -> crate::engine::SideQuestionOutcome {
+            crate::engine::ScriptedEngine::default().run_side_question(request, signal, sink)
+        }
+
+        fn run_compaction(
+            &self,
+            request: crate::engine::CompactionRequest,
+            signal: &pa_agent::abort::AbortSignal,
+        ) -> crate::engine::CompactionOutcome {
+            crate::engine::ScriptedEngine::default().run_compaction(request, signal)
+        }
+
+        fn run_branch_summary(
+            &self,
+            request: crate::engine::BranchSummaryRequest,
+            signal: &pa_agent::abort::AbortSignal,
+        ) -> crate::engine::BranchSummaryOutcome {
+            crate::engine::ScriptedEngine::default().run_branch_summary(request, signal)
+        }
+
+        fn rebuild_session_context(
+            &self,
+            _: Vec<pa_types::session::FileEntry>,
+            _: pa_core::session_engine::goal_driver::GoalBranchReload,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn model_metadata(&self) -> Option<Value> {
+            Some(json!({
+                "provider": "prime-inference",
+                "id": self.model.lock().unwrap().clone(),
+                "reasoning": true,
+            }))
+        }
+
+        fn effective_thinking_level(&self) -> Option<String> {
+            Some(self.thinking.lock().unwrap().clone())
+        }
+
+        fn switch_model(&self, selection: EngineModelSelection) -> bool {
+            let Some(model) = selection.model else {
+                return false;
+            };
+            *self.model.lock().unwrap() = model;
+            true
+        }
+
+        fn switch_thinking_level(&self, level: pa_types::ai::ModelThinkingLevel) -> bool {
+            let Some(wire) = serde_json::to_value(level)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+            else {
+                return false;
+            };
+            *self.thinking.lock().unwrap() = wire;
+            true
+        }
+    }
+
     fn worker_config(dir: &std::path::Path) -> crate::worker::WorkerConfig {
         crate::worker::WorkerConfig {
             socket_path: dir.join("worker.sock"),
@@ -279,7 +363,10 @@ mod tests {
                         "models": [
                             { "id": "mock-1", "name": "Mock 1", "api": "openai-completions",
                               "baseUrl": "http://127.0.0.1:9/v1", "contextWindow": 128_000,
-                              "maxTokens": 4096 }
+                              "maxTokens": 4096, "reasoning": true },
+                            { "id": "mock-2", "name": "Mock 2", "api": "openai-completions",
+                              "baseUrl": "http://127.0.0.1:9/v1", "contextWindow": 128_000,
+                              "maxTokens": 4096, "reasoning": true }
                         ]
                     }
                 }
@@ -287,6 +374,109 @@ mod tests {
             .to_string(),
         )
         .expect("write models.json");
+    }
+
+    #[tokio::test]
+    async fn studio_switches_stay_in_session_while_cli_keeps_shared_defaults() {
+        for session_scoped in [true, false] {
+            let dir = tempfile::tempdir().expect("isolated session and settings");
+            models_fixture(dir.path());
+            let settings_path = dir.path().join("agent/settings.json");
+            let initial = json!({
+                "defaultProvider": "prime-inference",
+                "defaultModel": "mock-1",
+                "defaultThinkingLevel": "low",
+                "recentModels": ["prime-inference/mock-1"]
+            });
+            std::fs::write(&settings_path, initial.to_string()).unwrap();
+            let mut worker = crate::worker::Worker::new(worker_config(dir.path()), None);
+            // The env is read once at process startup. Set the resulting
+            // worker policy directly so tests never mutate process-wide env.
+            worker.session_scoped_preferences = session_scoped;
+            worker.engine = std::sync::Arc::new(SwitchingPreferencesEngine {
+                model: std::sync::Mutex::new("mock-1".to_string()),
+                thinking: std::sync::Mutex::new("low".to_string()),
+            });
+            let created = worker
+                .dispatch(
+                    "create",
+                    &json!({ "cwd": dir.path(), "sessionDir": dir.path().join("sessions") }),
+                )
+                .await;
+            assert!(created.success, "create failed: {created:?}");
+            {
+                let core = worker.core.lock().unwrap();
+                let store = core.store.as_ref().unwrap();
+                let lease = store.lease.as_ref().unwrap();
+                assert_eq!(
+                    crate::lease::canonical_session_path(&store.path),
+                    lease.session_path,
+                    "fresh-session lease must remain valid after the file is created"
+                );
+            }
+
+            let switched = worker
+                .dispatch(
+                    "set_model",
+                    &json!({
+                        "activeSessionId": "allowlist-session",
+                        "provider": "prime-inference",
+                        "modelId": "mock-2",
+                    }),
+                )
+                .await;
+            assert!(switched.success, "model switch failed: {switched:?}");
+            let thinking = worker
+                .dispatch(
+                    "set_thinking_level",
+                    &json!({ "activeSessionId": "allowlist-session", "level": "high" }),
+                )
+                .await;
+            assert!(thinking.success, "thinking switch failed: {thinking:?}");
+            let settings: Value =
+                serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+            if session_scoped {
+                assert_eq!(settings, initial, "Studio must not rewrite shared defaults");
+            } else {
+                assert_eq!(settings["defaultModel"], "mock-2");
+                assert_eq!(settings["defaultThinkingLevel"], "high");
+                assert_eq!(settings["recentModels"][0], "prime-inference/mock-2");
+            }
+            let session_path = worker
+                .core
+                .lock()
+                .unwrap()
+                .store
+                .as_ref()
+                .expect("created session file")
+                .path
+                .clone();
+            let entries: Vec<Value> = std::fs::read_to_string(session_path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert!(entries
+                .iter()
+                .any(|entry| { entry["type"] == "model_change" && entry["modelId"] == "mock-2" }));
+            assert!(entries.iter().any(|entry| {
+                entry["type"] == "thinking_level_change" && entry["thinkingLevel"] == "high"
+            }));
+
+            if session_scoped {
+                let cycled = worker
+                    .dispatch(
+                        "cycle_model",
+                        &json!({ "activeSessionId": "allowlist-session" }),
+                    )
+                    .await;
+                assert!(cycled.success, "cycle model failed: {cycled:?}");
+                assert!(cycled.data.as_ref().unwrap()["model"]["id"].is_string());
+                let settings: Value =
+                    serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+                assert_eq!(settings, initial, "cycling must remain session scoped");
+            }
+        }
     }
 
     #[tokio::test]

@@ -933,6 +933,7 @@ impl SupervisorChildSessionsInner {
 mod host;
 mod lifecycle;
 mod registry;
+mod subagent_policy;
 mod usage;
 
 #[cfg(test)]

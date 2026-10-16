@@ -11,6 +11,19 @@ use super::{
 
 use std::sync::{Arc, Mutex};
 
+/// Ignore a captured turn goal update if a newer driver state has reached the
+/// worker store first. Wall-clock time alone is not a state transition.
+pub(super) fn goal_update_is_superseded(captured: &Value, current: &Value) -> bool {
+    let (Some(mut captured), Some(mut current)) =
+        (captured.as_object().cloned(), current.as_object().cloned())
+    else {
+        return false;
+    };
+    captured.remove("timeUsedSeconds");
+    current.remove("timeUsedSeconds");
+    captured != current
+}
+
 pub(super) struct TurnRunner {
     pub(crate) core: Arc<Mutex<SessionCore>>,
     pub(super) input_pauses: crate::session_input_pause::InputPauseTable,
@@ -476,8 +489,18 @@ impl TurnRunner {
                         | EngineEvent::AgentEnd { .. }
                         | EngineEvent::Done(_)
                         | EngineEvent::DoneAborted
+                        | EngineEvent::ModelRestore
                 );
                 let mut core = core.lock().unwrap();
+                if let EngineEvent::GoalUpdate { goal } = &event {
+                    // A goal update can be captured before a live objective
+                    // edit and reach this store after the edit. Compare the
+                    // driver's current state under the same store lock before
+                    // either persisting or broadcasting the captured row.
+                    if goal_update_is_superseded(goal, &engine.goal_state_value()) {
+                        return true;
+                    }
+                }
                 // The run's TRUE end — an `agent_end` with no queued work
                 // taking the next turn — keys both the note clear here and
                 // the pane's idle debounce below. An internal boundary that
@@ -636,6 +659,29 @@ impl TurnRunner {
                                     "micros": persist_started.elapsed().as_micros(),
                                 }),
                             );
+                        }
+                    }
+                    EngineEvent::ModelRestore => {
+                        if let Some(store) = core.store.as_mut() {
+                            // Resolve the actual restored target while holding the
+                            // store lock. A live switch persists under this same
+                            // lock, so this cannot overwrite its newer final row.
+                            let (Some(provider), Some(model_id)) = engine.session_model_identity()
+                            else {
+                                *turn_outcome_slot.lock().unwrap() = Some(TurnSettle::Failed(
+                                    "Could not resolve image-model restore".to_string(),
+                                ));
+                                return false;
+                            };
+                            if let Err(error) = store.persist_entry(
+                                "model_change",
+                                json!({ "provider": provider, "modelId": model_id }),
+                            ) {
+                                *turn_outcome_slot.lock().unwrap() = Some(TurnSettle::Failed(
+                                    format!("Could not persist image-model restore: {error}"),
+                                ));
+                                return false;
+                            }
                         }
                     }
                     // The durable mirror of a goal-state change: each row is the new state.
@@ -871,6 +917,7 @@ impl TurnRunner {
                         "error": ABORTED_TURN_SETTLE_ERROR,
                     })],
                     EngineEvent::ModelChange(_)
+                    | EngineEvent::ModelRestore
                     | EngineEvent::Done(Ok(()) | Err(_))
                     | EngineEvent::DoneAborted => Vec::new(),
                     EngineEvent::AutoRetryStart {

@@ -15,6 +15,24 @@ pub use pa_types::daemon::{
 };
 use serde_json::Value;
 
+/// Studio's session-scoped model/thinking switches are available only when
+/// its daemon process explicitly opts in. Stock CLI daemons keep TS defaults.
+pub(crate) const STUDIO_SESSION_PREFERENCES_CAPABILITY: &str = "session_scoped_preferences";
+
+pub(crate) fn studio_session_preferences_enabled() -> bool {
+    std::env::var("PRIME_STUDIO_SESSION_PREFERENCES").is_ok_and(|value| value == "1")
+}
+
+pub(crate) fn studio_server_capabilities(
+    mut capabilities: Vec<String>,
+    session_scoped_preferences: bool,
+) -> Vec<String> {
+    if session_scoped_preferences {
+        capabilities.push(STUDIO_SESSION_PREFERENCES_CAPABILITY.to_string());
+    }
+    capabilities
+}
+
 /// Minimum protocol version accepted in command envelopes (TS parity).
 pub const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION: u64 = DAEMON_PROTOCOL_VERSION;
 /// Compiled product-version fallback for library embedders. Packaged CLI
@@ -341,6 +359,8 @@ pub fn default_server_capabilities() -> Vec<DaemonServerCapability> {
                 "prompt_admission_cancellation",
                 "owned_prompt_cancellation",
                 "queue_message_mutation",
+                "goal_objective_edit",
+                "goal_lifecycle_control",
                 "authoritative_child_roster",
                 "owned_session_recovery_context",
                 "rlm_quiescence_barrier",
@@ -696,6 +716,12 @@ pub fn command_active_session_id(command: &DaemonCommand) -> Option<&str> {
         | DaemonCommand::GetState {
             active_session_id, ..
         }
+        | DaemonCommand::EditGoalObjective {
+            active_session_id, ..
+        }
+        | DaemonCommand::ControlGoal {
+            active_session_id, ..
+        }
         | DaemonCommand::GetConnectionState {
             active_session_id, ..
         }
@@ -981,6 +1007,8 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
         DaemonCommand::WaitForHeadlessCompletion { .. } => "wait_for_headless_completion",
         DaemonCommand::GetSessionHeader { .. } => "get_session_header",
         DaemonCommand::GetState { .. } => "get_state",
+        DaemonCommand::EditGoalObjective { .. } => "edit_goal_objective",
+        DaemonCommand::ControlGoal { .. } => "control_goal",
         DaemonCommand::GetConnectionState { .. } => "get_connection_state",
         DaemonCommand::GetMessages { .. } => "get_messages",
         DaemonCommand::GetRlmChildren { .. } => "get_rlm_children",
@@ -1063,6 +1091,17 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn session_scoped_preferences_are_advertised_only_when_active() {
+        let stock = studio_server_capabilities(vec!["factory_activity".to_string()], false);
+        assert_eq!(stock, vec!["factory_activity"]);
+        let studio = studio_server_capabilities(vec!["factory_activity".to_string()], true);
+        assert_eq!(
+            studio,
+            vec!["factory_activity", STUDIO_SESSION_PREFERENCES_CAPABILITY]
+        );
+    }
+
+    #[test]
     fn kernel_bash_activity_commands_are_session_scoped() {
         for (command, kind) in [
             (
@@ -1085,6 +1124,29 @@ mod tests {
             assert!(pa_types::daemon::is_session_plane_daemon_command(kind));
         }
         assert!(default_server_capabilities().contains(&"kernel_bash_activity".to_string()));
+    }
+
+    #[test]
+    fn goal_control_command_is_session_scoped() {
+        let line = serde_json::json!({
+            "type": "command",
+            "id": "c1",
+            "protocol": current_protocol_info(),
+            "command": {
+                "type": "control_goal",
+                "activeSessionId": "session",
+                "goalId": "goal",
+                "expectedObjective": "old",
+                "action": "clear",
+            },
+        })
+        .to_string();
+        let parsed = parse_daemon_command_line(&line).unwrap();
+        assert_eq!(command_type_name(&parsed.command), "control_goal");
+        assert_eq!(command_active_session_id(&parsed.command), Some("session"));
+        assert!(pa_types::daemon::is_session_plane_daemon_command(
+            "control_goal"
+        ));
     }
 
     #[test]
@@ -1140,6 +1202,8 @@ mod tests {
             }
         }
         assert!(default_server_capabilities().contains(&"factory_activity".to_string()));
+        assert!(default_server_capabilities().contains(&"goal_objective_edit".to_string()));
+        assert!(default_server_capabilities().contains(&"goal_lifecycle_control".to_string()));
     }
 
     #[test]

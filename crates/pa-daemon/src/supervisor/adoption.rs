@@ -41,6 +41,53 @@ mod recorded_process_tests {
         ));
         assert!(!recorded_process_alive(Some(false), Some("original"), None));
     }
+
+    #[tokio::test]
+    async fn live_unverified_tombstone_is_failed_not_counted_as_stopped() {
+        use super::{AdoptionBoot, AdoptionOutcome, Supervisor};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let options = crate::supervisor::SupervisorOptions {
+            socket_path: dir.path().join("daemon.sock"),
+            agent_dir: dir.path().join("agent"),
+        };
+        let descriptor_path =
+            crate::descriptor::descriptor_dir(&options.agent_dir, &options.socket_path)
+                .join("w-live.json");
+        let supervisor = Arc::new(Supervisor::new(options).expect("supervisor"));
+        let descriptor: pa_types::daemon::DaemonWorkerDescriptor =
+            serde_json::from_value(serde_json::json!({
+                "version": 2,
+                "workerId": "w-live",
+                "pid": std::process::id(),
+                "socketPath": dir.path().join("missing.sock").to_string_lossy(),
+                "recoveryJournalPath": dir.path().join("recovery.jsonl").to_string_lossy(),
+                "supervisorSocketPath": dir.path().join("daemon.sock").to_string_lossy(),
+                "authenticationToken": "token",
+                "rootActiveSessionId": "w-live",
+                "createdAt": "2026-10-07T00:00:00Z",
+                "updatedAt": "2026-10-07T00:00:00Z",
+                "lifecycle": "ready",
+                "createCommand": {},
+                "consecutiveFailures": 0,
+                "stopRequestedAt": "2026-10-07T00:00:00Z"
+            }))
+            .expect("descriptor");
+        crate::descriptor::persist_worker(&descriptor_path, &descriptor)
+            .expect("persist descriptor");
+        let outcome = supervisor
+            .adopt_persisted_worker(
+                descriptor_path.clone(),
+                descriptor,
+                AdoptionBoot::PlainStartup,
+            )
+            .await;
+        assert!(matches!(outcome, AdoptionOutcome::Failed));
+        assert!(descriptor_path.exists(), "tombstone remains retryable");
+        assert!(supervisor.registry.get("w-live").await.is_none());
+        assert!(crate::lease::is_process_alive(std::process::id()).unwrap());
+    }
 }
 
 /// The boot the descriptor-adoption pass runs under. An update boot relaunches kept
@@ -70,8 +117,8 @@ pub(super) enum AdoptionOutcome {
     Revived,
     /// Dead descriptor with no durable busy evidence: stayed down.
     SkippedIdle,
-    /// The descriptor carried a durable stop tombstone: the boot re-ran
-    /// the stop's finalization instead of adopting or reviving.
+    /// The descriptor carried a durable stop tombstone and the boot proved
+    /// that the stopped process exited.
     Stopped,
     Failed,
 }
@@ -259,8 +306,13 @@ impl Supervisor {
         // BEFORE the worker was told): a supervisor that died between the tombstone and the
         // shutdown finishes the stop on the next boot — never adopts it as healthy.
         if resident.descriptor.lock().await.stop_requested_at.is_some() {
-            self.finish_tombstoned_stop(&resident, alive).await;
-            return AdoptionOutcome::Stopped;
+            return if self.finish_tombstoned_stop(&resident, alive).await {
+                AdoptionOutcome::Stopped
+            } else {
+                // The durable tombstone remains for a later boot retry. It is
+                // neither a completed stop nor a healthy worker to adopt.
+                AdoptionOutcome::Failed
+            };
         }
         // The monitor must watch the process that actually runs, never the
         // descriptor's stale pre-restart pid (a revived worker was once left
@@ -668,7 +720,7 @@ impl Supervisor {
                 }
                 let _ = crate::descriptor::persist_worker(&resident.descriptor_path, &descriptor);
             }
-            self.finish_tombstoned_stop(&resident, true).await;
+            let _ = self.finish_tombstoned_stop(&resident, true).await;
             return Err(anyhow!(
                 crate::registration::tombstoned_registration_refusal(
                     &registration.active_session_id

@@ -134,6 +134,8 @@ impl AgentSessionEngine {
             late_agent_message_sink: std::sync::Mutex::new(None),
             goal_runtime: std::sync::Mutex::new(None),
             pending_goal_continuation: std::sync::Mutex::new(None),
+            goal_retry_notify: tokio::sync::Notify::new(),
+            goal_retry_in_flight: std::sync::atomic::AtomicUsize::new(0),
             goal_budget_crossed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             goal_input_probe: std::sync::Mutex::new(None),
             goal_admission_sink: std::sync::Mutex::new(None),
@@ -812,6 +814,7 @@ impl AgentSessionEngine {
     pub fn mark_session_closed(&self) {
         self.session_closed
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.goal_retry_notify.notify_waiters();
         *self.goal_runtime.lock().expect("goal runtime lock") = None;
         *self
             .autonomous_boundary
@@ -985,7 +988,7 @@ impl AgentSessionEngine {
         })
     }
 
-    async fn build_session(&self, model: &Model) -> anyhow::Result<CoreSessionEngine> {
+    pub(super) async fn build_session(&self, model: &Model) -> anyhow::Result<CoreSessionEngine> {
         let agent_model =
             json_round_trip(model).ok_or_else(|| anyhow::anyhow!("model conversion failed"))?;
         // The live queue-delivery modes: read under a scoped lock (a std

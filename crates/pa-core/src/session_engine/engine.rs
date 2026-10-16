@@ -315,7 +315,13 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     let model_context_window = model.context_window;
 
     let python_skills = super::runtime_wiring::kernel_python_skills(&resources.skills);
-    let session_id = wiring.session.lock().await.get_session_id().to_string();
+    // The daemon owns the durable session; its engine manager is in-memory
+    // and has a new id on each rebuild. Kernel callers must identify the
+    // durable owner that the supervisor can resolve, including RLM children.
+    let session_id = match config.semantic_edges.as_ref() {
+        Some(identity) => identity.session_id.clone(),
+        None => wiring.session.lock().await.get_session_id().to_string(),
+    };
     let mut handlers = wiring.handlers.clone();
     if let Some(extra) = config.extra_host_handlers.clone() {
         handlers.merge(extra);
@@ -678,11 +684,11 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             std::sync::Arc::clone(&request_timing_wiring),
             super::refinement_gate::convert_to_llm(refinement_settings.reopen()),
         )),
-        // The Rust engine wires no transform, so the instrumented seam
-        // wraps a pass-through that marks the turn's dispatch moment.
+        // Studio's optional request-only namespace compression runs before
+        // conversion; the durable session rows retain their full text.
         transform_context: Some(super::request_timing::instrument_transform_context(
             std::sync::Arc::clone(&request_timing_wiring),
-            super::request_timing::pass_through_transform(),
+            super::context_hygiene::transform_context(),
         )),
         should_stop_after_turn: {
             let steering = config.queued_steering_probe.take();

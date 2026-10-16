@@ -70,9 +70,9 @@ pub struct GoalContextDetails {
     pub continuations_used: u64,
 }
 
-/// The goal-update dedupe's age-invariant projection: the creation-based timer recomputes
-/// `time_used_seconds` from the wall clock (the operator's ruling), so the age must not participate
-/// in an "unchanged state" comparison.
+/// The goal-update dedupe's time-invariant projection: an active timer can
+/// advance between reads without a state mutation, so time alone must not
+/// cause another update event.
 #[must_use]
 pub fn goal_update_dedupe_projection(state: &GoalState) -> GoalState {
     let mut projected = state.clone();
@@ -466,6 +466,9 @@ mod tests {
         assert!(validate_goal_objective(&long).is_err());
         let at_limit = "x".repeat(MAX_THREAD_GOAL_OBJECTIVE_CHARS);
         assert!(validate_goal_objective(&at_limit).is_ok());
+        let unicode_limit = "🛰".repeat(MAX_THREAD_GOAL_OBJECTIVE_CHARS);
+        assert!(validate_goal_objective(&unicode_limit).is_ok());
+        assert!(validate_goal_objective(&format!("{unicode_limit}🛰")).is_err());
         assert!(validate_goal_budget(None).unwrap().is_none());
         assert_eq!(validate_goal_budget(Some(10)).unwrap(), Some(10));
         assert!(validate_goal_budget(Some(0)).is_err());

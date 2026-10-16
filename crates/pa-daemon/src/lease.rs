@@ -69,13 +69,27 @@ impl SessionAlreadyActiveError {
     }
 }
 
+#[must_use]
 pub fn canonical_session_path(path: &Path) -> PathBuf {
-    match path.canonicalize() {
-        Ok(canonical) => canonical,
-        Err(_) => match path.parent().map(std::path::Path::canonicalize) {
-            Some(Ok(parent)) => parent.join(path.file_name().unwrap_or_default()),
-            _ => path.to_path_buf(),
-        },
+    // A fresh session's file and even its parent directory may not exist
+    // when ownership is acquired. Canonicalize the nearest existing ancestor
+    // and append the missing components: on Windows, canonicalize adds the
+    // verbatim `\\?\` prefix, so returning the original path before creation
+    // and a canonical path afterward would make the same lease reject writes.
+    let mut ancestor = path;
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(mut canonical) = ancestor.canonicalize() {
+            for component in missing.into_iter().rev() {
+                canonical.push(component);
+            }
+            return canonical;
+        }
+        let (Some(name), Some(parent)) = (ancestor.file_name(), ancestor.parent()) else {
+            return path.to_path_buf();
+        };
+        missing.push(name.to_os_string());
+        ancestor = parent;
     }
 }
 
@@ -619,6 +633,25 @@ mod tests {
         drop(shared);
         let next = acquire_runtime_session_lease(&path, dir.path()).unwrap();
         assert_eq!(next.session_path, canonical_session_path(&path));
+    }
+
+    #[test]
+    fn fresh_lease_keeps_its_identity_after_parent_and_file_are_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("new-sessions")
+            .join("nested")
+            .join("session.jsonl");
+        let lease = acquire_runtime_session_lease(&path, dir.path()).unwrap();
+        let identity = lease.session_path.clone();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{}\n").unwrap();
+        assert_eq!(canonical_session_path(&path), identity);
+        lease.append(&path, b"{\"type\":\"custom\"}\n").unwrap();
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("{\"type\":\"custom\"}"));
     }
 
     #[test]

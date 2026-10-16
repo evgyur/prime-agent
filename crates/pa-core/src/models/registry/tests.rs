@@ -411,3 +411,49 @@ fn without_a_stored_xai_subscription_the_models_stay_on_completions() {
     assert!(grok.thinking_level_map.is_none());
     assert!(grok.compat.is_none());
 }
+
+#[test]
+fn canonical_muse_uses_only_the_stored_minted_key() {
+    let credential: AuthCredential = serde_json::from_value(serde_json::json!({
+        "type": "oauth",
+        "access": r#"{"oauthAccessToken":"identity-token","apiKey":"minted-key"}"#,
+        "refresh": "identity-token",
+        "expires": i64::MAX,
+    }))
+    .unwrap();
+    let mut data = AuthStorageData::default();
+    data.insert("muse-code", &credential);
+    let auth = AuthStorage::in_memory_without_env(&data, Arc::new(NoOAuth));
+    let mut registry = ModelRegistry::in_memory(auth);
+    let muse =
+        super::studio_providers::studio_provider_defaults(true, None, &[], Some(&credential))
+            .models
+            .into_iter()
+            .find(|model| model.provider == "muse-code")
+            .unwrap();
+    registry.models.push(muse.clone());
+    registry.canonical_muse_code = true;
+    assert!(registry.has_configured_auth(&muse));
+    let request_auth = registry.get_api_key_and_headers(&muse, None);
+    assert_eq!(request_auth.api_key.as_deref(), Some("minted-key"));
+    assert_eq!(
+        request_auth
+            .headers
+            .as_ref()
+            .and_then(|headers| headers.get("x-api-version"))
+            .map(String::as_str),
+        Some("1.0.0")
+    );
+
+    registry.auth.set(
+        "muse-code",
+        AuthCredential::ApiKey {
+            key: "identity-token".to_string(),
+            prime_team: None,
+        },
+    );
+    assert!(!registry.has_configured_auth(&muse));
+    let refusal = registry.get_api_key_and_headers(&muse, None);
+    assert!(!refusal.ok);
+    assert_eq!(refusal.api_key, None);
+}

@@ -250,6 +250,10 @@ pub fn kernel_provisioner(
     if let Some(serper_api_key) = serper_api_key {
         env.insert("SERPER_API_KEY".to_string(), serper_api_key);
     }
+    // Studio resolves this id against the supervisor's live family roster.
+    // Bind each kernel to its own session; children must never inherit the
+    // parent's Roadmap identity from a shared helper configuration.
+    env.insert("PRIME_STUDIO_SESSION_ID".to_string(), session_id.clone());
     Arc::new(KernelProvisioner::new(
         cwd,
         IpythonKernelProvisionerOptions {
