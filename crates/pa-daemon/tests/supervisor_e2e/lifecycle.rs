@@ -16,7 +16,7 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
     let (mut client, hello) = Client::connect(&socket);
     assert_eq!(hello["type"], "daemon_hello");
     // Differential goldens captured from the TS supervisor
-    // (`prime-agent --mode daemon`, protocol 7, schema 29).
+    // (`prime-agent --mode daemon`, protocol 7), plus installed private goal controls.
     assert_eq!(
         hello["protocol"],
         serde_json::json!({
@@ -27,7 +27,7 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
         hello["schemaId"]
             .as_str()
             .map(std::string::ToString::to_string),
-        Some("protocol-7-schema-30-8e4b17c2a9f5".to_string())
+        Some("protocol-7-schema-31-d72194ac0355".to_string())
     );
     assert!(hello["supervisorOwnerToken"].is_string());
     assert!(hello["supervisorProcessStartId"]
@@ -55,6 +55,8 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
             "prompt_admission_cancellation",
             "owned_prompt_cancellation",
             "queue_message_mutation",
+            "goal_objective_edit",
+            "goal_lifecycle_control",
             "authoritative_child_roster",
             "owned_session_recovery_context",
             "rlm_quiescence_barrier",
