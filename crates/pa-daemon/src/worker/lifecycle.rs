@@ -529,20 +529,40 @@ impl Worker {
     /// between the check and the await loses its wake
     /// (`notify_waiters` only reaches registered futures).
     pub(crate) async fn wait_until_idle(&self) {
+        self.wait_until_idle_with_background(false).await;
+    }
+
+    /// Strong completion owns kernel background handles; ordinary turn-idle does not.
+    pub(super) async fn wait_until_idle_with_background(&self, include_background: bool) {
         loop {
             let idle = self.idle_notify.notified();
             tokio::pin!(idle);
             idle.as_mut().enable();
+            let fallback = tokio::sync::Notify::new();
+            let background_notify = self
+                .agent_engine
+                .as_ref()
+                .map_or(&fallback, |engine| &engine.goal_retry_notify);
+            let background_settled = background_notify.notified();
+            tokio::pin!(background_settled);
+            background_settled.as_mut().enable();
             {
                 let core = self.core.lock().unwrap();
+                let stopped =
+                    core.abort_requested && core.queued_input_suspended || core.shutdown_requested;
                 if !core.busy
                     && (core.steering.is_empty() && core.follow_up.is_empty()
-                        || self.input_pauses.paused())
+                        || self.input_pauses.paused()
+                        || include_background && stopped)
+                    && (!include_background || !self.engine.has_background_bash() || stopped)
                 {
                     return;
                 }
             }
-            idle.await;
+            tokio::select! {
+                () = &mut idle => {},
+                () = &mut background_settled => {},
+            }
         }
     }
 
@@ -555,7 +575,7 @@ impl Worker {
     /// terminal notice (a queued turn) drains inside the barrier exactly
     /// like TS's "work may start at the child-settlement boundary"
     /// re-check.
-    async fn wait_until_quiescent(&self, payload: &Value) {
+    async fn wait_until_quiescent(&self, payload: &Value, include_background: bool) {
         let children = if payload.get("waitForRlmQuiescence").and_then(Value::as_bool) == Some(true)
         {
             self.agent_engine
@@ -565,7 +585,8 @@ impl Worker {
             None
         };
         loop {
-            self.wait_until_idle().await;
+            self.wait_until_idle_with_background(include_background)
+                .await;
             let Some(children) = children.as_ref() else {
                 return;
             };
@@ -577,7 +598,8 @@ impl Worker {
                 // A settle funnel queues its terminal-notice follow-up BEFORE it
                 // marks the run settled, so one more idle wait drains the owed
                 // notices before the barrier answers.
-                self.wait_until_idle().await;
+                self.wait_until_idle_with_background(include_background)
+                    .await;
                 // A notice can start new child work during that drain (a settle
                 // hook spawning a descendant): re-read before answering, so the
                 // barrier holds for the new work too.
@@ -595,7 +617,11 @@ impl Worker {
     /// (the parent-side settle watcher and `collect` wait out a child's
     /// whole subtree this way).
     pub(crate) async fn handle_wait_for_idle(&self, payload: &Value) -> DaemonResponse {
-        self.wait_until_quiescent(payload).await;
+        self.wait_until_quiescent(
+            payload,
+            payload.get("waitForRlmQuiescence").and_then(Value::as_bool) == Some(true),
+        )
+        .await;
         response_success(None, "wait_for_idle", None)
     }
 
@@ -616,7 +642,7 @@ impl Worker {
         let mut retried_unwoken = false;
         loop {
             let Some(engine) = self.agent_engine.as_ref() else {
-                self.wait_until_quiescent(payload).await;
+                self.wait_until_quiescent(payload, true).await;
                 break;
             };
             let idle = self.idle_notify.notified();
@@ -625,7 +651,7 @@ impl Worker {
             tokio::pin!(retry);
             idle.as_mut().enable();
             retry.as_mut().enable();
-            self.wait_until_quiescent(payload).await;
+            self.wait_until_quiescent(payload, true).await;
             let aborted_while_idle = {
                 let core = self.core.lock().unwrap();
                 core.abort_requested && core.queued_input_suspended
@@ -637,7 +663,7 @@ impl Worker {
             match engine.headless_goal_wait_state().await {
                 HeadlessGoalWait::Settled => {
                     // A retry can admit a turn after the prior idle read.
-                    self.wait_until_quiescent(payload).await;
+                    self.wait_until_quiescent(payload, true).await;
                     if engine.headless_goal_wait_state().await == HeadlessGoalWait::Settled {
                         settled_candidate = true;
                     }
@@ -650,7 +676,7 @@ impl Worker {
                     engine.retry_owed_goal_continuation();
                 }
                 HeadlessGoalWait::RetryOwed => {
-                    self.wait_until_quiescent(payload).await;
+                    self.wait_until_quiescent(payload, true).await;
                     if matches!(
                         engine.headless_goal_wait_state().await,
                         HeadlessGoalWait::RetryOwed | HeadlessGoalWait::Settled

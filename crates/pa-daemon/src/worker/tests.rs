@@ -157,3 +157,93 @@ async fn background_refinement_event_is_fenced_to_its_review_session() {
     ));
     assert!(session_events_since(&mut subscription).is_empty());
 }
+
+#[tokio::test]
+async fn background_bash_strong_idle_holds_without_goal_but_turn_idle_returns() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = tempfile::TempDir::new().unwrap();
+    let worker = Worker::new(
+        WorkerConfig {
+            socket_path: dir.path().join("worker.sock"),
+            supervisor_socket_path: dir.path().join("supervisor.sock"),
+            token: "token".into(),
+            worker_instance_id: String::new(),
+            active_session_id: "background-test".into(),
+            agent_dir: dir.path().join("agent"),
+            recovery_journal_path: dir.path().join("recovery.jsonl"),
+            telemetry_disabled: Some(true),
+            script: Some(json!({"engine":"faux","responses":[{"text":"done"}]})),
+        },
+        None,
+    );
+    let engine = worker
+        .agent_engine
+        .as_ref()
+        .expect("actual AgentSessionEngine");
+    let live = Arc::new(AtomicBool::new(true));
+    let probe = Arc::clone(&live);
+    *engine.background_bash_probe.lock().unwrap() =
+        Some(Arc::new(move || probe.load(Ordering::SeqCst)));
+    worker.wait_until_idle().await;
+    let mut idle = Box::pin(worker.wait_until_idle_with_background(true));
+    assert!(matches!(
+        futures::poll!(idle.as_mut()),
+        std::task::Poll::Pending
+    ));
+    live.store(false, Ordering::SeqCst);
+    // The real kernel-settlement callback uses this method, including without a goal.
+    engine.retry_owed_goal_continuation();
+    tokio::time::timeout(std::time::Duration::from_secs(5), idle)
+        .await
+        .unwrap();
+    live.store(true, Ordering::SeqCst);
+    let mut headless = Box::pin(worker.wait_until_idle_with_background(true));
+    assert!(matches!(
+        futures::poll!(headless.as_mut()),
+        std::task::Poll::Pending
+    ));
+    {
+        let mut core = worker.core.lock().unwrap();
+        core.abort_requested = true;
+        core.queued_input_suspended = true;
+    }
+    {
+        worker.core.lock().unwrap().steering.push_back(QueuedItem {
+            message: "retained queued input".into(),
+            priority: QueuePriority::Human,
+            preview: None,
+            custom_message: None,
+            agent_message: None,
+            queue_key: None,
+            admission_id: None,
+            images: Vec::new(),
+            done: None,
+            queue_visible: false,
+            policy: TurnPolicy::Queued,
+            forced_batch: false,
+        });
+    }
+    let mut ordinary = Box::pin(worker.wait_until_idle());
+    assert!(matches!(
+        futures::poll!(ordinary.as_mut()),
+        std::task::Poll::Pending
+    ));
+    drop(ordinary);
+    worker.idle_notify.notify_waiters();
+    tokio::time::timeout(std::time::Duration::from_secs(5), headless)
+        .await
+        .unwrap();
+    {
+        let mut core = worker.core.lock().unwrap();
+        core.steering.clear();
+        core.abort_requested = false;
+        core.queued_input_suspended = false;
+        core.shutdown_requested = true;
+    }
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        worker.wait_until_idle_with_background(true),
+    )
+    .await
+    .unwrap();
+}

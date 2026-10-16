@@ -7,6 +7,7 @@ fn inputs() -> SummaryInputs {
         model: None,
         model_fallback_message: None,
         bash_running: false,
+        background_bash: false,
         quota_parked: false,
         subagents_running: false,
         progress_note: None,
@@ -337,4 +338,19 @@ async fn summary_carries_the_live_note_until_the_run_boundaries_clear_it() {
         summary.get("progressNote").is_none(),
         "the run boundary cleared the note: {summary:?}"
     );
+}
+
+#[test]
+fn summary_distinguishes_kernel_background_bash_from_user_bash() {
+    let core = SessionCore::test_core(None, "/tmp".to_string());
+    let summary = session_summary(
+        &core,
+        SummaryInputs {
+            background_bash: true,
+            ..inputs()
+        },
+    );
+    let wire = serde_json::to_value(summary).unwrap();
+    assert_eq!(wire["hasBackgroundBash"], true);
+    assert_eq!(wire["isBashRunning"], false);
 }

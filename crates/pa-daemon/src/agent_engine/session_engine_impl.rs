@@ -653,6 +653,10 @@ impl SessionEngine for AgentSessionEngine {
         AgentSessionEngine::is_quota_parked(self)
     }
 
+    fn has_background_bash(&self) -> bool {
+        self.has_live_background_bash_handles()
+    }
+
     fn has_running_subagents(&self) -> bool {
         self.children
             .as_ref()

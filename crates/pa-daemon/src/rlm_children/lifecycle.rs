@@ -359,7 +359,8 @@ impl SupervisorChildSessionsInner {
             record.lock().await.observe_summary(&state);
         }
         let flag = |name: &str| state.get(name).and_then(Value::as_bool).unwrap_or(false);
-        Ok(flag("isStreaming")
+        Ok(flag("hasBackgroundBash")
+            || flag("isStreaming")
             || flag("hasRunningSubagents")
             || state
                 .get("sessionActions")

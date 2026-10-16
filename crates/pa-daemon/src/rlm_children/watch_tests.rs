@@ -223,6 +223,7 @@ async fn spawn_fake_supervisor(
                             Some(json!({
                                 "isStreaming": false,
                                 "hasRunningSubagents": child_subagents.running.load(Ordering::SeqCst),
+                                "hasBackgroundBash": child_subagents.background_bash.load(Ordering::SeqCst),
                                 "sessionActions": { "queuedCount": 0 },
                             })),
                         ),
@@ -324,6 +325,7 @@ async fn sessions_with_fake_supervisor(
 #[derive(Default)]
 struct FakeChildSubagents {
     running: AtomicBool,
+    background_bash: AtomicBool,
     quiescent_waits: std::sync::atomic::AtomicUsize,
     answer_reads: AtomicU32,
 }
@@ -1836,4 +1838,23 @@ async fn failed_child_summary_retains_cached_progress_without_new_freshness() {
     assert_eq!(wire[0]["progressNote"], "last observation");
     assert_eq!(wire[0]["thinkingLevel"], "high");
     assert!(wire[0].get("lastActivityAt").is_none());
+}
+
+#[tokio::test]
+async fn background_bash_state_keeps_child_busy_before_answer_capture() {
+    let state = Arc::new(FakeChildSubagents::default());
+    state.background_bash.store(true, Ordering::SeqCst);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let (sessions, _) = sessions_with_fake_child_subagents(
+        tx,
+        0,
+        FakeKill::Success,
+        FakeChild::Healthy,
+        Arc::clone(&state),
+    )
+    .await;
+    assert!(sessions.inner.child_busy("child-live").await.unwrap());
+    assert_eq!(state.answer_reads.load(Ordering::SeqCst), 0);
+    state.background_bash.store(false, Ordering::SeqCst);
+    assert!(!sessions.inner.child_busy("child-live").await.unwrap());
 }

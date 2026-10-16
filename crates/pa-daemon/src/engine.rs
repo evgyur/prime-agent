@@ -363,6 +363,11 @@ pub trait SessionEngine: Send + Sync {
         false
     }
 
+    /// Kernel-owned background commands, distinct from user bash.
+    fn has_background_bash(&self) -> bool {
+        false
+    }
+
     /// Apply a live model switch (the daemon `set_model` command, TS
     /// `session.setModel`): the selection merges over the current one and
     /// a built session's agent and provider stream follow the new model on

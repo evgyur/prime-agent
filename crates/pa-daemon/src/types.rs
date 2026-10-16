@@ -76,6 +76,9 @@ pub struct SessionSummary {
     pub is_quota_parked: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_bash_running: Option<bool>,
+    /// A live kernel-owned bash handle still owes a result or completion notice.
+    #[serde(default)]
+    pub has_background_bash: bool,
     /// A streaming turn with tool calls in flight (TS `isRunningTools`: `isStreaming &&
     /// pendingToolCalls.size > 0`); drives the agents-view activity label's `running tools` state.
     #[serde(default)]
