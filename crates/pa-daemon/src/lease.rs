@@ -325,6 +325,49 @@ fn with_lease_guard<T>(
     result
 }
 
+/// Private supervisor-to-worker proof of an already-held session lease.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct LeaseProof {
+    session_path: String,
+    token: String,
+    pid: u32,
+    process_start_id: Option<String>,
+}
+
+pub(crate) fn with_lease_proof<T>(
+    agent_dir: &Path,
+    target: &Path,
+    proof: &LeaseProof,
+    action: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let path = canonical_session_path(Path::new(&proof.session_path));
+    anyhow::ensure!(
+        path.to_string_lossy() == proof.session_path && path == canonical_session_path(target),
+        "Lease path mismatch"
+    );
+    let directory = lease_directory(agent_dir, &path);
+    with_lease_guard(&directory, GuardWait::ThroughStale, || {
+        let owner = read_owner(&directory)?.ok_or_else(|| anyhow!("Lease no longer owned"))?;
+        anyhow::ensure!(
+            owner.token == proof.token
+                && owner.pid == proof.pid
+                && owner.session_path == proof.session_path
+                && matches!(is_process_alive(owner.pid), Ok(true))
+                && owner
+                    .process_start_id
+                    .as_deref()
+                    .filter(|id| !id.is_empty())
+                    .is_some_and(|recorded| {
+                        proof.process_start_id.as_deref() == Some(recorded)
+                            && get_process_start_id(owner.pid).as_deref() == Some(recorded)
+                    }),
+            "Lease proof no longer current"
+        );
+        action()
+    })
+}
+
 /// A held session lease; release removes the directory when still owned.
 #[derive(Debug)]
 pub struct SessionLease {
@@ -344,6 +387,14 @@ pub struct SessionLease {
 }
 
 impl SessionLease {
+    pub(crate) fn private_proof(&self) -> LeaseProof {
+        LeaseProof {
+            session_path: self.session_path.to_string_lossy().into_owned(),
+            token: self.token.clone(),
+            pid: std::process::id(),
+            process_start_id: get_process_start_id(std::process::id()),
+        }
+    }
     pub fn release(&self) {
         if self
             .released
@@ -607,6 +658,124 @@ pub(crate) fn reclaim_dead_owner_leases(agent_dir: &Path) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn private_proof_denies_missing_empty_mismatched_or_unverifiable_process_identity() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("child.jsonl");
+        let lease = acquire_runtime_session_lease(&target, dir.path()).unwrap();
+        let original = read_owner(&lease.directory).unwrap().unwrap();
+        let mut writes = 0;
+        for identity in [
+            None,
+            Some(String::new()),
+            Some("not-current-process".into()),
+        ] {
+            let mut owner = original.clone();
+            owner.process_start_id = identity.clone();
+            let mut proof = lease.private_proof();
+            proof.process_start_id = identity;
+            fs::write(
+                lease.directory.join("owner.json"),
+                serde_json::to_vec(&owner).unwrap(),
+            )
+            .unwrap();
+            assert!(with_lease_proof(dir.path(), &target, &proof, || {
+                writes += 1;
+                Ok(())
+            })
+            .is_err());
+        }
+        let mut owner = original.clone();
+        owner.pid = u32::MAX;
+        owner.process_start_id = Some("unverifiable".into());
+        let mut proof = lease.private_proof();
+        proof.pid = owner.pid;
+        proof.process_start_id = owner.process_start_id.clone();
+        fs::write(
+            lease.directory.join("owner.json"),
+            serde_json::to_vec(&owner).unwrap(),
+        )
+        .unwrap();
+        assert!(with_lease_proof(dir.path(), &target, &proof, || {
+            writes += 1;
+            Ok(())
+        })
+        .is_err());
+        fs::write(
+            lease.directory.join("owner.json"),
+            serde_json::to_vec(&original).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(writes, 0);
+    }
+
+    #[test]
+    fn private_lease_proof_rejects_late_replaced_or_wrong_target_append() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("child.jsonl");
+        let lease = acquire_runtime_session_lease(&file, dir.path()).unwrap();
+        let proof = lease.private_proof();
+        let mut writes = 0;
+        with_lease_proof(dir.path(), &file, &proof, || {
+            writes += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(writes, 1);
+        lease.release();
+        assert!(with_lease_proof(dir.path(), &file, &proof, || {
+            writes += 1;
+            Ok(())
+        })
+        .is_err());
+        let replacement = acquire_runtime_session_lease(&file, dir.path()).unwrap();
+        assert!(with_lease_proof(dir.path(), &file, &proof, || {
+            writes += 1;
+            Ok(())
+        })
+        .is_err());
+        assert!(with_lease_proof(
+            dir.path(),
+            &dir.path().join("other"),
+            &replacement.private_proof(),
+            || {
+                writes += 1;
+                Ok(())
+            }
+        )
+        .is_err());
+        assert_eq!(writes, 1);
+    }
+
+    #[test]
+    fn private_proof_append_and_release_share_cross_process_guard() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("child.jsonl");
+        let lease = std::sync::Arc::new(acquire_runtime_session_lease(&file, dir.path()).unwrap());
+        let proof = lease.private_proof();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let root = dir.path().to_path_buf();
+        let target = file.clone();
+        let thread = std::thread::spawn(move || {
+            with_lease_proof(&root, &target, &proof, || {
+                entered_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+                std::fs::write(&target, "synced fact").unwrap();
+                std::fs::File::open(&target).unwrap().sync_all().unwrap();
+                Ok(())
+            })
+        });
+        entered_rx.recv().unwrap();
+        let release = std::sync::Arc::clone(&lease);
+        let releaser = std::thread::spawn(move || release.release());
+        resume_tx.send(()).unwrap();
+        thread.join().unwrap().unwrap();
+        releaser.join().unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "synced fact");
+        assert!(with_lease_proof(dir.path(), &file, &lease.private_proof(), || Ok(())).is_err());
+    }
+
     use super::*;
 
     #[test]

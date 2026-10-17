@@ -32,6 +32,13 @@ impl SessionEngine for AgentSessionEngine {
                 .ok_or_else(|| anyhow::anyhow!("Orchestration children unavailable"))?;
             match configure {
                 Some(mut payload) => {
+                    if let Some(request) = payload.get("ownerCancelChild") {
+                        anyhow::ensure!(
+                            payload.as_object().is_some_and(|object| object.len() == 1),
+                            "Unexpected owner cancellation fields"
+                        );
+                        return children.owner_cancel_child(request).await;
+                    }
                     if let Some(review) = payload.get("beginManagedReview") {
                         anyhow::ensure!(
                             crate::child_status_notices::consume(review["nativeNonce"].as_str()),

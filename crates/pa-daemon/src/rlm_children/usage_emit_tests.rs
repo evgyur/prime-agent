@@ -53,6 +53,7 @@ fn record_with_file(child_id: &str, session_file: &Path) -> Arc<Mutex<ChildRecor
         progress_note: None,
         label: "child".to_string(),
         started_at_ms: 0,
+        owner_cancelled: false,
         settled_status: None,
         settled: false,
         admission_blocked: false,

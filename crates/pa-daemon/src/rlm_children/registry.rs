@@ -512,6 +512,7 @@ fn ledger_child_records(
                 },
                 |display| display.created_at,
             ),
+            owner_cancelled: false,
             settled_status: (!unresolved).then_some(
                 if display
                     .as_ref()

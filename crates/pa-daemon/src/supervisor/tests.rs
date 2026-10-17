@@ -1873,7 +1873,7 @@ async fn a_passivated_row_prompt_with_no_rival_falls_through_the_failed_launch()
 }
 
 #[tokio::test]
-async fn a_ledger_delete_of_a_stopped_child_tombstones_without_a_worker() {
+async fn a_saved_child_delete_preserves_artifacts_without_verified_stop() {
     let dir = tempfile::TempDir::new().unwrap();
     let agent_dir = dir.path().join("agent");
     let sessions_dir = agent_dir.join("sessions");
@@ -1893,8 +1893,7 @@ async fn a_ledger_delete_of_a_stopped_child_tombstones_without_a_worker() {
         "{\"type\":\"session\",\"version\":3,\"id\":\"child-gone\",\"timestamp\":\"t\",\"cwd\":\"/c\"}\n",
     )
     .unwrap();
-    // The child's artifact partition exists (the stopped child's leftover):
-    // the delete must sweep it exactly like a live child's kill route.
+    // Saved evidence survives an unverified delete.
     let artifacts = agent_dir.join("session-artifacts").join("child-gone");
     std::fs::create_dir_all(&artifacts).unwrap();
     std::fs::write(artifacts.join("scheduled-jobs.json"), "{}").unwrap();
@@ -1915,64 +1914,34 @@ async fn a_ledger_delete_of_a_stopped_child_tombstones_without_a_worker() {
         .expect("the spawn edge appends");
     assert_eq!(ledger.live_edges().expect("edges").len(), 1);
 
-    // The parent's delete rides the kill route with the marker; the arm must answer
-    // success WITH the tombstone applied.
     let outcome = supervisor
         .tombstone_saved_rlm_child(
             "child-gone",
             Some("sub-gone"),
             crate::rlm_ledger::RlmLedgerDeleteReason::User,
         )
-        .await;
-    assert!(
-        outcome.is_ok(),
-        "the stopped child's delete must tombstone: {outcome:?}"
-    );
-    let edges = ledger.live_edges().expect("edges after");
-    assert!(
-        edges.is_empty(),
-        "the tombstone retires the live edge: {edges:?}"
-    );
-    let tombstones = ledger.edges(true).expect("tombstones");
-    assert_eq!(
-        tombstones[0].deleted,
-        Some(crate::rlm_ledger::RlmLedgerDeleteReason::User)
-    );
-
-    // An unknown selector with no ledger edge is a clean failure (the
-    // caller answers the delete error, never a silent success).
-    let miss = supervisor
+        .await
+        .unwrap_err();
+    assert!(outcome.to_string().contains("reconciliation required"));
+    assert_eq!(ledger.live_edges().unwrap().len(), 1);
+    assert!(ledger.edges(true).unwrap()[0].deleted.is_none());
+    assert!(artifacts.join("scheduled-jobs.json").exists());
+    assert!(!std::fs::read_to_string(&child_file)
+        .unwrap()
+        .contains("archived"));
+    assert!(supervisor
         .tombstone_saved_rlm_child(
             "no-such-child",
             None,
-            crate::rlm_ledger::RlmLedgerDeleteReason::User,
+            crate::rlm_ledger::RlmLedgerDeleteReason::User
         )
-        .await;
-    assert!(miss.is_err(), "a selector with no edge must not delete");
-    // The teardown mirrors the resident delete: the artifact partition is swept and the
-    // session file carries the archived state.
-    assert!(
-        !artifacts.exists(),
-        "the deleted child's artifact partition must be swept"
-    );
-    assert!(
-        std::fs::read_to_string(&child_file)
-            .expect("the child file survives (archived, not unlinked)")
-            .contains("archived"),
-        "the stopped child's delete must archive the session file"
-    );
+        .await
+        .is_err());
 }
 
-/// The stopped-child delete settles the roster the way the resident
-/// delete does (the D1b composition with the idle passivation): a
-/// `rlmLedgerDelete` aimed at an idle-passivated child finds no stop to
-/// settle the row, so the passivation's unowned row would linger while
-/// the bucket bills the captured spend on the parent - the same child
-/// billed twice until some later stop's unowned sweep catches the row.
-/// The delete's own push carries both halves together: the parent's
-/// refreshed bucket AND the child's row removal, one `roster_update`.
+/// Without a verified stop, deletion must not change usage or roster ownership.
 #[tokio::test]
-async fn the_stopped_childs_delete_removes_its_row_and_bills_the_parent() {
+async fn unverified_saved_child_delete_preserves_roster_and_usage() {
     let dir = tempfile::TempDir::new().unwrap();
     let agent_dir = dir.path().join("agent");
     let sessions_dir = agent_dir.join("sessions");
@@ -2057,7 +2026,7 @@ async fn the_stopped_childs_delete_removes_its_row_and_bills_the_parent() {
         "status": "done",
         "usage": { "inputTokens": 60, "outputTokens": 6, "cost": 0.3 },
     });
-    let child_agent_id = supervisor
+    let _child_agent_id = supervisor
         .write_roster_summary(&child_row, None)
         .expect("the child row")
         .agent_id;
@@ -2076,72 +2045,24 @@ async fn the_stopped_childs_delete_removes_its_row_and_bills_the_parent() {
             name: "parked-worker".to_string(),
         })
         .expect("the spawn edge appends");
+    let before = serde_json::to_value(supervisor.roster.lock().unwrap().entries()).unwrap();
     let mut events = supervisor.events.subscribe();
-    // The parent's delete of its stopped child.
-    supervisor
+    let error = supervisor
         .tombstone_saved_rlm_child(
             "sub-gone",
             Some("sub-gone"),
             crate::rlm_ledger::RlmLedgerDeleteReason::User,
         )
         .await
-        .expect("the stopped child's delete tombstones");
-    // ONE push carries both halves of the settle: the parent's
-    // refreshed bucket and the child's row removal.
-    let mut pushes = Vec::new();
-    loop {
-        match events.try_recv() {
-            Ok((ClientRouting::RosterSubscribers, payload)) => pushes.push((*payload).clone()),
-            Ok(_) => {}
-            Err(
-                tokio::sync::broadcast::error::TryRecvError::Empty
-                | tokio::sync::broadcast::error::TryRecvError::Closed,
-            ) => break,
-            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(missed)) => {
-                panic!("roster push subscriber lagged by {missed}");
-            }
-        }
-    }
+        .unwrap_err();
+    assert!(error.to_string().contains("reconciliation required"));
+    assert_eq!(ledger.live_edges().unwrap().len(), 1);
     assert_eq!(
-        pushes.len(),
-        1,
-        "the stopped child's delete settles in one push: {pushes:?}"
+        serde_json::to_value(supervisor.roster.lock().unwrap().entries()).unwrap(),
+        before
     );
-    let parent_after = supervisor
-        .roster
-        .lock()
-        .unwrap()
-        .entries()
-        .into_iter()
-        .find(|entry| entry.summary.get("sessionId").and_then(Value::as_str) == Some("p"))
-        .expect("the parent row");
-    assert_eq!(
-        pushes[0]["changed"],
-        serde_json::to_value(vec![parent_after]).expect("serialized parent"),
-        "the push carries the parent's refreshed row: {pushes:?}"
-    );
-    assert_eq!(
-        pushes[0]["changed"][0]["summary"]["deletedDescendantUsage"],
-        json!({ "inputTokens": 60, "outputTokens": 6, "cost": 0.3 }),
-        "the deleted child's captured spend bills through the parent"
-    );
-    assert_eq!(
-        pushes[0]["removed"],
-        json!([child_agent_id]),
-        "the lingering row is removed in the same push: {pushes:?}"
-    );
-    assert!(
-        supervisor
-            .roster
-            .lock()
-            .unwrap()
-            .entries()
-            .into_iter()
-            .all(|entry| {
-                entry.summary.get("rlmChildId").and_then(Value::as_str) != Some("sub-gone")
-            }),
-        "the deleted child's row is gone from the roster"
-    );
+    assert!(events.try_recv().is_err());
+    assert!(child_transcript.exists());
 }
 
 /// The delete's edge resolution must match BOTH the selector's stem and
@@ -2189,23 +2110,19 @@ async fn a_ledger_delete_never_tombstones_an_unrelated_edge_sharing_the_child_id
             .expect("the spawn edge appends");
     }
     assert_eq!(ledger.live_edges().expect("edges").len(), 2);
-    // The delete targets child-a by its stem WITH the shared id: only
-    // child-a's edge may retire.
-    supervisor
+    let error = supervisor
         .tombstone_saved_rlm_child(
             "child-a",
             Some("sub-shared"),
             crate::rlm_ledger::RlmLedgerDeleteReason::User,
         )
         .await
-        .expect("the delete resolves the stem-matching edge");
-    let live = ledger.live_edges().expect("edges after");
-    assert_eq!(
-        live.len(),
-        1,
-        "the unrelated edge sharing the child id must stay live: {live:?}"
-    );
-    assert_eq!(live[0].child, file_b, "the survivor is child-b's edge");
+        .unwrap_err();
+    assert!(error.to_string().contains("reconciliation required"));
+    let live = ledger.live_edges().unwrap();
+    assert_eq!(live.len(), 2);
+    assert!(live.iter().any(|edge| edge.child == file_a));
+    assert!(live.iter().any(|edge| edge.child == file_b));
 }
 
 #[tokio::test]
@@ -2294,6 +2211,22 @@ async fn a_ledger_child_wake_joins_an_already_hosting_resident() {
         .registry
         .insert(std::sync::Arc::clone(&resident))
         .await;
+    let delete = supervisor
+        .tombstone_saved_rlm_child(
+            "kid-1",
+            Some("sub-kid-1"),
+            crate::rlm_ledger::RlmLedgerDeleteReason::User,
+        )
+        .await
+        .unwrap_err();
+    assert!(delete.to_string().contains("reconciliation required"));
+    assert_eq!(ledger.live_edges().unwrap().len(), 1);
+    assert!(session_file.exists());
+    assert!(supervisor
+        .registry
+        .find_by_session_file(&session_file.to_string_lossy())
+        .await
+        .is_some());
     let before = supervisor.registry.list().await.len();
     // The wake by the child's NAME: the catalog misses (the artifacts tree), the ledger
     // matches, and the REUSE arm joins — no second launch.

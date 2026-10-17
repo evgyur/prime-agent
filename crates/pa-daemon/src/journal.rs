@@ -276,6 +276,17 @@ pub(crate) struct WorkerMessageFact {
     pub(crate) incarnation: String,
 }
 
+/// Explicit owner cancellation under exclusive child-session ownership; not process-exit evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct OwnerCancelFact {
+    pub(crate) parent_session_file: String,
+    pub(crate) child_id: String,
+    pub(crate) child_session_file: String,
+    pub(crate) admission_generation: Option<String>,
+    pub(crate) expected_message_id: Option<String>,
+}
+
 /// Latest busy/operation per active session, plus the latest queue
 /// snapshot per session.
 pub struct WorkerRecoveryJournal {
@@ -284,6 +295,7 @@ pub struct WorkerRecoveryJournal {
     latest: HashMap<String, WorkerRecoveryRecord>,
     queue_snapshots: HashMap<String, WorkerQueueSnapshotRecord>,
     message_facts: HashMap<(String, String), WorkerMessageFact>,
+    owner_cancel_facts: Vec<OwnerCancelFact>,
 }
 
 impl WorkerRecoveryJournal {
@@ -307,6 +319,7 @@ impl WorkerRecoveryJournal {
             latest: parse_worker_records(path)?,
             queue_snapshots,
             message_facts: Self::read_message_facts(path)?,
+            owner_cancel_facts: Self::read_owner_cancel_facts(path)?,
         };
         if tail_is_torn(path)? {
             // Recovery can still contain busy verdicts and queued prompts.
@@ -314,6 +327,108 @@ impl WorkerRecoveryJournal {
             journal.compact(Finalize::Synced)?;
         }
         Ok(journal)
+    }
+
+    pub(crate) fn retain_owner_cancellations(path: &Path) -> Result<()> {
+        let _owner = journal_write_owner(path)?;
+        let facts = Self::read_owner_cancel_facts(path)?;
+        if facts.is_empty() {
+            if path.exists() {
+                fs::remove_file(path)?;
+            }
+        } else {
+            let records: Vec<Value> = facts
+                .iter()
+                .map(|fact| serde_json::json!({"type":"owner_cancel_fact","fact":fact}))
+                .collect();
+            rewrite_records(path, &records, Finalize::Synced)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn restore_parent_owner_cancellations(
+        directory: &Path,
+        destination: &Path,
+        parent: &Path,
+    ) -> Result<()> {
+        let parent = crate::lease::canonical_session_path(parent);
+        let mut facts = Vec::new();
+        for entry in fs::read_dir(directory)? {
+            let path = entry?.path();
+            if path == destination
+                || !path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().ends_with(RECOVERY_JOURNAL_SUFFIX))
+            {
+                continue;
+            }
+            for fact in Self::read_owner_cancel_facts(&path)? {
+                if crate::lease::canonical_session_path(Path::new(&fact.parent_session_file))
+                    == parent
+                    && !facts.contains(&fact)
+                {
+                    facts.push(fact);
+                }
+            }
+        }
+        if !facts.is_empty() {
+            let mut journal = Self::open(destination)?;
+            for fact in facts {
+                journal.record_owner_cancel(fact)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn read_owner_cancel_facts(path: &Path) -> Result<Vec<OwnerCancelFact>> {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut facts = Vec::new();
+        let lines = decode_journal_lines(&bytes, path)?;
+        for (index, line) in lines.iter().enumerate() {
+            if line.is_empty() {
+                continue;
+            }
+            let value = match serde_json::from_str::<Value>(line) {
+                Ok(value) => value,
+                Err(error)
+                    if index + 1 == lines.len() && !bytes.ends_with(b"\n") && error.is_eof() =>
+                {
+                    break
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("invalid owner cancellation journal {}", path.display())
+                    })
+                }
+            };
+            if value["type"] == "owner_cancel_fact" {
+                let fact: OwnerCancelFact = serde_json::from_value(value["fact"].clone())?;
+                if !facts.contains(&fact) {
+                    facts.push(fact);
+                }
+            }
+        }
+        Ok(facts)
+    }
+
+    pub(crate) fn record_owner_cancel(&mut self, fact: OwnerCancelFact) -> Result<()> {
+        if self.owner_cancel_facts.contains(&fact) {
+            return Ok(());
+        }
+        append_record(
+            &self.path,
+            &serde_json::json!({"type":"owner_cancel_fact","fact":fact}),
+        )?;
+        self.owner_cancel_facts.push(fact);
+        Ok(())
+    }
+
+    pub(crate) fn owner_cancel_facts(&self) -> &[OwnerCancelFact] {
+        &self.owner_cancel_facts
     }
 
     pub(crate) fn read_message_facts(
@@ -595,6 +710,11 @@ impl WorkerRecoveryJournal {
                 .values()
                 .map(|fact| serde_json::json!({"type":"worker_message_fact","fact":fact})),
         );
+        records.extend(
+            self.owner_cancel_facts
+                .iter()
+                .map(|fact| serde_json::json!({"type":"owner_cancel_fact","fact":fact})),
+        );
         rewrite_records(&self.path, &records, finalize)
     }
 }
@@ -673,6 +793,141 @@ fn parse_snapshot_lane(value: Option<&Value>) -> Vec<WorkerQueueItemRecord> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn owner_cancel_retention_rejects_complete_corruption_without_mutation() {
+        for corrupt in [
+            b"not-json\n".as_slice(),
+            b"{bad}\n",
+            b"not-json",
+            b"{bad}\n{}\n",
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let old = dir.path().join("old.recovery.jsonl");
+            std::fs::write(&old, corrupt).unwrap();
+            assert!(super::WorkerRecoveryJournal::retain_owner_cancellations(&old).is_err());
+            assert_eq!(std::fs::read(&old).unwrap(), corrupt);
+            let new = dir.path().join("new.recovery.jsonl");
+            assert!(
+                super::WorkerRecoveryJournal::restore_parent_owner_cancellations(
+                    dir.path(),
+                    &new,
+                    &dir.path().join("parent")
+                )
+                .is_err()
+            );
+            assert!(!new.exists());
+            assert_eq!(std::fs::read(&old).unwrap(), corrupt);
+        }
+    }
+
+    #[test]
+    fn owner_cancel_reader_allows_valid_nonowner_records_and_only_torn_final_json() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("worker.recovery.jsonl");
+        std::fs::write(&path, b"{}\n{\"type\":\"queue_snapshot\"}\n{\"type\":").unwrap();
+        assert!(super::WorkerRecoveryJournal::read_owner_cancel_facts(&path)
+            .unwrap()
+            .is_empty());
+        std::fs::write(&path, b"{}\n{\"type\":\"queue_snapshot\"}").unwrap();
+        assert!(super::WorkerRecoveryJournal::read_owner_cancel_facts(&path)
+            .unwrap()
+            .is_empty());
+        std::fs::write(&path, b"{\"type\":\n{}\n").unwrap();
+        assert!(super::WorkerRecoveryJournal::read_owner_cancel_facts(&path).is_err());
+    }
+
+    #[test]
+    fn owner_cancel_survives_worker_rotation_without_restoring_busy_or_queues() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let parent = dir.path().join("parent.jsonl");
+        std::fs::write(&parent, "parent").unwrap();
+        let old = dir.path().join("old.recovery.jsonl");
+        let new = dir.path().join("new.recovery.jsonl");
+        let other = dir.path().join("other.recovery.jsonl");
+        let fact = super::OwnerCancelFact {
+            parent_session_file: parent.to_string_lossy().into_owned(),
+            child_id: "child".into(),
+            child_session_file: "child-file".into(),
+            admission_generation: None,
+            expected_message_id: None,
+        };
+        {
+            let mut journal = super::WorkerRecoveryJournal::open(&old).unwrap();
+            journal.record_owner_cancel(fact.clone()).unwrap();
+            journal
+                .record(
+                    "active",
+                    "session",
+                    Some(&parent.to_string_lossy()),
+                    true,
+                    "prompt_accepted",
+                )
+                .unwrap();
+            journal.record_queue_snapshot("active", &[], &[]).unwrap();
+        }
+        super::WorkerRecoveryJournal::retain_owner_cancellations(&old).unwrap();
+        assert!(super::WorkerRecoveryJournal::read_latest(&old)
+            .unwrap()
+            .is_empty());
+        super::WorkerRecoveryJournal::restore_parent_owner_cancellations(dir.path(), &new, &parent)
+            .unwrap();
+        let journal = super::WorkerRecoveryJournal::open(&new).unwrap();
+        assert_eq!(journal.owner_cancel_facts(), &[fact.clone()]);
+        assert!(journal.get_latest().is_empty());
+        assert!(journal.latest_queue_snapshot("active").is_none());
+        drop(journal);
+        super::WorkerRecoveryJournal::restore_parent_owner_cancellations(
+            dir.path(),
+            &other,
+            &dir.path().join("other-parent"),
+        )
+        .unwrap();
+        assert!(!other.exists());
+        super::WorkerRecoveryJournal::retain_owner_cancellations(&new).unwrap();
+        let reopened = dir.path().join("third.recovery.jsonl");
+        super::WorkerRecoveryJournal::restore_parent_owner_cancellations(
+            dir.path(),
+            &reopened,
+            &parent,
+        )
+        .unwrap();
+        assert_eq!(
+            super::WorkerRecoveryJournal::open(&reopened)
+                .unwrap()
+                .owner_cancel_facts(),
+            &[fact]
+        );
+    }
+
+    #[test]
+    fn owner_cancel_survives_compaction_restart_without_duplicate_credit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("worker.jsonl");
+        let fact = super::OwnerCancelFact {
+            parent_session_file: "parent".into(),
+            child_id: "child".into(),
+            child_session_file: "file".into(),
+            admission_generation: None,
+            expected_message_id: None,
+        };
+        {
+            let mut journal = super::WorkerRecoveryJournal::open(&path).unwrap();
+            journal.record_owner_cancel(fact.clone()).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            journal.record_owner_cancel(fact.clone()).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            journal
+                .record("parent", "p", None, false, "turn_end")
+                .unwrap();
+        }
+        let mut journal = super::WorkerRecoveryJournal::open(&path).unwrap();
+        assert_eq!(journal.owner_cancel_facts(), &[fact.clone()]);
+        let before = std::fs::read(&path).unwrap();
+        journal.record_owner_cancel(fact).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!String::from_utf8(before).unwrap().contains("workerToken"));
+    }
+
     #[test]
     fn exact_managed_message_fact_survives_idle_compaction_and_reopen() {
         let dir = tempfile::TempDir::new().unwrap();

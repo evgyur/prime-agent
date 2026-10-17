@@ -6,7 +6,6 @@ use super::{
     wants_chunked, Arc, DaemonCommand, DaemonResponse, Duration, Outbound, ResidentWorker, Result,
     RouteAdmission, SnapshotPurpose, Supervisor, Value, WorkerReply, WorkerRequest,
 };
-use anyhow::Context as _;
 
 /// The route-level wake outcome: a woken resident, or the fallthrough
 /// error the caller answers (no saved session matched).
@@ -323,6 +322,18 @@ impl Supervisor {
         // itself; `None` (supervisor-internal callers) forces the typed path.
         raw_out: Option<&tokio::sync::mpsc::Sender<(Vec<Outbound>, bool)>>,
     ) -> (Vec<Value>, bool) {
+        if let DaemonCommand::Kill { rest, .. } = command {
+            if let Some(request) = rest.get("ownerCancel") {
+                let result = self.reconcile_owner_cancel(request).await;
+                let response = match result {
+                    Ok(value) => response_success(Some(&command_id), &type_name, Some(value)),
+                    Err(error) => {
+                        response_failure(Some(&command_id), &type_name, &format!("{error:#}"), None)
+                    }
+                };
+                return (vec![response_line(&response)], false);
+            }
+        }
         // Routing gate: the generic forward requires the `activeSessionId` field
         // (present-but-empty is an unknown session).
         let Some(selector) = command_active_session_id(command) else {
@@ -1016,6 +1027,101 @@ impl Supervisor {
         }
     }
 
+    async fn reconcile_owner_cancel(self: &Arc<Self>, request: &Value) -> Result<Value> {
+        let token = request["workerToken"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("Owner authentication missing"))?;
+        let parent = self
+            .registry
+            .find_by_token(token)
+            .await
+            .ok_or_else(|| anyhow!("Owner authentication failed"))?;
+        let parent_file = parent
+            .descriptor
+            .lock()
+            .await
+            .session_file
+            .clone()
+            .ok_or_else(|| anyhow!("Parent identity unavailable"))?;
+        let fact: crate::journal::OwnerCancelFact =
+            serde_json::from_value(request["fact"].clone())?;
+        anyhow::ensure!(
+            crate::lease::canonical_session_path(std::path::Path::new(&parent_file))
+                == crate::lease::canonical_session_path(std::path::Path::new(
+                    &fact.parent_session_file
+                )),
+            "Owner parent mismatch"
+        );
+        let ledger = self.rlm_spawn_ledger_for(None).await?;
+        let matches = |edge: &crate::rlm_ledger::RlmLedgerEdge| {
+            edge.child_id == fact.child_id
+                && edge.parent == fact.parent_session_file
+                && edge.child == fact.child_session_file
+        };
+        anyhow::ensure!(
+            ledger
+                .live_edges()?
+                .iter()
+                .filter(|edge| matches(edge))
+                .count()
+                == 1,
+            "Exact parent child edge unavailable"
+        );
+        let file = std::path::PathBuf::from(&fact.child_session_file);
+        let agent_dir = self.options.agent_dir.clone();
+        let lease = tokio::task::spawn_blocking(move || {
+            crate::lease::acquire_runtime_session_lease(&file, &agent_dir)
+        })
+        .await??;
+        anyhow::ensure!(
+            self.registry
+                .find_by_session_file(&fact.child_session_file)
+                .await
+                .is_none(),
+            "Child resident exists; use verified resident stop"
+        );
+        anyhow::ensure!(
+            self.registry
+                .find_by_token(token)
+                .await
+                .is_some_and(|current| Arc::ptr_eq(&parent, &current)),
+            "Parent owner changed"
+        );
+        anyhow::ensure!(
+            ledger
+                .live_edges()?
+                .iter()
+                .filter(|edge| matches(edge))
+                .count()
+                == 1,
+            "Parent child edge changed"
+        );
+        let display = std::path::Path::new(&fact.child_session_file)
+            .parent()
+            .and_then(crate::rlm_ledger::read_rlm_subagent_display)
+            .ok_or_else(|| anyhow!("Child admission identity unavailable"))?;
+        anyhow::ensure!(
+            display.child_id == fact.child_id
+                && display.session_file == fact.child_session_file
+                && display.admission_generation == fact.admission_generation
+                && display.expected_message_id == fact.expected_message_id,
+            "Child admission changed"
+        );
+        let response = self
+            .route_command_typed(
+                &parent,
+                "persist_owner_cancel",
+                json!({"fact":fact,"leaseProof":lease.private_proof()}),
+                ROUTE_TIMEOUT_MS,
+                RouteAdmission::SupervisorInternal,
+            )
+            .await?;
+        anyhow::ensure!(response.success, "Owner cancellation persistence failed");
+        drop(lease);
+        Ok(response.data.unwrap_or(Value::Null))
+    }
+
     /// The ledger tombstone for a delete aimed at a STOPPED child: no worker to kill, the
     /// tombstone IS the deletion boundary, persisted before any teardown.
     pub(super) async fn tombstone_saved_rlm_child(
@@ -1024,104 +1130,10 @@ impl Supervisor {
         child_id: Option<&str>,
         reason: crate::rlm_ledger::RlmLedgerDeleteReason,
     ) -> anyhow::Result<()> {
-        let ledger = self
-            .rlm_spawn_ledger_for(None)
-            .await
-            .with_context(|| "resolve the spawn ledger sessions dir".to_string())?;
-        // The child's identity: the explicit id the parent's delete carries, else
-        // the live ledger edge matching the selector.
-        let edges = ledger
-            .live_edges()
-            .with_context(|| "read the spawn ledger edges".to_string())?;
-        // `rlmChildId` is the durable key; the selector is the child's LIVE id, NOT
-        // the file stem. Order: (1a) edge matching BOTH the stem and the id; (1b)
-        // the LAST live edge carrying the id; (2) the stem-matching edge.
-        let mut resolved: Option<(String, String)> = None;
-        if let Some(id) = child_id {
-            for edge in &edges {
-                let stem = std::path::Path::new(&edge.child)
-                    .file_stem()
-                    .map(|name| name.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                if stem == selector && edge.child_id == id {
-                    resolved = Some((edge.child_id.clone(), edge.child.clone()));
-                    break;
-                }
-            }
-            if resolved.is_none() {
-                for edge in &edges {
-                    if edge.child_id == id {
-                        resolved = Some((edge.child_id.clone(), edge.child.clone()));
-                    }
-                }
-            }
-        } else {
-            for edge in &edges {
-                let stem = std::path::Path::new(&edge.child)
-                    .file_stem()
-                    .map(|name| name.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                if stem == selector {
-                    resolved = Some((edge.child_id.clone(), edge.child.clone()));
-                    break;
-                }
-            }
-        }
-        let Some((child_id, session_file)) = resolved else {
-            anyhow::bail!("stopped RLM subagent \"{selector}\" is not in the spawn ledger");
-        };
-        ledger
-            .append_delete(&child_id, &session_file, reason)
-            .with_context(|| format!("tombstone RLM subagent {child_id}"))?;
-        // The stopped child's teardown mirrors the resident delete's end state: the usage
-        // capture, archived state, and artifact sweep land as a live child's kill leaves them.
-        let sessions_dir = crate::paths::sessions_dir(&self.options.agent_dir)
-            .with_context(|| "resolve the sessions dir for the delete finalize".to_string())?;
-        // Live coverage captured AFTER the tombstone append: a wake that registered a resident
-        // between the two must be visible here (the archive/sweep skips its tree).
-        let live = self.live_session_files().await;
-        if self
-            .registry
-            .find_by_session_file(&session_file)
-            .await
-            .is_some()
-        {
-            // A revival raced the delete: the tombstone stands as the durable boundary, but the
-            // revived session stays live — no archive, no artifact sweep.
-            return Ok(());
-        }
-        crate::stop_cleanup::finalize_archived_stop(
-            &self.options.agent_dir,
-            &sessions_dir,
-            std::path::Path::new(&session_file),
-            &live,
-        );
-        self.capture_deleted_child_usage(&session_file, &child_id, "rlm_delete")
-            .await;
-        crate::saved_session_commands::remove_session_artifacts(std::path::Path::new(
-            &session_file,
-        ));
-        // The resident delete's end state, continued: no stop ran for
-        // this child (its worker was already passivated), so the
-        // passivation's row lingers unowned while the bucket bills the
-        // captured spend on the parent - the same settle the resident
-        // delete's pass performs, in one push.
-        let changed = self.refresh_deleted_descendant_usage().await;
-        let canonical = crate::lease::canonical_session_path(std::path::Path::new(&session_file))
-            .to_string_lossy()
-            .to_string();
-        let removed: Vec<String> = {
-            let mut roster = self.roster.lock().unwrap();
-            let agent_id = roster
-                .by_session_file(&canonical)
-                .map(|row| row.agent_id.clone());
-            if let Some(agent_id) = &agent_id {
-                roster.delete(agent_id);
-            }
-            agent_id.into_iter().collect()
-        };
-        self.push_roster_update(changed, removed);
-        Ok(())
+        let _ = (child_id, reason);
+        anyhow::bail!(
+            "RLM child reconciliation required for \"{selector}\": no verified resident process-stop receipt; saved ledger and artifacts preserved"
+        )
     }
 }
 
@@ -1140,4 +1152,250 @@ pub(crate) fn spliced_client_line(command_id: &str, worker_payload: &[u8]) -> Ve
     }
     line.push(b'\n');
     line
+}
+
+#[cfg(test)]
+mod saved_delete_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn missing_resident_delete_requires_reconciliation_without_mutation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        let sessions = agent_dir.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let supervisor = Arc::new(
+            Supervisor::new(super::super::SupervisorOptions {
+                socket_path: dir.path().join("daemon.sock"),
+                agent_dir: agent_dir.clone(),
+            })
+            .unwrap(),
+        );
+        let child = sessions.join("child.jsonl");
+        let original = "{\"type\":\"session\",\"id\":\"child\"}\n";
+        std::fs::write(&child, original).unwrap();
+        let artifacts = agent_dir.join("session-artifacts").join("child");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        std::fs::write(artifacts.join("keep.txt"), "evidence").unwrap();
+        let ledger = supervisor.rlm_spawn_ledger_for(None).await.unwrap();
+        ledger
+            .append_spawn(&crate::rlm_ledger::RlmSpawnInput {
+                child_id: "sub-child".into(),
+                parent: sessions.join("parent.jsonl").to_string_lossy().into_owned(),
+                child: child.to_string_lossy().into_owned(),
+                depth: 1,
+                name: "worker".into(),
+            })
+            .unwrap();
+        let before = ledger.live_edges().unwrap().len();
+        for identity in [Some("sub-child"), None, Some("unknown-child")] {
+            let error = supervisor
+                .tombstone_saved_rlm_child(
+                    "child",
+                    identity,
+                    crate::rlm_ledger::RlmLedgerDeleteReason::User,
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("reconciliation required"));
+            assert_eq!(ledger.live_edges().unwrap().len(), before);
+            assert_eq!(std::fs::read_to_string(&child).unwrap(), original);
+            assert_eq!(
+                std::fs::read_to_string(artifacts.join("keep.txt")).unwrap(),
+                "evidence"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn owner_cancel_requires_authenticated_parent_before_any_effect() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let supervisor = Arc::new(
+            Supervisor::new(super::super::SupervisorOptions {
+                socket_path: dir.path().join("daemon.sock"),
+                agent_dir: dir.path().join("agent"),
+            })
+            .unwrap(),
+        );
+        for request in [json!({}), json!({"workerToken":"forged","fact":{}})] {
+            assert!(supervisor.reconcile_owner_cancel(&request).await.is_err());
+        }
+        assert!(!dir.path().join("agent/session-leases").exists());
+        assert!(serde_json::from_value::<DaemonCommand>(
+            json!({"type":"persist_owner_cancel","fact":{}})
+        )
+        .is_err());
+        let grant = pa_types::daemon::DaemonWorkerPeerGrant {
+            grant_id: "g".into(),
+            token: "t".into(),
+            expires_at: "future".into(),
+            purpose: "session_client".into(),
+            worker_instance_id: "i".into(),
+            active_session_id: "parent".into(),
+            issuer_generation: "epoch".into(),
+        };
+        assert!(!crate::peer::peer_command_allowed(
+            "persist_owner_cancel",
+            &json!({"activeSessionId":"parent"}),
+            &grant
+        ));
+        assert!(!crate::peer::worker_peer_command_allowed(
+            "persist_owner_cancel",
+            &json!({"targetActiveSessionId":"parent"}),
+            &grant
+        ));
+    }
+
+    #[tokio::test]
+    async fn owner_cancel_denies_wrong_edge_admission_live_and_corrupt_lease() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        let sessions = agent_dir.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let supervisor = Arc::new(
+            Supervisor::new(super::super::SupervisorOptions {
+                socket_path: dir.path().join("s.sock"),
+                agent_dir: agent_dir.clone(),
+            })
+            .unwrap(),
+        );
+        let parent_file = sessions.join("parent.jsonl");
+        let child_file = sessions.join("child.jsonl");
+        std::fs::write(&parent_file, "parent evidence").unwrap();
+        std::fs::write(&child_file, "child evidence").unwrap();
+        let mut descriptor: pa_types::daemon::DaemonWorkerDescriptor = serde_json::from_value(json!({
+            "version":1,"workerId":"parent-worker","pid":std::process::id(),"socketPath":"unused",
+            "recoveryJournalPath":"unused","supervisorSocketPath":"unused","authenticationToken":"test-auth",
+            "rootActiveSessionId":"parent-worker","sessionFile":parent_file,"createdAt":"t","updatedAt":"t",
+            "lifecycle":"ready","createCommand":{},"consecutiveFailures":0
+        })).unwrap();
+        descriptor.session_file = Some(parent_file.to_string_lossy().into_owned());
+        let resident = ResidentWorker::new(
+            "parent-worker".into(),
+            descriptor,
+            dir.path().join("worker"),
+        );
+        supervisor.registry.insert(resident).await;
+        let ledger = supervisor.rlm_spawn_ledger_for(None).await.unwrap();
+        ledger
+            .append_spawn(&crate::rlm_ledger::RlmSpawnInput {
+                child_id: "child".into(),
+                parent: parent_file.to_string_lossy().into_owned(),
+                child: child_file.to_string_lossy().into_owned(),
+                depth: 1,
+                name: "child".into(),
+            })
+            .unwrap();
+        let fact = crate::journal::OwnerCancelFact {
+            parent_session_file: parent_file.to_string_lossy().into_owned(),
+            child_id: "child".into(),
+            child_session_file: child_file.to_string_lossy().into_owned(),
+            admission_generation: None,
+            expected_message_id: None,
+        };
+        let request = json!({"workerToken":"test-auth","fact":fact});
+        let mut wrong = request.clone();
+        wrong["fact"]["parentSessionFile"] = json!("wrong");
+        assert!(supervisor.reconcile_owner_cancel(&wrong).await.is_err());
+        let mut wrong = request.clone();
+        wrong["fact"]["childId"] = json!("wrong");
+        assert!(supervisor.reconcile_owner_cancel(&wrong).await.is_err());
+        let lease = crate::lease::acquire_runtime_session_lease(&child_file, &agent_dir).unwrap();
+        assert!(supervisor.reconcile_owner_cancel(&request).await.is_err());
+        drop(lease);
+        assert!(
+            supervisor.reconcile_owner_cancel(&request).await.is_err(),
+            "missing admission display denies"
+        );
+        use sha2::{Digest, Sha256};
+        let canonical = crate::lease::canonical_session_path(&child_file);
+        let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
+        let key: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        let corrupt = agent_dir.join("session-leases").join(format!("{key}.lock"));
+        std::fs::create_dir_all(&corrupt).unwrap();
+        std::fs::write(corrupt.join("owner.json"), "corrupt").unwrap();
+        assert!(supervisor.reconcile_owner_cancel(&request).await.is_err());
+        assert_eq!(
+            std::fs::read_to_string(corrupt.join("owner.json")).unwrap(),
+            "corrupt"
+        );
+        std::fs::remove_file(corrupt.join("owner.json")).unwrap();
+        std::fs::remove_dir(&corrupt).unwrap();
+        let display = crate::rlm_ledger::RlmSubagentDisplayEntry {
+            type_tag: "rlm_subagent".into(),
+            child_id: "child".into(),
+            session_name: "child".into(),
+            session_dir: sessions.to_string_lossy().into_owned(),
+            session_file: child_file.to_string_lossy().into_owned(),
+            rlm_parent_node_id: None,
+            prompt: None,
+            spawn_code: None,
+            model: None,
+            status: "running".into(),
+            admission_unresolved: Some(true),
+            admission_generation: None,
+            expected_message_id: None,
+            created_at: 0,
+        };
+        crate::rlm_ledger::write_rlm_subagent_display(&display).unwrap();
+        let mut wrong = request.clone();
+        wrong["fact"]["admissionGeneration"] = json!("wrong-generation");
+        assert!(supervisor.reconcile_owner_cancel(&wrong).await.is_err());
+        let parent = supervisor
+            .registry
+            .find_by_token("test-auth")
+            .await
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::registry::WorkerRequest>(1);
+        *parent.cmd_tx.lock().await = Some(tx);
+        parent.note_connection_live();
+        parent.note_session_ready();
+        let journal_path = dir.path().join("parent.recovery.jsonl");
+        let pump_parent = Arc::clone(&parent);
+        let expected_fact = fact.clone();
+        let journal_copy = journal_path.clone();
+        let pump = tokio::spawn(async move {
+            let mut journal = crate::journal::WorkerRecoveryJournal::open(&journal_copy).unwrap();
+            let frame = rx.recv().await.unwrap();
+            assert_eq!(frame.command_type, "persist_owner_cancel");
+            let persisted: crate::journal::OwnerCancelFact =
+                serde_json::from_value(frame.payload["fact"].clone()).unwrap();
+            assert_eq!(persisted, expected_fact);
+            let proof: crate::lease::LeaseProof =
+                serde_json::from_value(frame.payload["leaseProof"].clone()).unwrap();
+            crate::lease::with_lease_proof(
+                &agent_dir,
+                std::path::Path::new(&persisted.child_session_file),
+                &proof,
+                || journal.record_owner_cancel(persisted.clone()),
+            )
+            .unwrap();
+            let reply = pump_parent
+                .pending
+                .lock()
+                .await
+                .remove(&frame.request_id)
+                .unwrap();
+            reply.send(crate::registry::WorkerReply::Typed(response_success(None,"persist_owner_cancel",Some(json!({"ownerCancel":persisted,"kind":"owner_cancel","processExitObserved":false}))))).ok().unwrap();
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            supervisor.reconcile_owner_cancel(&request),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result["kind"], "owner_cancel");
+        assert_eq!(result["processExitObserved"], false);
+        pump.await.unwrap();
+        let journal = crate::journal::WorkerRecoveryJournal::open(&journal_path).unwrap();
+        assert_eq!(journal.owner_cancel_facts(), &[fact]);
+        assert!(!std::fs::read_to_string(&journal_path)
+            .unwrap()
+            .contains("test-auth"));
+        assert_eq!(ledger.live_edges().unwrap().len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&child_file).unwrap(),
+            "child evidence"
+        );
+    }
 }

@@ -39,11 +39,62 @@ pub(super) struct Binding {
     pub(super) terminal_delivery: Option<String>,
     #[serde(default)]
     pub(super) review_consumed: bool,
-    #[serde(default)]
-    pub(super) accepted_closure: Option<Value>,
     #[serde(skip)]
     pub(super) start_token: Option<String>,
 }
+pub(super) fn accepted_proof<'a>(
+    snapshot: Option<&'a Value>,
+    scope: Option<&Value>,
+    binding: &Binding,
+) -> Option<&'a Value> {
+    let snapshot = snapshot.filter(|snapshot| snapshot["complete"] == true)?;
+    let scope = scope?;
+    if !binding.start_permitted || binding.terminal_delivery.is_none() {
+        return None;
+    }
+    let item = snapshot["items"].as_array()?.iter().find(|item| {
+        item["planId"] == binding.plan_id
+            && item["stepId"] == binding.step_id
+            && item["status"] == "accepted"
+    })?;
+    let proof = &item["completion"]["managedAcceptance"];
+    (binding.review_consumed
+        && binding.started_result.as_ref().is_some_and(|result| {
+            proof["result"]["childId"] == result["childId"]
+                && proof["result"]["admissionGeneration"] == result["admissionGeneration"]
+                && proof["result"]["incarnation"] == result["incarnation"]
+                && proof["result"]["expectedMessageId"] == result["expectedMessageId"]
+        })
+        && proof["result"]["terminalDeliveryId"].as_str() == binding.terminal_delivery.as_deref()
+        && item["completion"]["sessionId"] == scope["rootSessionId"]
+        && proof["schemaVersion"] == 1
+        && proof["policy"] == "causal_results_v1"
+        && [
+            "rootSessionId",
+            "goalId",
+            "taskGeneration",
+            "policyRevision",
+            "ownerBindingId",
+        ]
+        .iter()
+        .all(|key| proof[*key] == scope[*key])
+        && proof["planId"] == binding.plan_id
+        && proof["stepId"] == binding.step_id
+        && proof["committedRevision"].as_u64().is_some_and(|revision| {
+            snapshot["revision"]
+                .as_u64()
+                .is_some_and(|current| revision <= current)
+        })
+        && !proof["artifactRef"].as_str().unwrap_or_default().is_empty()
+        && !proof["acceptanceRef"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty()
+        && proof["artifactRef"] == item["artifactRef"]
+        && proof["acceptanceRef"] == item["acceptanceRef"])
+        .then_some(proof)
+}
+
 impl Source {
     pub(crate) fn parse(value: &Value) -> Result<Self> {
         let source: Self = serde_json::from_value(value.clone())?;
@@ -440,82 +491,15 @@ impl SupervisorChildSessions {
         }
         if let Some(snapshot) = &snapshot {
             let accepted = snapshot["items"].as_array().cloned().unwrap_or_default();
-            if gate.policy.as_ref().is_some_and(|policy| {
-                policy.managed_pass_policy.as_deref() == Some("causal_results_v1")
-            }) {
-                let scope = gate.management_scope.clone().unwrap_or(Value::Null);
-                for binding in &mut gate.work_bindings {
-                    binding.accepted_closure = None;
-                    if let Some(item) = accepted.iter().find(|item| {
-                        item["planId"] == binding.plan_id
-                            && item["stepId"] == binding.step_id
-                            && item["status"] == "accepted"
-                    }) {
-                        let proof = &item["completion"]["managedAcceptance"];
-                        if binding.review_consumed
-                            && binding.started_result.as_ref().is_some_and(|result| {
-                                proof["result"]["childId"] == result["childId"]
-                                    && proof["result"]["admissionGeneration"]
-                                        == result["admissionGeneration"]
-                                    && proof["result"]["incarnation"] == result["incarnation"]
-                                    && proof["result"]["expectedMessageId"]
-                                        == result["expectedMessageId"]
-                            })
-                            && proof["result"]["terminalDeliveryId"].as_str()
-                                == binding.terminal_delivery.as_deref()
-                            && item["completion"]["sessionId"] == scope["rootSessionId"]
-                            && proof["schemaVersion"] == 1
-                            && proof["policy"] == "causal_results_v1"
-                            && [
-                                "rootSessionId",
-                                "goalId",
-                                "taskGeneration",
-                                "policyRevision",
-                                "ownerBindingId",
-                            ]
-                            .iter()
-                            .all(|key| proof[*key] == scope[*key])
-                            && proof["planId"] == binding.plan_id
-                            && proof["stepId"] == binding.step_id
-                            && proof["committedRevision"].as_u64().is_some_and(|revision| {
-                                snapshot["revision"]
-                                    .as_u64()
-                                    .is_some_and(|current| revision <= current)
-                            })
-                            && !proof["artifactRef"].as_str().unwrap_or_default().is_empty()
-                            && !proof["acceptanceRef"]
-                                .as_str()
-                                .unwrap_or_default()
-                                .is_empty()
-                            && proof["artifactRef"] == item["artifactRef"]
-                            && proof["acceptanceRef"] == item["acceptanceRef"]
-                        {
-                            binding.accepted_closure = Some(proof.clone());
-                        }
-                    }
-                }
-            }
-            let closures: Vec<Value> = gate
-                .work_bindings
-                .iter()
-                .filter_map(|binding| binding.accepted_closure.clone())
-                .collect();
-            for closure in closures {
-                if let Some(consumed) = gate.consumed_managed_results.iter_mut().find(|result| {
-                    result["childId"] == closure["result"]["childId"]
-                        && result["terminalDeliveryId"] == closure["result"]["terminalDeliveryId"]
-                }) {
-                    consumed["acceptedClosure"] = closure;
-                    consumed["state"] = json!("accepted_refill_pending");
-                }
-            }
             let managed = gate
                 .policy
                 .as_ref()
                 .is_some_and(|policy| policy.managed_pass_policy.is_some());
+            let scope = gate.management_scope.clone();
             gate.work_bindings.retain(|binding| {
                 !(deleted.contains(&binding.child_id)
-                    && (!managed || binding.accepted_closure.is_some())
+                    && (!managed
+                        || accepted_proof(Some(snapshot), scope.as_ref(), binding).is_some())
                     && accepted.iter().any(|item| {
                         item["planId"] == binding.plan_id
                             && item["stepId"] == binding.step_id
@@ -606,7 +590,7 @@ impl SupervisorChildSessions {
             })
             .cloned()
             .collect();
-        let acceptance: Vec<Value> = gate.work_bindings.iter().filter(|binding| rows.iter().any(|row| row["childId"] == binding.child_id && row["obligation"] == false) && !items.iter().any(|item| item["planId"] == binding.plan_id && item["stepId"] == binding.step_id && item["status"] == "accepted")).map(|binding| json!({"childId":binding.child_id,"planId":binding.plan_id,"stepId":binding.step_id,"result":binding.started_result,"terminalDeliveryId":binding.terminal_delivery,"reviewConsumed":binding.review_consumed,"state":if binding.accepted_closure.is_some(){"accepted_refill_pending"}else if binding.terminal_delivery.is_none(){"terminal_delivery_unproven"}else{"awaiting_acceptance"}})).collect();
+        let acceptance: Vec<Value> = gate.work_bindings.iter().filter(|binding| rows.iter().any(|row| row["childId"] == binding.child_id && row["obligation"] == false) && (if gate.policy.as_ref().is_some_and(|policy| policy.managed_pass_policy.is_some()) { accepted_proof(gate.next_work.as_ref(), gate.management_scope.as_ref(), binding).is_none() } else { !items.iter().any(|item| item["planId"] == binding.plan_id && item["stepId"] == binding.step_id && item["status"] == "accepted") })).map(|binding| json!({"childId":binding.child_id,"planId":binding.plan_id,"stepId":binding.step_id,"result":binding.started_result,"terminalDeliveryId":binding.terminal_delivery,"reviewConsumed":binding.review_consumed,"state":if binding.terminal_delivery.is_none(){"terminal_delivery_unproven"}else{"awaiting_acceptance"}})).collect();
         snapshot["actionRequired"] = json!(!acceptance.is_empty() || free > 0 && !ready.is_empty());
         snapshot["runtime"] = json!({"complete":rows.iter().all(|row| row["executionKind"] != "unknown"),"freeSlots":free,"ownership":gate.work_bindings,"ready":ready,"awaitingAcceptance":acceptance});
         snapshot
@@ -670,7 +654,6 @@ impl SupervisorChildSessions {
             started_result: None,
             terminal_delivery: None,
             review_consumed: false,
-            accepted_closure: None,
             task: gate.task.clone(),
             policy: gate.policy.clone(),
             start_token: Some(uuid::Uuid::new_v4().to_string()),
@@ -743,7 +726,7 @@ mod tests {
             let task = gate.task.clone();
             let policy = gate.policy.clone();
             gate.work_bindings.push(Binding {child_id:"A".into(),plan_id:"p".into(),step_id:"leaf".into(),snapshot_revision:1,ownership:vec!["A".into()],start_permitted:true,task,policy,start_token:None,
-                started_result:Some(json!({"childId":"A","admissionGeneration":"g","expectedMessageId":"m","incarnation":"i"})),terminal_delivery:Some("t".into()),review_consumed:false,accepted_closure:None});
+                started_result:Some(json!({"childId":"A","admissionGeneration":"g","expectedMessageId":"m","incarnation":"i"})),terminal_delivery:Some("t".into()),review_consumed:false});
         }
         let request = || json!({"beginManagedReview":{"childId":"A","terminalDeliveryId":"t","nativeNonce":crate::child_status_notices::mint()}});
         let handles = engine.goal_runtime.lock().unwrap().clone().unwrap();
@@ -849,16 +832,98 @@ mod tests {
             let policy = gate.policy.clone();
             gate.work_bindings.push(Binding {child_id:"A".into(),plan_id:"p".into(),step_id:"leaf".into(),snapshot_revision:1,
                 ownership:vec!["a".into()],start_permitted:true,task,policy,start_token:None,started_result:Some(json!({"childId":"A","expectedMessageId":"m","admissionGeneration":"g","incarnation":"i"})),
-                terminal_delivery:Some("t".into()),review_consumed:true,accepted_closure:None});
+                terminal_delivery:Some("t".into()),review_consumed:true});
         }
         sessions.refresh_next_work().await;
-        let gate = sessions.inner.gate.lock().unwrap();
+        let mut gate = sessions.inner.gate.lock().unwrap();
         assert_eq!(
-            gate.work_bindings[0].accepted_closure.as_ref(),
+            accepted_proof(
+                gate.next_work.as_ref(),
+                gate.management_scope.as_ref(),
+                &gate.work_bindings[0]
+            ),
             Some(&proof)
         );
         assert_eq!(gate.attempts, 2);
         assert!(gate.work_bindings[0].review_consumed);
+        let snapshot = gate.next_work.clone().unwrap();
+        let scope = gate.management_scope.clone().unwrap();
+        let binding = gate.work_bindings[0].clone();
+        let rows = vec![json!({"childId":"A","obligation":false,"executionKind":"settled"})];
+        assert!(
+            sessions.next_work_view(&gate, &rows)["runtime"]["awaitingAcceptance"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        for mutation in ["proofless", "forged_owner", "reopened", "incomplete"] {
+            let mut changed = snapshot.clone();
+            match mutation {
+                "proofless" => {
+                    changed["items"][0]["completion"] = Value::Null;
+                }
+                "forged_owner" => {
+                    changed["items"][0]["completion"]["managedAcceptance"]["ownerBindingId"] =
+                        json!("other");
+                }
+                "reopened" => {
+                    changed["items"][0]["status"] = json!("ready");
+                }
+                "incomplete" => {
+                    changed["complete"] = json!(false);
+                }
+                _ => unreachable!(),
+            }
+            gate.next_work = Some(changed);
+            assert!(
+                accepted_proof(gate.next_work.as_ref(), Some(&scope), &binding).is_none(),
+                "{mutation}"
+            );
+            assert_eq!(
+                sessions.next_work_view(&gate, &rows)["runtime"]["awaitingAcceptance"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1,
+                "{mutation}"
+            );
+        }
+        for mutation in ["delivery", "start", "review"] {
+            let mut changed = binding.clone();
+            match mutation {
+                "delivery" => changed.terminal_delivery = None,
+                "start" => changed.started_result = None,
+                "review" => changed.review_consumed = false,
+                _ => unreachable!(),
+            }
+            assert!(accepted_proof(Some(&snapshot), Some(&scope), &changed).is_none());
+        }
+        gate.next_work = None;
+        assert!(accepted_proof(None, Some(&scope), &binding).is_none());
+        assert_eq!(
+            sessions.next_work_view(&gate, &rows)["runtime"]["awaitingAcceptance"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        gate.next_work = Some(snapshot);
+        assert!(accepted_proof(gate.next_work.as_ref(), Some(&scope), &binding).is_some());
+        gate.next_work.as_mut().unwrap()["items"][0]["completion"] = Value::Null;
+        assert_eq!(
+            sessions.next_work_view(&gate, &rows)["runtime"]["awaitingAcceptance"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        gate.policy.as_mut().unwrap().managed_pass_policy = None;
+        assert!(
+            sessions.next_work_view(&gate, &rows)["runtime"]["awaitingAcceptance"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -948,7 +1013,7 @@ mod tests {
             let task = gate.task.clone();
             let policy = gate.policy.clone();
             gate.attempts = 2;
-            gate.work_bindings.push(Binding {child_id:"A".into(),plan_id:"p".into(),step_id:"leaf".into(),snapshot_revision:1,ownership:vec!["A".into()],start_permitted:true,task,policy,start_token:None,started_result:Some(json!({"childId":"A","admissionGeneration":"g","expectedMessageId":"m","incarnation":"i"})),terminal_delivery:Some("t".into()),review_consumed:false,accepted_closure:None});
+            gate.work_bindings.push(Binding {child_id:"A".into(),plan_id:"p".into(),step_id:"leaf".into(),snapshot_revision:1,ownership:vec!["A".into()],start_permitted:true,task,policy,start_token:None,started_result:Some(json!({"childId":"A","admissionGeneration":"g","expectedMessageId":"m","incarnation":"i"})),terminal_delivery:Some("t".into()),review_consumed:false});
         }
         assert!(sessions.any_running().await);
         let accounting = sessions.gate_status().await;
@@ -992,7 +1057,6 @@ mod tests {
                 started_result: None,
                 terminal_delivery: Some("terminal".into()),
                 review_consumed: false,
-                accepted_closure: None,
             });
         }
         let request = json!({"childId":"A","terminalDeliveryId":"terminal"});
@@ -1012,6 +1076,24 @@ mod tests {
         let gate = sessions.inner.gate.lock().unwrap();
         assert_eq!(gate.attempts, 2);
         assert_eq!(gate.consumed_managed_results.len(), 1);
+        let consumed = gate.consumed_managed_results.clone();
+        let mut persisted = serde_json::to_value(&*gate).unwrap();
+        persisted["workBindings"][0]["acceptedClosure"] = json!({"stale":true});
+        let restored: super::super::orchestration::Gate =
+            serde_json::from_value(persisted).unwrap();
+        assert!(restored.work_bindings[0].review_consumed);
+        assert_eq!(restored.consumed_managed_results, consumed);
+        assert!(restored.next_work.is_none());
+        assert!(accepted_proof(
+            restored.next_work.as_ref(),
+            restored.management_scope.as_ref(),
+            &restored.work_bindings[0]
+        )
+        .is_none());
+        drop(gate);
+        *sessions.inner.gate.lock().unwrap() = restored;
+        assert!(sessions.consume_managed_review(&candidate).is_err());
+        assert!(sessions.managed_review_candidate(&request).await.is_err());
     }
 
     #[tokio::test]
@@ -1044,7 +1126,6 @@ mod tests {
                 started_result: None,
                 terminal_delivery: Some("terminal".into()),
                 review_consumed: false,
-                accepted_closure: None,
             });
         }
         let request = json!({"childId":"A","terminalDeliveryId":"terminal"});

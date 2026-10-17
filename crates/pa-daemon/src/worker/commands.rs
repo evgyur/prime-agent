@@ -94,16 +94,83 @@ impl Worker {
             "wait_for_headless_completion" => {
                 self.handle_wait_for_headless_completion(payload).await
             }
+            "persist_owner_cancel" => {
+                let result = (|| -> Result<Value> {
+                    let fact: crate::journal::OwnerCancelFact =
+                        serde_json::from_value(payload["fact"].clone())?;
+                    let proof: crate::lease::LeaseProof =
+                        serde_json::from_value(payload["leaseProof"].clone())?;
+                    let parent = self
+                        .core
+                        .lock()
+                        .unwrap()
+                        .store
+                        .as_ref()
+                        .map(|store| store.path.clone())
+                        .ok_or_else(|| anyhow::anyhow!("Parent session unavailable"))?;
+                    anyhow::ensure!(
+                        crate::lease::canonical_session_path(&parent)
+                            == crate::lease::canonical_session_path(std::path::Path::new(
+                                &fact.parent_session_file
+                            )),
+                        "Owner cancellation parent mismatch"
+                    );
+                    let mut recovery = self.recovery.lock().unwrap();
+                    let journal = recovery
+                        .as_mut()
+                        .ok_or_else(|| anyhow::anyhow!("Parent recovery journal unavailable"))?;
+                    crate::lease::with_lease_proof(
+                        &self.config.agent_dir,
+                        std::path::Path::new(&fact.child_session_file),
+                        &proof,
+                        || journal.record_owner_cancel(fact.clone()),
+                    )?;
+                    Ok(
+                        json!({"ownerCancel":fact,"kind":"owner_cancel","processExitObserved":false}),
+                    )
+                })();
+                match result {
+                    Ok(value) => response_success(None, command_type, Some(value)),
+                    Err(error) => response_failure(None, command_type, &format!("{error:#}"), None),
+                }
+            }
             "get_state" => self.handle_get_state(),
             "configure_orchestration_gate" | "get_orchestration_gate" => {
+                let facts = self
+                    .recovery
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|journal| journal.owner_cancel_facts().to_vec())
+                    .unwrap_or_default();
+                if let Some(children) = self
+                    .agent_engine
+                    .as_ref()
+                    .and_then(|engine| engine.children.as_ref())
+                {
+                    if let Err(error) = children.restore_owner_cancellations(&facts).await {
+                        return response_failure(None, command_type, &format!("{error:#}"), None);
+                    }
+                }
                 if let Err(response) = self.require_created(command_type) {
                     return response;
                 }
                 match self
                     .engine
-                    .orchestration_gate(
-                        (command_type == "configure_orchestration_gate").then(|| payload.clone()),
-                    )
+                    .orchestration_gate((command_type == "configure_orchestration_gate").then(
+                        || {
+                            let mut configure = payload.clone();
+                            if configure.get("ownerCancelChild").is_some() {
+                                if let Some(object) = configure.as_object_mut() {
+                                    object.remove("id");
+                                    object.remove("type");
+                                    object.remove("activeSessionId");
+                                    object.remove("clientId");
+                                }
+                            }
+                            configure
+                        },
+                    ))
                     .await
                 {
                     Ok(status) => response_success(None, command_type, Some(status)),
@@ -124,7 +191,25 @@ impl Worker {
             "get_mcp_connections" => self.handle_get_mcp_connections().await,
             "set_mcp_static_token" => self.handle_set_mcp_static_token(payload).await,
             "remove_mcp_connection" => self.handle_remove_mcp_connection(payload).await,
-            "get_rlm_children" => self.handle_get_rlm_children().await,
+            "get_rlm_children" => {
+                let facts = self
+                    .recovery
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|journal| journal.owner_cancel_facts().to_vec())
+                    .unwrap_or_default();
+                if let Some(children) = self
+                    .agent_engine
+                    .as_ref()
+                    .and_then(|engine| engine.children.as_ref())
+                {
+                    if let Err(error) = children.restore_owner_cancellations(&facts).await {
+                        return response_failure(None, command_type, &format!("{error:#}"), None);
+                    }
+                }
+                self.handle_get_rlm_children().await
+            }
             "get_context_tree" => self.handle_get_context_tree().await,
             "get_commands" => self.handle_get_commands().await,
             "get_resource_snapshot" => self.handle_get_resource_snapshot().await,
@@ -443,6 +528,13 @@ impl Worker {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let owner_cancel_facts = self
+            .recovery
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|journal| json!(journal.owner_cancel_facts()))
+            .unwrap_or_else(|| json!([]));
         let (core, inputs) = self.summary_inputs();
         let summary = self.summary_locked(&core, inputs);
         response_success(
@@ -451,6 +543,7 @@ impl Worker {
             Some({
                 let mut value = serde_json::to_value(&summary).unwrap_or(Value::Null);
                 value["messageLifecycleFacts"] = json!(message_facts);
+                value["ownerCancelFacts"] = owner_cancel_facts;
                 value["ownExecutionStarted"] = json!(
                     core.busy
                         && core
@@ -1212,5 +1305,54 @@ mod bounce_text_tests {
             assert!(text.starts_with("Your agent message was cleared from "));
             assert!(text.contains("'s queue before delivery: "));
         }
+    }
+}
+
+#[cfg(test)]
+mod owner_cancel_wire_tests {
+    use super::*;
+    #[tokio::test]
+    async fn owner_cancel_wire_normalizes_only_transport_fields() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = crate::worker::WorkerConfig {
+            socket_path: dir.path().join("w.sock"),
+            supervisor_socket_path: std::path::PathBuf::new(),
+            token: "fixture".into(),
+            worker_instance_id: String::new(),
+            active_session_id: "parent".into(),
+            agent_dir: dir.path().join("agent"),
+            recovery_journal_path: dir.path().join("r.jsonl"),
+            telemetry_disabled: Some(true),
+            script: None,
+        };
+        let worker = Worker::new(config, None);
+        assert!(
+            worker
+                .dispatch("create", &json!({"noSession":true,"cwd":dir.path()}))
+                .await
+                .success
+        );
+        let wire = json!({"type":"configure_orchestration_gate","id":"request","activeSessionId":"parent","clientId":"owner-client","ownerCancelChild":{"childId":"absent"}});
+        let response = worker.dispatch("configure_orchestration_gate", &wire).await;
+        assert!(!response.success);
+        assert_eq!(response.error.as_deref(), Some("Direct child unavailable"));
+        let mut unexpected = wire.clone();
+        unexpected["unexpected"] = json!(true);
+        let response = worker
+            .dispatch("configure_orchestration_gate", &unexpected)
+            .await;
+        assert_eq!(
+            response.error.as_deref(),
+            Some("Unexpected owner cancellation fields")
+        );
+        let mut unexpected = wire;
+        unexpected["ownerCancelChild"]["unexpected"] = json!(true);
+        let response = worker
+            .dispatch("configure_orchestration_gate", &unexpected)
+            .await;
+        assert_eq!(
+            response.error.as_deref(),
+            Some("Invalid owner cancellation request")
+        );
     }
 }

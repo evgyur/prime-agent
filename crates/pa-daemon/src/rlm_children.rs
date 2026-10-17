@@ -148,6 +148,7 @@ struct ChildRecord {
     started_at_ms: u64,
     /// Terminal state (`done` | `error` | `cancelled`); running while absent.
     settled_status: Option<&'static str>,
+    owner_cancelled: bool,
     /// Set only by the settle funnel, after the terminal notice is delivered; the
     /// terminal status flips earlier, so the quiescence predicate waits out the
     /// notice window.
@@ -801,6 +802,7 @@ impl SupervisorChildSessions {
                 generation: row.admission_generation.take(),
                 expected: row.expected_message_id.take(),
             };
+            row.owner_cancelled = false;
             row.admission_generation =
                 crate::rlm_ledger::read_rlm_subagent_display(Path::new(&row.session_dir))
                     .and_then(|d| d.admission_generation);
@@ -889,6 +891,7 @@ impl SupervisorChildSessions {
                 progress_note: None,
                 label: String::new(),
                 started_at_ms: 0,
+                owner_cancelled: false,
                 settled_status: None,
                 settled: false,
                 admission_blocked: false,

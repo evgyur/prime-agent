@@ -4,7 +4,9 @@
 //! with the spawn-admission helpers only this surface uses.
 use super::subagent_policy;
 
-pub(crate) fn create_refused_error(message: String) -> anyhow::Error { anyhow::anyhow!(message) }
+pub(crate) fn create_refused_error(message: String) -> anyhow::Error {
+    anyhow::anyhow!(message)
+}
 use super::{
     assert_thinking_supported, bail, create_default_rlm_subagent_session_name, json, now_ms,
     resolve_child_model, rlm_child_label, rlm_depth_limit_error, spawn_name_unavailable_error, Arc,
@@ -161,7 +163,10 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 let created = match created {
                     Ok(created) => created,
                     Err(error) => {
-                        if error.downcast_ref::<super::next_work::CreateNotSent>().is_some() {
+                        if error
+                            .downcast_ref::<super::next_work::CreateNotSent>()
+                            .is_some()
+                        {
                             sessions.release_unsent_work(&child_id)?;
                         }
                         return Err(error);
@@ -178,6 +183,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     progress_note: None,
                     label: rlm_child_label(&request.prompt),
                     started_at_ms: now_ms(),
+                    owner_cancelled: false,
                     settled_status: None,
                     settled: false,
                     admission_blocked: false,

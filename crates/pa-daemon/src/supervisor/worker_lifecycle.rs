@@ -327,6 +327,13 @@ impl Supervisor {
             "{worker_id}{}",
             crate::journal::RECOVERY_JOURNAL_SUFFIX
         ));
+        if let Some(parent_file) = session_path.as_deref() {
+            crate::journal::WorkerRecoveryJournal::restore_parent_owner_cancellations(
+                &self.descriptor_dir,
+                &recovery_journal_path,
+                Path::new(parent_file),
+            )?;
+        }
         let descriptor = DaemonWorkerDescriptor {
             version: 2,
             worker_id: worker_id.clone(),
@@ -874,7 +881,15 @@ impl Supervisor {
                     start_id.as_deref(),
                     crate::lease::get_process_start_id(pid).as_deref(),
                 ) {
-                    let _ = std::fs::remove_file(&recovery_journal_path);
+                    if let Err(error) =
+                        crate::journal::WorkerRecoveryJournal::retain_owner_cancellations(
+                            Path::new(&recovery_journal_path),
+                        )
+                    {
+                        self.log_line(&format!(
+                            "Owner cancellation retention failed; journal preserved: {error:#}"
+                        ));
+                    }
                 }
                 let _ = std::fs::remove_file(&resident.descriptor_path);
                 // The identity-pending side record dies with the descriptor it shadows

@@ -598,7 +598,12 @@ impl SupervisorChildSessions {
                 && gate.work_bindings.iter().any(|binding| {
                     binding.started_result.is_some()
                         && binding.terminal_delivery.is_some()
-                        && binding.accepted_closure.is_none()
+                        && super::next_work::accepted_proof(
+                            gate.next_work.as_ref(),
+                            gate.management_scope.as_ref(),
+                            binding,
+                        )
+                        .is_none()
                 }))
             || gate.exception.is_some()
             || gate.attempts >= gate.policy.as_ref()?.corrective_budget
@@ -662,7 +667,8 @@ impl SupervisorChildSessions {
             let command=DaemonCommand::GetState{id:None,active_session_id:selector,rest:Map::default()};
             let state=self.inner.command(&command,SNAPSHOT_TIMEOUT_MS).await.ok();
             let current=record.lock().await;
-            let kind=if blocked || current.admission_blocked || current.admission_generation!=generation || generation.is_none() { "unknown" }
+            let kind=if current.owner_cancelled && current.settled && !current.admission_blocked && current.admission_generation==generation { "idle" }
+                else if blocked || current.admission_blocked || current.admission_generation!=generation || generation.is_none() { "unknown" }
                 else if current.settled { "idle" }
                 else { execution_kind(state.as_ref(),expected.as_deref()) };
             json!({"childId":id,"admissionGeneration":generation,"expectedMessageId":expected,

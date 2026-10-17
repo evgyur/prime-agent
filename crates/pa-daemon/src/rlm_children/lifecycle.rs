@@ -52,7 +52,136 @@ fn custom_message_text(message: &CustomMessage) -> Option<String> {
     }
 }
 
+impl super::SupervisorChildSessions {
+    pub(crate) async fn restore_owner_cancellations(
+        &self,
+        facts: &[crate::journal::OwnerCancelFact],
+    ) -> Result<()> {
+        let parent = self
+            .inner
+            .identity
+            .lock()
+            .expect("identity lock")
+            .session_file
+            .clone();
+        for fact in facts {
+            if parent.as_deref() != Some(fact.parent_session_file.as_str()) {
+                continue;
+            }
+            if let Some(record) = self.inner.find_record(&fact.child_id).await {
+                let lock = record.lock().await.admission_lock.clone();
+                let Ok(_guard) = lock.try_lock() else {
+                    continue;
+                };
+                let _ = self.inner.apply_owner_cancel(&record, fact).await;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn owner_cancel_child(&self, request: &Value) -> Result<Value> {
+        anyhow::ensure!(
+            request
+                .as_object()
+                .is_some_and(|object| object.len() == 1 && object.contains_key("childId")),
+            "Invalid owner cancellation request"
+        );
+        let child_id = request["childId"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Child identity missing"))?;
+        let record = self
+            .inner
+            .find_record(child_id)
+            .await
+            .ok_or_else(|| anyhow!("Direct child unavailable"))?;
+        let lock = record.lock().await.admission_lock.clone();
+        let _guard = lock.lock().await;
+        let fact = {
+            let row = record.lock().await;
+            let parent = self
+                .inner
+                .identity
+                .lock()
+                .expect("identity lock")
+                .session_file
+                .clone()
+                .ok_or_else(|| anyhow!("Parent file unavailable"))?;
+            crate::journal::OwnerCancelFact {
+                parent_session_file: parent,
+                child_id: row.rlm_child_id.clone(),
+                child_session_file: row
+                    .session_file
+                    .clone()
+                    .ok_or_else(|| anyhow!("Child file unavailable"))?,
+                admission_generation: row.admission_generation.clone(),
+                expected_message_id: row.expected_message_id.clone(),
+            }
+        };
+        let state = self
+            .inner
+            .command(
+                &DaemonCommand::GetState {
+                    id: None,
+                    active_session_id: self.inner.parent_active_session_id.clone(),
+                    rest: Map::default(),
+                },
+                STATE_TIMEOUT_MS,
+            )
+            .await?;
+        if state["ownerCancelFacts"].as_array().is_some_and(|facts| {
+            facts.iter().any(|value| {
+                serde_json::from_value::<crate::journal::OwnerCancelFact>(value.clone())
+                    .ok()
+                    .as_ref()
+                    == Some(&fact)
+            })
+        }) {
+            self.inner.apply_owner_cancel(&record, &fact).await?;
+            return Ok(
+                json!({"ownerCancel":fact,"kind":"owner_cancel","processExitObserved":false,"alreadyRecorded":true}),
+            );
+        }
+        let token = std::env::var("PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN")
+            .map_err(|_| anyhow!("Native owner authentication unavailable"))?;
+        let command = DaemonCommand::Kill {
+            id: None,
+            active_session_id: record.lock().await.active_session_id.clone(),
+            rest: Map::from_iter([(
+                "ownerCancel".into(),
+                json!({"workerToken":token,"fact":fact}),
+            )]),
+        };
+        let response = self.inner.command(&command, KILL_TIMEOUT_MS).await?;
+        self.inner.apply_owner_cancel(&record, &fact).await?;
+        Ok(response)
+    }
+}
+
 impl SupervisorChildSessionsInner {
+    async fn apply_owner_cancel(
+        &self,
+        record: &Arc<Mutex<ChildRecord>>,
+        fact: &crate::journal::OwnerCancelFact,
+    ) -> Result<()> {
+        {
+            let mut row = record.lock().await;
+            anyhow::ensure!(
+                row.rlm_child_id == fact.child_id
+                    && row.session_file.as_deref() == Some(fact.child_session_file.as_str())
+                    && row.admission_generation == fact.admission_generation
+                    && row.expected_message_id == fact.expected_message_id,
+                "Owner cancellation no longer matches child admission"
+            );
+            row.owner_cancelled = true;
+            row.admission_blocked = false;
+            row.settled_status = Some("cancelled");
+            row.settled = true;
+            row.error = Some("Cancelled by owner under exclusive session lease; historical process exit not observed".into());
+        }
+        self.refresh_running().await;
+        Ok(())
+    }
+
     /// Create one child session over the supervisor link (no prompt yet);
     /// `model` is the resolved `provider/id` selector.
     ///
@@ -1045,5 +1174,130 @@ mod exit_capture_tests {
         assert_eq!(last_assistant_text_from_file(&bare.to_string_lossy()), None);
         let _ = std::fs::remove_file(&file);
         let _ = std::fs::remove_file(&bare);
+    }
+}
+
+#[cfg(test)]
+mod owner_cancel_tests {
+    use super::*;
+    #[tokio::test]
+    async fn owner_cancel_settles_only_matching_admission_without_deadlock_or_credit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sessions = super::super::SupervisorChildSessions::new(
+            Arc::new(crate::supervisor_link::SupervisorLink::new(
+                std::path::PathBuf::new(),
+            )),
+            dir.path().to_path_buf(),
+            "parent".into(),
+            Arc::new(crate::model_allowlist::ModelRefusalTelemetry::new(
+                dir.path().to_path_buf(),
+                true,
+            )),
+        );
+        sessions.set_identity(ParentIdentity {
+            session_file: Some("parent-file".into()),
+            ..ParentIdentity::with_default_depth()
+        });
+        let record = Arc::new(Mutex::new(ChildRecord {
+            rlm_child_id: "child".into(),
+            session_name: "child".into(),
+            active_session_id: "child-active".into(),
+            session_id: None,
+            session_dir: dir.path().to_string_lossy().into_owned(),
+            model: String::new(),
+            thinking_level: None,
+            progress_note: None,
+            label: String::new(),
+            started_at_ms: 0,
+            owner_cancelled: false,
+            settled_status: None,
+            settled: false,
+            admission_blocked: true,
+            admission_lock: Arc::new(Mutex::new(())),
+            settle_watch_lock: Arc::new(Mutex::new(())),
+            answer_preview: None,
+            answer_text: None,
+            answer_captured: false,
+            replied_since_task: false,
+            notice_delivered: false,
+            prompt_admitted: true,
+            admission_generation: None,
+            expected_message_id: None,
+            error: None,
+            closed_by_parent: false,
+            retirement_finished: false,
+            retirement_notified: false,
+            retirement_roster_emitted: false,
+            usage_registration_forgotten: false,
+            session_file: Some("child-file".into()),
+            attributed_rows: None,
+            pending_usage_report: None,
+            usage_watch_live: false,
+            usage_rearm: false,
+            emit_lock: Arc::new(Mutex::new(())),
+            last_emitted_status: None,
+            rename_lock: Arc::new(Mutex::new(())),
+        }));
+        sessions
+            .inner
+            .children
+            .lock()
+            .await
+            .push(Arc::clone(&record));
+        let fact = crate::journal::OwnerCancelFact {
+            parent_session_file: "parent-file".into(),
+            child_id: "child".into(),
+            child_session_file: "child-file".into(),
+            admission_generation: None,
+            expected_message_id: None,
+        };
+        sessions.inner.refresh_running().await;
+        assert!(*sessions.inner.running.borrow());
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            sessions.restore_owner_cancellations(&[fact.clone()]),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!*sessions.inner.running.borrow());
+        assert_eq!(record.lock().await.settled_status, Some("cancelled"));
+        let rows = sessions.accounting_rows().await;
+        assert_eq!(rows[0]["executionKind"], "idle");
+        assert_eq!(rows[0]["obligation"], false);
+        {
+            let mut row = record.lock().await;
+            row.owner_cancelled = false;
+        }
+        assert_eq!(
+            sessions.accounting_rows().await[0]["executionKind"],
+            "unknown"
+        );
+        sessions
+            .restore_owner_cancellations(&[fact.clone()])
+            .await
+            .unwrap();
+        assert!(sessions
+            .inner
+            .gate
+            .lock()
+            .unwrap()
+            .consumed_managed_results
+            .is_empty());
+        sessions
+            .restore_owner_cancellations(&[fact.clone()])
+            .await
+            .unwrap();
+        {
+            let mut row = record.lock().await;
+            row.owner_cancelled = false;
+            row.admission_generation = Some("new-generation".into());
+            row.admission_blocked = true;
+            row.settled = false;
+            row.settled_status = None;
+        }
+        sessions.restore_owner_cancellations(&[fact]).await.unwrap();
+        assert!(record.lock().await.admission_blocked);
+        assert!(record.lock().await.settled_status.is_none());
     }
 }
