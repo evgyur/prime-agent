@@ -57,6 +57,13 @@ impl Source {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("gate_changed: Work start revision changed; expected={expected} current={current}; start_permitted=false")]
+struct StartRevisionChanged {
+    expected: u64,
+    current: u64,
+}
+
 impl SupervisorChildSessions {
     pub(super) fn release_unsent_work(&self, child_id: &str) -> Result<()> {
         let mut gate = self.inner.gate.lock().expect("gate lock");
@@ -136,6 +143,15 @@ impl SupervisorChildSessions {
     }
 
     pub(crate) async fn begin_work_start(&self, permit: &Value) -> Result<Value> {
+        match self.begin_work_start_snapshot(permit).await {
+            Err(error) if error.downcast_ref::<StartRevisionChanged>().is_some() => {
+                self.begin_work_start_snapshot(permit).await
+            }
+            result => result,
+        }
+    }
+
+    async fn begin_work_start_snapshot(&self, permit: &Value) -> Result<Value> {
         self.refresh_next_work().await;
         let revision = self.inner.gate.lock().expect("gate lock").revision;
         let epoch = self
@@ -190,14 +206,9 @@ impl SupervisorChildSessions {
         );
         let mut gate = self.inner.gate.lock().expect("gate lock");
         anyhow::ensure!(
-            gate.revision == revision
-                && self
-                    .inner
-                    .accounting_epoch
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                    == epoch,
-            "gate_changed: Work start accounting changed; revision expected={} current={}, epoch expected={} current={}; start_permitted=false",
-            revision,gate.revision,epoch,self.inner.accounting_epoch.load(std::sync::atomic::Ordering::SeqCst)
+            self.inner.accounting_epoch.load(std::sync::atomic::Ordering::SeqCst) == epoch,
+            "gate_changed: Work start accounting epoch changed; expected={} current={}; start_permitted=false",
+            epoch,self.inner.accounting_epoch.load(std::sync::atomic::Ordering::SeqCst)
         );
         anyhow::ensure!(
             gate.start_accounting_complete(&accounting, permit),
@@ -228,6 +239,7 @@ impl SupervisorChildSessions {
                             && item["status"] == "ready")),
             "Work no longer ready before provider start"
         );
+        let current_revision = gate.revision;
         let task = gate.task.clone();
         let policy = gate.policy.clone();
         let binding = gate
@@ -254,6 +266,13 @@ impl SupervisorChildSessions {
             !binding.start_permitted,
             "Work start already admitted; reconcile without replay"
         );
+        if current_revision != revision {
+            return Err(StartRevisionChanged {
+                expected: revision,
+                current: current_revision,
+            }
+            .into());
+        }
         binding.start_permitted = true;
         gate.revision += 1;
         self.persist_gate(&gate)?;
@@ -1294,6 +1313,17 @@ mod tests {
         Value,
         Arc<tokio::sync::Notify>,
     ) {
+        start_fixture_with_revision_changes(state, false).await
+    }
+    async fn start_fixture_with_revision_changes(
+        state: Value,
+        change_revision: bool,
+    ) -> (
+        SupervisorChildSessions,
+        tempfile::TempDir,
+        Value,
+        Arc<tokio::sync::Notify>,
+    ) {
         use tokio::io::{AsyncBufReadExt, BufReader};
         let mut sessions = sessions();
         let source = source(&sessions, projection()).await;
@@ -1305,11 +1335,13 @@ mod tests {
             Arc::new(crate::supervisor_link::SupervisorLink::new(socket));
         let state_read = Arc::new(tokio::sync::Notify::new());
         let server_read = state_read.clone();
+        let server_gate = sessions.inner.clone();
         tokio::spawn(async move {
             loop {
                 let stream = listener.accept().await.unwrap();
                 let state_read = server_read.clone();
                 let state = state.clone();
+                let gate = server_gate.clone();
                 tokio::spawn(async move {
                     let (reader, mut writer) = stream.split();
                     writer.write_all(b"{\"type\":\"daemon_hello\",\"protocol\":{\"name\":\"prime-agent.daemon\",\"version\":7}}\n").await.unwrap();
@@ -1317,6 +1349,9 @@ mod tests {
                     let mut line = String::new();
                     reader.read_line(&mut line).await.unwrap();
                     let request: Value = serde_json::from_str(&line).unwrap();
+                    if change_revision {
+                        gate.gate.lock().unwrap().revision += 1;
+                    }
                     let response = crate::protocol::response_success(
                         request["id"].as_str(),
                         "get_state",
@@ -1447,6 +1482,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_revision_changes_deny_after_bounded_resample() {
+        let (sessions,_source,permit,_)=start_fixture_with_revision_changes(json!({"workerInstanceId":"worker","isStreaming":true,"ownExecutionStarted":false,"runningMessageIds":[],"sessionActions":{"queuedCount":1}}),true).await;
+        assert!(sessions
+            .begin_work_start(&permit)
+            .await
+            .unwrap_err()
+            .downcast_ref::<StartRevisionChanged>()
+            .is_some());
+        assert!(!sessions.inner.gate.lock().unwrap().work_bindings[0].start_permitted);
+    }
+
+    #[tokio::test]
+    async fn supported_assignment_cas_race_resamples_once_before_same_start() {
+        let (sessions, _source, permit, state_read) = start_fixture().await;
+        let gate = sessions.inner.gate.lock().unwrap().clone();
+        let config = json!({"expectedRevision":gate.revision,"policy":gate.policy,"task":gate.task,"assignments":[]});
+        let admission = sessions.inner.spawn_gate.lock().await;
+        let starting_sessions = sessions.clone();
+        let request = permit.clone();
+        let starting =
+            tokio::spawn(async move { starting_sessions.begin_work_start(&request).await });
+        state_read.notified().await;
+        sessions.configure_gate(&config).await.unwrap();
+        drop(admission);
+        assert_eq!(starting.await.unwrap().unwrap()["workStartPermitted"], true);
+        assert!(sessions.begin_work_start(&permit).await.is_err());
+        assert!(sessions.inner.gate.lock().unwrap().work_bindings[0].start_permitted);
+    }
+
+    #[tokio::test]
     async fn start_permit_rechecks_record_and_task_after_waiting_for_admission_lock() {
         for change in [
             "generation",
@@ -1456,7 +1521,6 @@ mod tests {
             "task",
             "policy",
             "epoch",
-            "revision",
         ] {
             let (sessions, _source, permit, state_read) = start_fixture().await;
             let admission = sessions.inner.spawn_gate.lock().await;
@@ -1481,9 +1545,6 @@ mod tests {
                     .inner
                     .accounting_epoch
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }
-            if change == "revision" {
-                sessions.inner.gate.lock().unwrap().revision += 1;
             }
             if change == "task" || change == "policy" {
                 let mut gate = sessions.inner.gate.lock().unwrap();
