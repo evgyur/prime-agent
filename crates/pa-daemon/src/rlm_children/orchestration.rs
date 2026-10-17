@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) const DEFAULT_CORRECTIVE_BUDGET: u32 = 2;
 pub(crate) const MAX_CORRECTIVE_BUDGET: u32 = 5;
-pub(crate) const MIN_ACTIVE: usize = 5;
+pub(crate) const DEFAULT_MIN_ACTIVE: usize = 5;
 pub(crate) const MAX_ACTIVE: usize = 20;
 const SNAPSHOT_TIMEOUT_MS: u64 = 2_000;
 
@@ -183,8 +183,8 @@ impl SupervisorChildSessions {
         let task: Task = serde_json::from_value(payload["task"].clone())?;
         anyhow::ensure!(
             policy.version == 1
-                && policy.min_active == MIN_ACTIVE
-                && (MIN_ACTIVE..=MAX_ACTIVE).contains(&policy.max_active)
+                && (1..=MAX_ACTIVE).contains(&policy.min_active)
+                && (policy.min_active..=MAX_ACTIVE).contains(&policy.max_active)
                 && policy.corrective_budget <= MAX_CORRECTIVE_BUDGET,
             "Invalid orchestration v1 policy"
         );
@@ -324,7 +324,11 @@ impl SupervisorChildSessions {
         } else if gate.exception.is_some() {
             "exception"
         } else if unknown == 0
-            && active >= gate.policy.as_ref().map_or(MIN_ACTIVE, |p| p.min_active)
+            && active
+                >= gate
+                    .policy
+                    .as_ref()
+                    .map_or(DEFAULT_MIN_ACTIVE, |p| p.min_active)
         {
             "pass"
         } else if gate.attempts >= gate.policy.as_ref().map_or(0, |p| p.corrective_budget) {
@@ -662,7 +666,7 @@ mod tests {
             .filter(|row| execution_kind(Some(row), Some("new")) == "executing")
             .count();
         assert_eq!(count, 4);
-        assert!(count < MIN_ACTIVE);
+        assert!(count < DEFAULT_MIN_ACTIVE);
         observations[4] = active;
         assert_eq!(
             observations
@@ -713,5 +717,125 @@ mod tests {
         assert!(sessions.gate_correction_is_current());
         sessions.inner_disable_gate_for_test();
         assert!(!sessions.gate_correction_is_current());
+    }
+    #[tokio::test]
+    async fn configurable_min_max_accept_valid_ranges_and_preserve_budget_bounds() {
+        for (min, max) in [(1, 1), (3, 3), (3, 8), (5, 20)] {
+            let sessions = sessions();
+            let mut config = configure(2);
+            config["policy"]["minActive"] = json!(min);
+            config["policy"]["maxActive"] = json!(max);
+            let status = sessions.configure_gate(&config).await.unwrap();
+            assert_eq!(status["policy"]["minActive"], min);
+            assert_eq!(status["policy"]["maxActive"], max);
+            assert_eq!(status["decision"], "corrective");
+            assert!(sessions.gate_correction().await.is_some());
+            sessions.consume_gate_correction();
+            assert!(sessions.gate_correction().await.is_some());
+            sessions.consume_gate_correction();
+            assert!(sessions.gate_correction().await.is_none());
+            assert_eq!(sessions.gate_status().await["decision"], "suspended");
+        }
+        for (min, max) in [(0, 20), (3, 2), (1, 21), (21, 21), (1, 0)] {
+            let sessions = sessions();
+            let mut config = configure(2);
+            config["policy"]["minActive"] = json!(min);
+            config["policy"]["maxActive"] = json!(max);
+            assert!(sessions.configure_gate(&config).await.is_err());
+        }
+    }
+    #[tokio::test]
+    async fn three_live_executions_pass_min_three_but_two_do_not() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("range.sock");
+        let listener = pa_types::platform::transport::bind_transport(&socket)
+            .await
+            .unwrap();
+        let sessions = SupervisorChildSessions::new(
+            Arc::new(crate::supervisor_link::SupervisorLink::new(socket)),
+            dir.path().into(),
+            "parent".into(),
+            Arc::new(crate::model_allowlist::ModelRefusalTelemetry::new(
+                dir.path().into(),
+                true,
+            )),
+        );
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(3));
+        let active_server = active.clone();
+        tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.unwrap();
+                let active = active_server.clone();
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.split();
+                    writer.write_all(b"{\"type\":\"daemon_hello\",\"protocol\":{\"name\":\"prime-agent.daemon\",\"version\":7}}\n").await.unwrap();
+                    let mut reader = BufReader::new(reader);
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap() == 0 {
+                            return;
+                        }
+                        let request: Value = serde_json::from_str(&line).unwrap();
+                        let index = request["command"]["activeSessionId"]
+                            .as_str()
+                            .unwrap()
+                            .strip_prefix("kid-")
+                            .unwrap()
+                            .parse::<usize>()
+                            .unwrap();
+                        let executing = index < active.load(std::sync::atomic::Ordering::SeqCst);
+                        let state = json!({"workerInstanceId":"worker","ownExecutionStarted":executing,"isStreaming":executing,"runningMessageIds":["message"],"sessionActions":{"queuedCount":0}});
+                        let response = crate::protocol::response_success(
+                            request["id"].as_str(),
+                            "get_state",
+                            Some(state),
+                        );
+                        if writer
+                            .write_all(
+                                format!("{}\n", serde_json::to_string(&response).unwrap())
+                                    .as_bytes(),
+                            )
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let mut config = configure(2);
+        config["policy"]["minActive"] = json!(3);
+        config["policy"]["maxActive"] = json!(8);
+        sessions.configure_gate(&config).await.unwrap();
+        let mut assignments = Vec::new();
+        for i in 0..3 {
+            let id = format!("kid-{i}");
+            sessions
+                .push_test_child(RlmChildIdentity {
+                    rlm_child_id: id.clone(),
+                    active_session_id: id.clone(),
+                    session_id: None,
+                    session_name: id.clone(),
+                })
+                .await;
+            let record = sessions.inner.find_record(&id).await.unwrap();
+            {
+                let mut row = record.lock().await;
+                row.admission_generation = Some("generation".into());
+                row.expected_message_id = Some("message".into());
+            }
+            assignments.push(json!({"childId":id,"admissionGeneration":"generation","incarnation":"worker","assignmentId":format!("assignment-{i}"),"taskGeneration":1,"ownership":format!("lane-{i}"),"acceptanceRef":"accept","artifactRef":"artifact","dependenciesSatisfied":true}));
+        }
+        config["expectedRevision"] = json!(1);
+        config["assignments"] = json!(assignments);
+        let status = sessions.configure_gate(&config).await.unwrap();
+        assert_eq!(status["knownActive"], 3);
+        assert_eq!(status["decision"], "pass");
+        active.store(2, std::sync::atomic::Ordering::SeqCst);
+        let status = sessions.gate_status().await;
+        assert_eq!(status["knownActive"], 2);
+        assert_eq!(status["decision"], "corrective");
     }
 }
