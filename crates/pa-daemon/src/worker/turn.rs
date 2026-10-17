@@ -140,27 +140,42 @@ impl TurnRunner {
                     }
                 }
                 let mut work_allowed = true;
-                for (message_id, permit) in items.iter().filter_map(|item| {
-                    item.custom_message
-                        .as_ref()
-                        .and_then(|row| row.get("nativeWorkPermit").map(|permit| (row["details"]["id"].as_str(), permit)))
-                }) {
-                    let mut permit = permit.clone();
-                    if message_id.is_none() || message_id != permit["expectedMessageId"].as_str()
-                        || permit["childActiveSessionId"] != self.active_session_id {
+                for item in &mut items {
+                    let Some(row) = item.custom_message.as_mut() else {
+                        continue;
+                    };
+                    let Some(mut permit) = row.get("nativeWorkPermit").cloned() else {
+                        continue;
+                    };
+                    let _ = row["nativeWorkPermit"]
+                        .as_object_mut()
+                        .map(|permit| permit.remove("managedResultTracking"));
+                    let message_id = row["details"]["id"].as_str();
+                    if message_id.is_none()
+                        || message_id != permit["expectedMessageId"].as_str()
+                        || permit["childActiveSessionId"] != self.active_session_id
+                    {
                         work_allowed = false;
                         continue;
                     }
-                    permit["incarnation"] = json!(std::env::var(super::WORKER_INSTANCE_ID_ENV).unwrap_or_default());
+                    permit["incarnation"] =
+                        json!(std::env::var(super::WORKER_INSTANCE_ID_ENV).unwrap_or_default());
                     let response = self.passivation.link.request(json!({
                         "type":"configure_orchestration_gate","activeSessionId":permit["ownerActiveSessionId"],"beginWorkStart":permit
                     }), Duration::from_millis(2_000)).await;
-                    let allowed = response
+                    let status = response
                         .ok()
                         .filter(|response| response.success)
-                        .and_then(|response| response.data)
+                        .and_then(|response| response.data);
+                    work_allowed &= status
+                        .as_ref()
                         .is_some_and(|status| status["workStartPermitted"] == true);
-                    work_allowed &= allowed;
+                    if status
+                        .as_ref()
+                        .is_some_and(|status| status["managedResultTracking"] == true)
+                    {
+                        row["nativeWorkPermit"]["managedResultTracking"] = json!(true);
+                    }
                 }
                 if items.iter().any(|item| {
                     item.custom_message
@@ -510,6 +525,38 @@ impl TurnRunner {
         // The settled outcome reaches the waiting prompt only at full
         // settle: resolving at `Done` queued a follow-up behind the
         // indefinite suspension.
+        let started_message_ids: Vec<(String, Option<String>)> = items
+            .iter()
+            .filter_map(|item| {
+                item.custom_message
+                    .as_ref()
+                    .filter(|row| row["nativeWorkPermit"]["managedResultTracking"] == true)
+                    .and_then(|row| {
+                        row["details"]["id"].as_str().map(|id| {
+                            (
+                                id.to_string(),
+                                row["nativeWorkPermit"]["admissionGeneration"]
+                                    .as_str()
+                                    .map(str::to_string),
+                            )
+                        })
+                    })
+            })
+            .collect();
+        let delivered_terminal_ids: Vec<String> = items
+            .iter()
+            .filter_map(|item| {
+                item.custom_message
+                    .as_ref()
+                    .filter(|row| {
+                        crate::child_status_notices::is_reserved_child_status_custom_type(row)
+                            && row["details"]["nativeManagedResult"] == true
+                    })
+                    .and_then(|row| row["details"]["terminalDeliveryId"].as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        let fact_recovery = Arc::clone(&self.recovery);
         let settled_admissions: Vec<String> = items
             .iter()
             .filter_map(|item| item.admission_id.clone())
@@ -1199,6 +1246,74 @@ impl TurnRunner {
             // this boundary; their missing-ID validation remains strict.
             if file_backed {
                 engine.set_prompt_context_boundary(prompt_context_leaf);
+            }
+            let fact_result = (|| -> Result<()> {
+                let (active_session_id, session_id) = {
+                    let core = core.lock().unwrap();
+                    (
+                        core.active_session_id.clone(),
+                        core.store
+                            .as_ref()
+                            .map(|store| store.session_id().to_string())
+                            .unwrap_or_default(),
+                    )
+                };
+                let mut recovery = fact_recovery.lock().unwrap();
+                if !started_message_ids.is_empty() || !delivered_terminal_ids.is_empty() {
+                    let journal = recovery
+                        .as_mut()
+                        .ok_or_else(|| anyhow::anyhow!("Lifecycle fact journal unavailable"))?;
+                    for (message_id, generation, phase) in started_message_ids
+                        .iter()
+                        .map(|(id, generation)| (id, generation.clone(), "started"))
+                        .chain(
+                            delivered_terminal_ids
+                                .iter()
+                                .map(|id| (id, None, "delivered")),
+                        )
+                    {
+                        journal.record_message_fact(crate::journal::WorkerMessageFact {
+                            active_session_id: active_session_id.clone(),
+                            session_id: session_id.clone(),
+                            message_id: message_id.clone(),
+                            phase: phase.into(),
+                            admission_generation: generation,
+                            incarnation: std::env::var(super::WORKER_INSTANCE_ID_ENV)
+                                .unwrap_or_default(),
+                        })?;
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(error) = fact_result {
+                emit(EngineEvent::Done(Err(format!(
+                    "Lifecycle fact persist failed: {error:#}"
+                ))));
+                return;
+            }
+            if !delivered_terminal_ids.is_empty() {
+                let managed = engine.orchestration_gate(None);
+                let status = tokio::runtime::Handle::current().block_on(managed).ok();
+                if status.as_ref().is_some_and(|status| {
+                    status["policy"]["managedPassPolicy"] == "causal_results_v1"
+                }) {
+                    let review = request.custom_message.as_ref().map(|row| json!({"childId":row["details"]["childId"],"terminalDeliveryId":row["details"]["terminalDeliveryId"],"nativeNonce":crate::child_status_notices::mint()})).unwrap_or(Value::Null);
+                    let allowed = tokio::runtime::Handle::current().block_on(
+                        engine.orchestration_gate(Some(json!({"beginManagedReview":review}))),
+                    );
+                    if let Err(error) = allowed {
+                        emit(EngineEvent::Done(Err(format!(
+                            "Managed result review blocked: {error:#}"
+                        ))));
+                        return;
+                    }
+                }
+            }
+            if aborted_probe() {
+                emit(EngineEvent::Done(Err(
+                    "Managed admission aborted before execution".into(),
+                )));
+                return;
             }
             engine.run_prompt(prompt_index, request, &aborted_probe, &mut emit);
         });

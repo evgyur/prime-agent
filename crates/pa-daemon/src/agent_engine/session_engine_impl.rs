@@ -32,6 +32,56 @@ impl SessionEngine for AgentSessionEngine {
                 .ok_or_else(|| anyhow::anyhow!("Orchestration children unavailable"))?;
             match configure {
                 Some(mut payload) => {
+                    if let Some(review) = payload.get("beginManagedReview") {
+                        anyhow::ensure!(
+                            crate::child_status_notices::consume(review["nativeNonce"].as_str()),
+                            "Managed review is internal only"
+                        );
+                        anyhow::ensure!(
+                            !self.session_is_closed()
+                                && !self.session_input_queued()
+                                && !self.gate_budget_or_quota_blocks(),
+                            "Managed review stopped by input, close or budget"
+                        );
+                        let goal = self
+                            .current_goal_state()
+                            .ok_or_else(|| anyhow::anyhow!("Goal state unavailable"))?;
+                        children.bind_management_goal(
+                            goal.goal_id
+                                .as_deref()
+                                .ok_or_else(|| anyhow::anyhow!("Goal missing"))?,
+                        )?;
+                        let candidate = children.managed_review_candidate(review).await?;
+                        anyhow::ensure!(
+                            candidate["goalId"].as_str() == goal.goal_id.as_deref(),
+                            "Managed review goal mismatch"
+                        );
+                        let handles = self
+                            .goal_runtime
+                            .lock()
+                            .expect("goal runtime lock")
+                            .clone()
+                            .ok_or_else(|| anyhow::anyhow!("Goal runtime missing"))?;
+                        let last_turn = self.last_loop_assistant_message_async().await;
+                        let mut driver = handles.driver.lock().await;
+                        let mut session = handles.session.lock().await;
+                        let minted =
+                            driver.next_continuation_message(&mut session, last_turn.as_ref())?;
+                        anyhow::ensure!(
+                            minted.is_some(),
+                            "Managed review private goal guard refused"
+                        );
+                        if let Err(error) = children.consume_managed_review(&candidate) {
+                            let _ = driver.rollback_continuation_mint(&mut session);
+                            return Err(error);
+                        }
+                        if self.session_is_closed() || self.session_input_queued() {
+                            let _ = driver.rollback_continuation_mint(&mut session);
+                            anyhow::bail!("Managed review consumed but admission cancelled; reconcile without replay");
+                        }
+                        driver.continuation_consumed();
+                        return Ok(json!({"managedReviewPermitted":true,"result":candidate}));
+                    }
                     if let Some(rebind) = payload.get("rebindNextWorkSource") {
                         let goal = self.current_goal_state();
                         return children
@@ -56,9 +106,14 @@ impl SessionEngine for AgentSessionEngine {
                     if let Some(scope) = management_scope.as_ref() {
                         let goal = self.current_goal_state();
                         anyhow::ensure!(
-                            scope["goalId"].as_str()
-                                == goal.as_ref().and_then(|goal| goal.goal_id.as_deref())
-                                && scope["goalId"].as_str().is_some(),
+                            (scope["goalId"].is_null()
+                                && goal
+                                    .as_ref()
+                                    .and_then(|goal| goal.goal_id.as_deref())
+                                    .is_none())
+                                || (scope["goalId"].as_str().is_some()
+                                    && scope["goalId"].as_str()
+                                        == goal.as_ref().and_then(|goal| goal.goal_id.as_deref())),
                             "Invalid management goal"
                         );
                     }

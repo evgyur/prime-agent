@@ -146,11 +146,25 @@ impl SupervisorChildSessionsInner {
             launch_env,
             rest: Map::default(),
         };
-        let response = self.link.request(serde_json::to_value(&create)?, Duration::from_millis(CREATE_TIMEOUT_MS)).await
+        let response = self
+            .link
+            .request(
+                serde_json::to_value(&create)?,
+                Duration::from_millis(CREATE_TIMEOUT_MS),
+            )
+            .await
             .with_context(|| format!("spawn RLM child session {child_id}"))?;
         if !response.success {
-            let message = response.error.unwrap_or_else(|| "Child create refused".into());
-            if matches!(response.error_info, Some(pa_types::daemon::DaemonErrorInfo::UpdateRestarting | pa_types::daemon::DaemonErrorInfo::WorkerOverloaded)) {
+            let message = response
+                .error
+                .unwrap_or_else(|| "Child create refused".into());
+            if matches!(
+                response.error_info,
+                Some(
+                    pa_types::daemon::DaemonErrorInfo::UpdateRestarting
+                        | pa_types::daemon::DaemonErrorInfo::WorkerOverloaded
+                )
+            ) {
                 return Err(super::next_work::CreateNotSent(message).into());
             }
             return Err(super::host::create_refused_error(message));
@@ -431,6 +445,48 @@ impl SupervisorChildSessionsInner {
             }
         }
         let active_session_id = record.lock().await.active_session_id.clone();
+        let state = self
+            .command(
+                &DaemonCommand::GetState {
+                    id: None,
+                    active_session_id: active_session_id.clone(),
+                    rest: Map::default(),
+                },
+                STATE_TIMEOUT_MS,
+            )
+            .await
+            .ok();
+        if let Some(state) = state {
+            let row = record.lock().await;
+            let mut gate = self.gate.lock().expect("gate lock");
+            let mut next = gate.clone();
+            if let Some(binding) = next
+                .work_bindings
+                .iter_mut()
+                .find(|binding| binding.child_id == row.rlm_child_id && binding.start_permitted)
+            {
+                if let Some(fact) = state["messageLifecycleFacts"].as_array().and_then(|facts| {
+                    facts.iter().find(|fact| {
+                        fact["phase"] == "started"
+                            && fact["messageId"].as_str() == row.expected_message_id.as_deref()
+                            && fact["incarnation"] == state["workerInstanceId"]
+                            && fact["admissionGeneration"].as_str()
+                                == row.admission_generation.as_deref()
+                    })
+                }) {
+                    binding.started_result = Some(
+                        json!({"childId":row.rlm_child_id,"admissionGeneration":row.admission_generation,
+                        "expectedMessageId":row.expected_message_id,"incarnation":fact["incarnation"]}),
+                    );
+                    match self.persist_gate(&next) {
+                        Ok(()) => *gate = next,
+                        Err(error) => {
+                            eprintln!("pa-daemon: started result persist failed: {error:#}")
+                        }
+                    }
+                }
+            }
+        }
         let busy = self.child_busy(&active_session_id).await;
         if !matches!(busy, Ok(false)) {
             return;
@@ -665,6 +721,8 @@ impl SupervisorChildSessionsInner {
         let message = {
             let mut record = record.lock().await;
             if record.notice_delivered || record.replied_since_task {
+                // A prior reply is not a terminal delivery receipt. Keep the managed
+                // binding for explicit acceptance; it never earns a result consult here.
                 return;
             }
             record.notice_delivered = true;
@@ -800,13 +858,37 @@ impl SupervisorChildSessionsInner {
     /// reserved-kind row exclusively with a live mint, and answers
     /// anything a caller sends — with or without a guessed nonce —
     /// loudly instead.
-    pub(super) async fn deliver_terminal_notice(&self, message: CustomMessage) {
+    pub(super) async fn deliver_terminal_notice(&self, message: CustomMessage) -> Option<String> {
         let Some(content) = custom_message_text(&message) else {
             eprintln!("pa-daemon: RLM child notice carried no text content");
-            return;
+            return None;
         };
-        let wire = serde_json::to_value(pa_types::session::AgentMessage::Custom(message))
+        let mut wire = serde_json::to_value(pa_types::session::AgentMessage::Custom(message))
             .unwrap_or(Value::Null);
+        let terminal_id = uuid::Uuid::new_v4().to_string();
+        wire["details"]["terminalDeliveryId"] = json!(terminal_id);
+        if let Some(child_id) = wire["details"]["childId"].as_str() {
+            let mut gate = self.gate.lock().expect("gate lock");
+            let mut next = gate.clone();
+            if let Some(binding) = next
+                .work_bindings
+                .iter_mut()
+                .find(|binding| binding.child_id == child_id)
+            {
+                binding.terminal_delivery = Some(terminal_id.clone());
+                wire["details"]["nativeManagedResult"] =
+                    json!(next
+                        .policy
+                        .as_ref()
+                        .is_some_and(|policy| policy.managed_pass_policy.as_deref()
+                            == Some("causal_results_v1")));
+                if let Err(error) = self.persist_gate(&next) {
+                    eprintln!("pa-daemon: terminal result intent persist failed: {error:#}");
+                    return None;
+                }
+                *gate = next;
+            }
+        }
         let nonce = crate::child_status_notices::mint();
         let command = DaemonCommand::FollowUp {
             id: None,
@@ -828,10 +910,12 @@ impl SupervisorChildSessionsInner {
             },
             rest: Map::default(),
         };
-        if let Err(error) = self.command(&command, NOTICE_DELIVERY_TIMEOUT_MS).await {
-            eprintln!(
-                "pa-daemon: RLM child terminal notice was not delivered to the parent session: {error:#}"
-            );
+        match self.command(&command, NOTICE_DELIVERY_TIMEOUT_MS).await {
+            Ok(receipt) => receipt["terminalDeliveryId"].as_str().map(str::to_string),
+            Err(error) => {
+                eprintln!("pa-daemon: RLM child terminal notice delivery ambiguous: {error:#}");
+                None
+            }
         }
     }
 }

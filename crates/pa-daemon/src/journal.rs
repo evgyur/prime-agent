@@ -264,6 +264,18 @@ pub struct WorkerQueueSnapshotRecord {
     pub recorded_at: String,
 }
 
+/// Durable worker-owned evidence for one exact admitted message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkerMessageFact {
+    pub(crate) active_session_id: String,
+    pub(crate) session_id: String,
+    pub(crate) message_id: String,
+    pub(crate) phase: String,
+    pub(crate) admission_generation: Option<String>,
+    pub(crate) incarnation: String,
+}
+
 /// Latest busy/operation per active session, plus the latest queue
 /// snapshot per session.
 pub struct WorkerRecoveryJournal {
@@ -271,6 +283,7 @@ pub struct WorkerRecoveryJournal {
     path: std::path::PathBuf,
     latest: HashMap<String, WorkerRecoveryRecord>,
     queue_snapshots: HashMap<String, WorkerQueueSnapshotRecord>,
+    message_facts: HashMap<(String, String), WorkerMessageFact>,
 }
 
 impl WorkerRecoveryJournal {
@@ -293,6 +306,7 @@ impl WorkerRecoveryJournal {
             path: path.to_path_buf(),
             latest: parse_worker_records(path)?,
             queue_snapshots,
+            message_facts: Self::read_message_facts(path)?,
         };
         if tail_is_torn(path)? {
             // Recovery can still contain busy verdicts and queued prompts.
@@ -300,6 +314,49 @@ impl WorkerRecoveryJournal {
             journal.compact(Finalize::Synced)?;
         }
         Ok(journal)
+    }
+
+    pub(crate) fn read_message_facts(
+        path: &Path,
+    ) -> Result<HashMap<(String, String), WorkerMessageFact>> {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut facts = HashMap::new();
+        for line in decode_journal_lines(&bytes, path)? {
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if value["type"] == "worker_message_fact" {
+                let fact: WorkerMessageFact = serde_json::from_value(value["fact"].clone())?;
+                facts.insert(
+                    (fact.active_session_id.clone(), fact.message_id.clone()),
+                    fact,
+                );
+            }
+        }
+        Ok(facts)
+    }
+
+    pub(crate) fn record_message_fact(&mut self, fact: WorkerMessageFact) -> Result<()> {
+        append_records(
+            &self.path,
+            &[serde_json::json!({"type":"worker_message_fact","fact":fact})],
+        )?;
+        self.message_facts.insert(
+            (fact.active_session_id.clone(), fact.message_id.clone()),
+            fact,
+        );
+        Ok(())
+    }
+
+    pub(crate) fn message_facts(&self, active_session_id: &str) -> Vec<&WorkerMessageFact> {
+        self.message_facts
+            .values()
+            .filter(|fact| fact.active_session_id == active_session_id)
+            .collect()
     }
 
     /// Read the latest worker record per active session straight from a
@@ -533,6 +590,11 @@ impl WorkerRecoveryJournal {
             .map(serde_json::to_value)
             .collect::<std::result::Result<_, _>>()?;
         records.extend(snapshots);
+        records.extend(
+            self.message_facts
+                .values()
+                .map(|fact| serde_json::json!({"type":"worker_message_fact","fact":fact})),
+        );
         rewrite_records(&self.path, &records, finalize)
     }
 }
@@ -611,6 +673,34 @@ fn parse_snapshot_lane(value: Option<&Value>) -> Vec<WorkerQueueItemRecord> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exact_managed_message_fact_survives_idle_compaction_and_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("worker.jsonl");
+        {
+            let mut journal = super::WorkerRecoveryJournal::open(&path).unwrap();
+            journal
+                .record_message_fact(super::WorkerMessageFact {
+                    active_session_id: "active".into(),
+                    session_id: "session".into(),
+                    message_id: "message".into(),
+                    phase: "started".into(),
+                    admission_generation: Some("generation".into()),
+                    incarnation: "incarnation".into(),
+                })
+                .unwrap();
+            journal
+                .record_queue_checkpoint("active", "session", None, false, "turn_end", &[], &[])
+                .unwrap();
+        }
+        let journal = super::WorkerRecoveryJournal::open(&path).unwrap();
+        let facts = journal.message_facts("active");
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].message_id, "message");
+        assert_eq!(facts[0].admission_generation.as_deref(), Some("generation"));
+        assert_eq!(facts[0].incarnation, "incarnation");
+    }
+
     use super::*;
 
     fn temp_path(name: &str) -> std::path::PathBuf {

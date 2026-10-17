@@ -238,6 +238,12 @@ impl AgentSessionEngine {
             // No session yet, or the driver is mid-mutation: a later event re-checks.
             return true;
         };
+        if let (Some(children), Some(goal_id)) = (&self.children, goal.goal_id.as_deref()) {
+            if let Err(error) = children.bind_management_goal(goal_id) {
+                eprintln!("pa-daemon: management goal binding refused: {error:#}");
+                return false;
+            }
+        }
         {
             let mut published = self.published_goal.lock().expect("published goal lock");
             // The dedupe is age-invariant (the age ticks with the wall clock).

@@ -28,11 +28,19 @@ pub(super) struct Binding {
     snapshot_revision: u64,
     ownership: Vec<String>,
     #[serde(default)]
-    start_permitted: bool,
+    pub(super) start_permitted: bool,
     #[serde(default)]
     task: Option<super::orchestration::Task>,
     #[serde(default)]
     policy: Option<super::orchestration::Policy>,
+    #[serde(default)]
+    pub(super) started_result: Option<Value>,
+    #[serde(default)]
+    pub(super) terminal_delivery: Option<String>,
+    #[serde(default)]
+    pub(super) review_consumed: bool,
+    #[serde(default)]
+    pub(super) accepted_closure: Option<Value>,
     #[serde(skip)]
     pub(super) start_token: Option<String>,
 }
@@ -57,6 +65,76 @@ impl SupervisorChildSessions {
         gate.revision += 1;
         self.persist_gate(&gate)
     }
+    pub(crate) async fn managed_review_candidate(&self, request: &Value) -> Result<Value> {
+        let status = self.gate_status().await;
+        let gate = self.inner.gate.lock().expect("gate lock");
+        anyhow::ensure!(
+            gate.policy.as_ref().is_some_and(
+                |policy| policy.managed_pass_policy.as_deref() == Some("causal_results_v1")
+            ),
+            "Not a managed result turn"
+        );
+        anyhow::ensure!(
+            !gate.suspended
+                && status["complete"] == true
+                && status["unknown"] == 0
+                && status["revision"].as_u64() == Some(gate.revision),
+            "Managed review accounting blocked"
+        );
+        let binding = gate
+            .work_bindings
+            .iter()
+            .find(|binding| {
+                request["childId"] == binding.child_id
+                    && request["terminalDeliveryId"].as_str()
+                        == binding.terminal_delivery.as_deref()
+            })
+            .ok_or_else(|| anyhow!("Managed result identity mismatch"))?;
+        anyhow::ensure!(
+            binding.start_permitted && binding.started_result.is_some() && !binding.review_consumed,
+            "Managed review already consumed or actual start missing"
+        );
+        let scope = gate
+            .management_scope
+            .as_ref()
+            .ok_or_else(|| anyhow!("Management scope absent"))?;
+        anyhow::ensure!(
+            scope["goalId"].as_str().is_some(),
+            "Management goal pending"
+        );
+        Ok(
+            json!({"result":binding.started_result,"goalId":scope["goalId"],"revision":gate.revision,
+            "terminalDeliveryId":binding.terminal_delivery,"childId":binding.child_id}),
+        )
+    }
+
+    pub(crate) fn consume_managed_review(&self, candidate: &Value) -> Result<()> {
+        let mut gate = self.inner.gate.lock().expect("gate lock");
+        anyhow::ensure!(
+            candidate["revision"].as_u64() == Some(gate.revision) && !gate.suspended,
+            "Managed review changed before consume"
+        );
+        let mut next = gate.clone();
+        let binding = next
+            .work_bindings
+            .iter_mut()
+            .find(|binding| {
+                candidate["childId"] == binding.child_id
+                    && candidate["terminalDeliveryId"].as_str()
+                        == binding.terminal_delivery.as_deref()
+            })
+            .ok_or_else(|| anyhow!("Managed result disappeared"))?;
+        anyhow::ensure!(
+            !binding.review_consumed && binding.started_result.as_ref() == candidate.get("result"),
+            "Managed review changed or consumed"
+        );
+        binding.review_consumed = true;
+        next.consumed_managed_results.push(candidate.clone());
+        self.persist_gate(&next)?;
+        *gate = next;
+        Ok(())
+    }
+
     pub(crate) async fn begin_work_start(&self, permit: &Value) -> Result<Value> {
         self.refresh_next_work().await;
         let child_id = permit["childId"]
@@ -159,7 +237,9 @@ impl SupervisorChildSessions {
         binding.start_permitted = true;
         gate.revision += 1;
         self.persist_gate(&gate)?;
-        Ok(json!({"workStartPermitted":true,"revision":gate.revision}))
+        Ok(
+            json!({"workStartPermitted":true,"revision":gate.revision,"managedResultTracking":gate.policy.as_ref().is_some_and(|policy| policy.managed_pass_policy.as_deref() == Some("causal_results_v1"))}),
+        )
     }
     pub(crate) async fn invalidate_next_work(&self) -> Result<Value> {
         let _admissions = self.inner.spawn_gate.lock().await;
@@ -212,7 +292,7 @@ impl SupervisorChildSessions {
             json!({"sourceRebound":true,"sessionId":identity.session_id,"revision":gate.revision,
             "task":gate.task,"policy":gate.policy,"correctiveAttempts":gate.attempts,
             "suspended":gate.suspended,"managementScope":gate.management_scope,
-            "managedContract":{"version":1,"sourceOnlyRebind":true,"causalResults":false}}),
+            "managedContract":{"version":1,"sourceOnlyRebind":true,"causalResults":true}}),
         )
     }
 
@@ -321,8 +401,82 @@ impl SupervisorChildSessions {
         }
         if let Some(snapshot) = &snapshot {
             let accepted = snapshot["items"].as_array().cloned().unwrap_or_default();
+            if gate.policy.as_ref().is_some_and(|policy| {
+                policy.managed_pass_policy.as_deref() == Some("causal_results_v1")
+            }) {
+                let scope = gate.management_scope.clone().unwrap_or(Value::Null);
+                for binding in &mut gate.work_bindings {
+                    binding.accepted_closure = None;
+                    if let Some(item) = accepted.iter().find(|item| {
+                        item["planId"] == binding.plan_id
+                            && item["stepId"] == binding.step_id
+                            && item["status"] == "accepted"
+                    }) {
+                        let proof = &item["completion"]["managedAcceptance"];
+                        if binding.review_consumed
+                            && binding.started_result.as_ref().is_some_and(|result| {
+                                proof["result"]["childId"] == result["childId"]
+                                    && proof["result"]["admissionGeneration"]
+                                        == result["admissionGeneration"]
+                                    && proof["result"]["incarnation"] == result["incarnation"]
+                                    && proof["result"]["expectedMessageId"]
+                                        == result["expectedMessageId"]
+                            })
+                            && proof["result"]["terminalDeliveryId"].as_str()
+                                == binding.terminal_delivery.as_deref()
+                            && item["completion"]["sessionId"] == scope["rootSessionId"]
+                            && proof["schemaVersion"] == 1
+                            && proof["policy"] == "causal_results_v1"
+                            && [
+                                "rootSessionId",
+                                "goalId",
+                                "taskGeneration",
+                                "policyRevision",
+                                "ownerBindingId",
+                            ]
+                            .iter()
+                            .all(|key| proof[*key] == scope[*key])
+                            && proof["planId"] == binding.plan_id
+                            && proof["stepId"] == binding.step_id
+                            && proof["committedRevision"].as_u64().is_some_and(|revision| {
+                                snapshot["revision"]
+                                    .as_u64()
+                                    .is_some_and(|current| revision <= current)
+                            })
+                            && !proof["artifactRef"].as_str().unwrap_or_default().is_empty()
+                            && !proof["acceptanceRef"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .is_empty()
+                            && proof["artifactRef"] == item["artifactRef"]
+                            && proof["acceptanceRef"] == item["acceptanceRef"]
+                        {
+                            binding.accepted_closure = Some(proof.clone());
+                        }
+                    }
+                }
+            }
+            let closures: Vec<Value> = gate
+                .work_bindings
+                .iter()
+                .filter_map(|binding| binding.accepted_closure.clone())
+                .collect();
+            for closure in closures {
+                if let Some(consumed) = gate.consumed_managed_results.iter_mut().find(|result| {
+                    result["childId"] == closure["result"]["childId"]
+                        && result["terminalDeliveryId"] == closure["result"]["terminalDeliveryId"]
+                }) {
+                    consumed["acceptedClosure"] = closure;
+                    consumed["state"] = json!("accepted_refill_pending");
+                }
+            }
+            let managed = gate
+                .policy
+                .as_ref()
+                .is_some_and(|policy| policy.managed_pass_policy.is_some());
             gate.work_bindings.retain(|binding| {
                 !(deleted.contains(&binding.child_id)
+                    && (!managed || binding.accepted_closure.is_some())
                     && accepted.iter().any(|item| {
                         item["planId"] == binding.plan_id
                             && item["stepId"] == binding.step_id
@@ -364,6 +518,16 @@ impl SupervisorChildSessions {
             gate.next_work = snapshot;
             gate.correction_pending = false;
         }
+        if gate
+            .policy
+            .as_ref()
+            .is_some_and(|policy| policy.managed_pass_policy.is_some())
+        {
+            if let Err(error) = self.persist_gate(&gate) {
+                gate.suspended = true;
+                eprintln!("pa-daemon: managed source reconciliation persistence failed: {error:#}");
+            }
+        }
     }
     pub(super) fn next_work_view(&self, gate: &Gate, rows: &[Value]) -> Value {
         if !gate.next_work_enabled {
@@ -403,7 +567,7 @@ impl SupervisorChildSessions {
             })
             .cloned()
             .collect();
-        let acceptance: Vec<Value> = gate.work_bindings.iter().filter(|binding| rows.iter().any(|row| row["childId"] == binding.child_id && row["obligation"] == false) && !items.iter().any(|item| item["planId"] == binding.plan_id && item["stepId"] == binding.step_id && item["status"] == "accepted")).map(|binding| json!({"childId":binding.child_id,"planId":binding.plan_id,"stepId":binding.step_id})).collect();
+        let acceptance: Vec<Value> = gate.work_bindings.iter().filter(|binding| rows.iter().any(|row| row["childId"] == binding.child_id && row["obligation"] == false) && !items.iter().any(|item| item["planId"] == binding.plan_id && item["stepId"] == binding.step_id && item["status"] == "accepted")).map(|binding| json!({"childId":binding.child_id,"planId":binding.plan_id,"stepId":binding.step_id,"result":binding.started_result,"terminalDeliveryId":binding.terminal_delivery,"reviewConsumed":binding.review_consumed,"state":if binding.accepted_closure.is_some(){"accepted_refill_pending"}else if binding.terminal_delivery.is_none(){"terminal_delivery_unproven"}else{"awaiting_acceptance"}})).collect();
         snapshot["actionRequired"] = json!(!acceptance.is_empty() || free > 0 && !ready.is_empty());
         snapshot["runtime"] = json!({"complete":rows.iter().all(|row| row["executionKind"] != "unknown"),"freeSlots":free,"ownership":gate.work_bindings,"ready":ready,"awaitingAcceptance":acceptance});
         snapshot
@@ -464,6 +628,10 @@ impl SupervisorChildSessions {
             snapshot_revision: snapshot["revision"].as_u64().unwrap(),
             ownership,
             start_permitted: false,
+            started_result: None,
+            terminal_delivery: None,
+            review_consumed: false,
+            accepted_closure: None,
             task: gate.task.clone(),
             policy: gate.policy.clone(),
             start_token: Some(uuid::Uuid::new_v4().to_string()),
@@ -502,6 +670,281 @@ mod tests {
         });
         sessions
     }
+    #[test]
+    fn managed_notice_consult_uses_private_goal_pending_and_once_result_guards() {
+        use crate::engine::SessionEngine;
+        let _faux = crate::agent_engine::tests::FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut engine, _dir) = crate::agent_engine::tests::faux_engine_with_settings(
+            &json!({"responses":[{"text":"warm"},{"text":"goal"},{"text":"accepted A"}]}),
+            u64::MAX,
+        );
+        engine.children = Some(Arc::new(sessions()));
+        let engine = Arc::new(engine);
+        engine.register_arc();
+        let _work = crate::agent_engine::tests::goal_admission_collector(&engine);
+        crate::agent_engine::tests::admit(&engine, "warm".into(), &mut Vec::new());
+        crate::agent_engine::tests::admit(&engine, "/goal review results".into(), &mut Vec::new());
+        let goal_id = engine.goal_state_value()["goalId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let children = engine.children.as_ref().unwrap();
+        let scope = json!({"rootSessionId":"root","goalId":goal_id,"taskGeneration":1,"policyRevision":1,"envelope":{"planIds":["p"],"requiredLeaves":[]}});
+        let config = json!({"expectedRevision":0,"policy":{"version":1,"enabled":true,"minActive":1,"maxActive":2,"rootWritesCode":false,"correctiveBudget":2,"managedPassPolicy":"causal_results_v1"},
+            "task":{"projectId":"project","planId":"p","stepId":"root","taskGeneration":1,"policyRevision":1},"assignments":[]});
+        engine
+            .runtime
+            .block_on(children.configure_gate_scoped(&config, Some(scope), None))
+            .unwrap();
+        {
+            let mut gate = children.inner.gate.lock().unwrap();
+            gate.attempts = 2;
+            let task = gate.task.clone();
+            let policy = gate.policy.clone();
+            gate.work_bindings.push(Binding {child_id:"A".into(),plan_id:"p".into(),step_id:"leaf".into(),snapshot_revision:1,ownership:vec!["A".into()],start_permitted:true,task,policy,start_token:None,
+                started_result:Some(json!({"childId":"A","admissionGeneration":"g","expectedMessageId":"m","incarnation":"i"})),terminal_delivery:Some("t".into()),review_consumed:false,accepted_closure:None});
+        }
+        let request = || json!({"beginManagedReview":{"childId":"A","terminalDeliveryId":"t","nativeNonce":crate::child_status_notices::mint()}});
+        let handles = engine.goal_runtime.lock().unwrap().clone().unwrap();
+        engine.runtime.block_on(async {
+            handles
+                .driver
+                .lock()
+                .await
+                .pending_continuation_handle()
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        // The outstanding ordinary goal mint keeps the new paid consult out.
+        assert!(engine
+            .runtime
+            .block_on(engine.orchestration_gate(Some(request())))
+            .is_err());
+        engine
+            .goal_budget_crossed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(engine
+            .runtime
+            .block_on(engine.orchestration_gate(Some(request())))
+            .is_err());
+        engine
+            .goal_budget_crossed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        *engine.goal_input_probe.lock().unwrap() = Some(Arc::new(|| true));
+        assert!(engine
+            .runtime
+            .block_on(engine.orchestration_gate(Some(request())))
+            .is_err());
+        *engine.goal_input_probe.lock().unwrap() = Some(Arc::new(|| false));
+        assert!(engine.runtime.block_on(engine.orchestration_gate(Some(json!({"beginManagedReview":{"childId":"A","terminalDeliveryId":"t","nativeNonce":"forged"}})))).is_err());
+        assert!(!children.inner.gate.lock().unwrap().work_bindings[0].review_consumed);
+        let handles = engine.goal_runtime.lock().unwrap().clone().unwrap();
+        engine.runtime.block_on(async {
+            handles.driver.lock().await.continuation_consumed();
+        });
+        assert!(engine
+            .runtime
+            .block_on(engine.orchestration_gate(Some(request())))
+            .is_ok());
+        assert!(engine
+            .runtime
+            .block_on(engine.orchestration_gate(Some(request())))
+            .is_err());
+        let before_tokens = engine.goal_state_value()["tokensUsed"].as_u64().unwrap();
+        let mut events = Vec::new();
+        crate::agent_engine::tests::admit(&engine, "review actual A result".into(), &mut events);
+        assert!(events.iter().any(|event| matches!(event,crate::engine::EngineEvent::AssistantMessage(message) if message.to_string().contains("accepted A"))));
+        assert!(engine.goal_state_value()["tokensUsed"].as_u64().unwrap() >= before_tokens);
+        assert_eq!(
+            engine.runtime.block_on(children.gate_status())["correctiveAttempts"],
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_closure_joins_flat_refs_and_exact_native_result_without_new_credit() {
+        let sessions = sessions();
+        let result = json!({"childId":"A","expectedMessageId":"m","admissionGeneration":"g","incarnation":"i","terminalDeliveryId":"t"});
+        let proof = json!({"schemaVersion":1,"policy":"causal_results_v1","rootSessionId":"root","goalId":"goal",
+            "taskGeneration":1,"policyRevision":1,"ownerBindingId":"owner","planId":"p","stepId":"leaf", "result":result,
+            "artifactRef":"artifact","acceptanceRef":"review","committedRevision":2});
+        let _source = source(&sessions,json!({"schemaVersion":1,"instanceId":"instance","revision":2,"total":1,"nextOffset":null,
+            "items":[{"planId":"p","stepId":"leaf","status":"accepted","artifactRef":"artifact","acceptanceRef":"review","completion":{"sessionId":"root","managedAcceptance":proof}}]})).await;
+        {
+            let mut gate = sessions.inner.gate.lock().unwrap();
+            gate.policy.as_mut().unwrap().managed_pass_policy = Some("causal_results_v1".into());
+            gate.management_scope = Some(
+                json!({"rootSessionId":"root","goalId":"goal","taskGeneration":1,"policyRevision":1,"ownerBindingId":"owner"}),
+            );
+            gate.attempts = 2;
+            let task = gate.task.clone();
+            let policy = gate.policy.clone();
+            gate.work_bindings.push(Binding {child_id:"A".into(),plan_id:"p".into(),step_id:"leaf".into(),snapshot_revision:1,
+                ownership:vec!["a".into()],start_permitted:true,task,policy,start_token:None,started_result:Some(json!({"childId":"A","expectedMessageId":"m","admissionGeneration":"g","incarnation":"i"})),
+                terminal_delivery:Some("t".into()),review_consumed:true,accepted_closure:None});
+        }
+        sessions.refresh_next_work().await;
+        let gate = sessions.inner.gate.lock().unwrap();
+        assert_eq!(
+            gate.work_bindings[0].accepted_closure.as_ref(),
+            Some(&proof)
+        );
+        assert_eq!(gate.attempts, 2);
+        assert!(gate.work_bindings[0].review_consumed);
+    }
+
+    #[tokio::test]
+    async fn live_d_projection_does_not_hold_a_result_review_but_unknown_d_does() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("supervisor.sock");
+        let listener = pa_types::platform::transport::bind_transport(&socket)
+            .await
+            .unwrap();
+        let known = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let source_known = known.clone();
+        tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.unwrap();
+                let known = source_known.clone();
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.split();
+                    writer.write_all(b"{\"type\":\"daemon_hello\",\"protocol\":{\"name\":\"prime-agent.daemon\",\"version\":7}}\n").await.unwrap();
+                    let mut reader = BufReader::new(reader);
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap() == 0 {
+                            return;
+                        }
+                        let input: Value = serde_json::from_str(&line).unwrap();
+                        let state = if known.load(std::sync::atomic::Ordering::SeqCst) {
+                            json!({"workerInstanceId":"D-worker","isStreaming":true,"ownExecutionStarted":true,"runningMessageIds":["D-message"]})
+                        } else {
+                            json!({})
+                        };
+                        let response = crate::protocol::response_success(
+                            input["id"].as_str(),
+                            "get_state",
+                            Some(state),
+                        );
+                        writer
+                            .write_all(
+                                format!("{}\n", serde_json::to_string(&response).unwrap())
+                                    .as_bytes(),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                });
+            }
+        });
+        let sessions = SupervisorChildSessions::new(
+            Arc::new(crate::supervisor_link::SupervisorLink::new(socket)),
+            dir.path().into(),
+            "root".into(),
+            Arc::new(crate::model_allowlist::ModelRefusalTelemetry::new(
+                dir.path().into(),
+                true,
+            )),
+        );
+        sessions.set_identity(ParentIdentity {
+            session_id: Some("root".into()),
+            ..ParentIdentity::with_default_depth()
+        });
+        let config = json!({"expectedRevision":0,"policy":{"version":1,"enabled":true,"minActive":1,"maxActive":2,"rootWritesCode":false,"correctiveBudget":2,"managedPassPolicy":"causal_results_v1"},"task":{"projectId":"project","planId":"p","stepId":"root","taskGeneration":1,"policyRevision":1},"assignments":[]});
+        sessions.configure_gate_scoped(&config,Some(json!({"rootSessionId":"root","goalId":"goal","taskGeneration":1,"policyRevision":1,"envelope":{"planIds":["p"],"requiredLeaves":[]}})),None).await.unwrap();
+        sessions
+            .push_test_child(RlmChildIdentity {
+                rlm_child_id: "D".into(),
+                active_session_id: "D-active".into(),
+                session_id: None,
+                session_name: "D".into(),
+            })
+            .await;
+        let record = sessions.inner.find_record("D").await.unwrap();
+        {
+            let mut row = record.lock().await;
+            row.admission_generation = Some("D-generation".into());
+            row.expected_message_id = Some("D-message".into());
+        }
+        let mut bind = config.clone();
+        bind["expectedRevision"] = json!(1);
+        bind["policy"]
+            .as_object_mut()
+            .unwrap()
+            .remove("managedPassPolicy");
+        bind["assignments"] = json!([{"childId":"D","admissionGeneration":"D-generation","incarnation":"D-worker","assignmentId":"D-assignment","taskGeneration":1,"ownership":"D","acceptanceRef":"D-review","artifactRef":"D-artifact","dependenciesSatisfied":true}]);
+        sessions.configure_gate(&bind).await.unwrap();
+        {
+            let mut gate = sessions.inner.gate.lock().unwrap();
+            let task = gate.task.clone();
+            let policy = gate.policy.clone();
+            gate.attempts = 2;
+            gate.work_bindings.push(Binding {child_id:"A".into(),plan_id:"p".into(),step_id:"leaf".into(),snapshot_revision:1,ownership:vec!["A".into()],start_permitted:true,task,policy,start_token:None,started_result:Some(json!({"childId":"A","admissionGeneration":"g","expectedMessageId":"m","incarnation":"i"})),terminal_delivery:Some("t".into()),review_consumed:false,accepted_closure:None});
+        }
+        assert!(sessions.any_running().await);
+        let accounting = sessions.gate_status().await;
+        assert_eq!(accounting["knownActive"], 1, "{accounting}");
+        assert_eq!(accounting["unknown"], 0, "{accounting}");
+        assert_eq!(accounting["complete"], true, "{accounting}");
+        let request = json!({"childId":"A","terminalDeliveryId":"t"});
+        let candidate = sessions.managed_review_candidate(&request).await;
+        assert!(candidate.is_ok(), "{candidate:?}");
+        known.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(sessions.managed_review_candidate(&request).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn causal_review_requires_actual_start_and_consumes_once_without_reset() {
+        let sessions = sessions();
+        let scope = json!({"rootSessionId":"root","goalId":"goal","taskGeneration":1,"policyRevision":1,
+            "envelope":{"planIds":["p"],"requiredLeaves":[{"planId":"p","stepId":"leaf"}]}});
+        let config = json!({"expectedRevision":0,"policy":{"version":1,"enabled":true,"minActive":1,"maxActive":2,
+            "rootWritesCode":false,"correctiveBudget":2,"managedPassPolicy":"causal_results_v1"},
+            "task":{"projectId":"project","planId":"p","stepId":"root","taskGeneration":1,"policyRevision":1},"assignments":[]});
+        sessions
+            .configure_gate_scoped(&config, Some(scope), None)
+            .await
+            .unwrap();
+        {
+            let mut gate = sessions.inner.gate.lock().unwrap();
+            gate.attempts = 2;
+            let task = gate.task.clone();
+            let policy = gate.policy.clone();
+            gate.work_bindings.push(Binding {
+                child_id: "A".into(),
+                plan_id: "p".into(),
+                step_id: "leaf".into(),
+                snapshot_revision: 1,
+                ownership: vec!["a".into()],
+                start_permitted: true,
+                task,
+                policy,
+                start_token: None,
+                started_result: None,
+                terminal_delivery: Some("terminal".into()),
+                review_consumed: false,
+                accepted_closure: None,
+            });
+        }
+        let request = json!({"childId":"A","terminalDeliveryId":"terminal"});
+        assert!(sessions.managed_review_candidate(&request).await.is_err());
+        {
+            let mut gate = sessions.inner.gate.lock().unwrap();
+            gate.work_bindings[0].started_result = Some(
+                json!({"childId":"A","expectedMessageId":"m","admissionGeneration":"g","incarnation":"i"}),
+            );
+        }
+        let candidate = sessions.managed_review_candidate(&request).await.unwrap();
+        sessions.consume_managed_review(&candidate).unwrap();
+        assert!(sessions.consume_managed_review(&candidate).is_err());
+        assert!(sessions.managed_review_candidate(&request).await.is_err());
+        let gate = sessions.inner.gate.lock().unwrap();
+        assert_eq!(gate.attempts, 2);
+        assert_eq!(gate.consumed_managed_results.len(), 1);
+    }
+
     #[tokio::test]
     async fn source_rebind_preserves_fences_and_rejects_scope_mismatch() {
         let sessions = sessions();
@@ -515,6 +958,23 @@ mod tests {
             .configure_gate_scoped(&config, Some(scope), None)
             .await
             .unwrap();
+        let mut model = config.clone();
+        model["expectedRevision"] = json!(1);
+        model["policy"]
+            .as_object_mut()
+            .unwrap()
+            .remove("managedPassPolicy");
+        let kept = sessions.configure_gate(&model).await.unwrap();
+        assert_eq!(kept["policy"]["managedPassPolicy"], "causal_results_v1");
+        model["expectedRevision"] = json!(2);
+        model["policy"]["enabled"] = json!(false);
+        assert!(sessions.configure_gate(&model).await.is_err());
+        model["policy"]["enabled"] = json!(true);
+        model["task"]["taskGeneration"] = json!(2);
+        assert!(sessions.configure_gate(&model).await.is_err());
+        model["task"]["taskGeneration"] = json!(1);
+        model["task"]["policyRevision"] = json!(2);
+        assert!(sessions.configure_gate(&model).await.is_err());
         for _ in 0..2 {
             sessions.gate_correction().await.unwrap();
             sessions.consume_gate_correction();

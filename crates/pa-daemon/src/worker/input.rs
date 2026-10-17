@@ -180,7 +180,7 @@ impl Worker {
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let custom_message = match parse_custom_message(payload.get("customMessage")) {
+        let mut custom_message = match parse_custom_message(payload.get("customMessage")) {
             Ok(custom_message) => custom_message,
             Err(error) => return response_failure(None, lane.as_str(), &error, None),
         };
@@ -201,6 +201,21 @@ impl Worker {
                     );
                 }
             }
+        }
+        let terminal_id = custom_message
+            .as_ref()
+            .filter(|row| {
+                crate::child_status_notices::is_reserved_child_status_custom_type(row)
+                    && row["details"]["nativeManagedResult"] == true
+            })
+            .map(|row| {
+                row["details"]["terminalDeliveryId"]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+            });
+        if let (Some(id), Some(row)) = (&terminal_id, custom_message.as_mut()) {
+            row["details"]["terminalDeliveryId"] = json!(id);
         }
         let mut core = self.core.lock().unwrap();
         let images = parse_prompt_images(payload);
@@ -235,9 +250,21 @@ impl Worker {
             Lane::Steering => "steer_queued",
             Lane::FollowUp => "follow_up_queued",
         };
-        self.checkpoint_queue(QueueCheckpoint::Admitted {
-            operation: queued_operation,
-        });
+        if terminal_id.is_some() {
+            if let Err(error) = super::queue::checkpoint_queue_recovery_checked(
+                &self.recovery,
+                &self.core,
+                QueueCheckpoint::Admitted {
+                    operation: queued_operation,
+                },
+            ) {
+                return response_failure(None, lane.as_str(), &error.to_string(), None);
+            }
+        } else {
+            self.checkpoint_queue(QueueCheckpoint::Admitted {
+                operation: queued_operation,
+            });
+        }
         let _ = self.emit_action_update(&snapshot);
         self.work_notify.notify_one();
         let command = if lane == Lane::Steering {
@@ -245,7 +272,16 @@ impl Worker {
         } else {
             "follow_up"
         };
-        response_success(None, command, Some(json!({ "queued": true })))
+        response_success(
+            None,
+            command,
+            Some(match terminal_id {
+                Some(id) => {
+                    json!({"queued":true,"terminalDeliveryId":id,"deliveryState":"durably_queued"})
+                }
+                None => json!({"queued":true}),
+            }),
+        )
     }
 
     /// Agent-to-agent delivery: render the `[agent-message from ...]` prompt and queue

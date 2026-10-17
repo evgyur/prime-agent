@@ -735,6 +735,48 @@ mod tests {
     }
 
     #[test]
+    fn pending_owner_scope_binds_only_actual_native_goal_and_rejects_replacement() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (engine, _dir) = gated_goal_engine();
+        engine
+            .children
+            .as_ref()
+            .unwrap()
+            .set_identity(crate::rlm_children::ParentIdentity {
+                session_id: Some("root".into()),
+                ..crate::rlm_children::ParentIdentity::with_default_depth()
+            });
+        let config = serde_json::json!({"expectedRevision":0,
+            "policy":{"version":1,"enabled":true,"minActive":5,"maxActive":20,"rootWritesCode":false,"correctiveBudget":0,"managedPassPolicy":"causal_results_v1"},
+            "task":{"projectId":"p","planId":"plan","stepId":"step","taskGeneration":1,"policyRevision":1},"assignments":[],
+            "managementScope":{"rootSessionId":"root","goalId":null,"taskGeneration":1,"policyRevision":1,"envelope":{"planIds":["plan"],"requiredLeaves":[]}}});
+        engine
+            .runtime
+            .block_on(engine.orchestration_gate(Some(config)))
+            .unwrap();
+        let _work = goal_admission_collector(&engine);
+        let mut events = Vec::new();
+        admit(&engine, "/goal real native goal".into(), &mut events);
+        let children = engine.children.as_ref().unwrap();
+        let status = engine.runtime.block_on(children.gate_status());
+        assert_eq!(
+            status["managementScope"]["goalId"],
+            engine.goal_state_value()["goalId"]
+        );
+        assert!(status["managementScope"]["ownerBindingId"]
+            .as_str()
+            .is_some());
+        let goal = engine.goal_state_value()["goalId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(children.bind_management_goal(&goal).is_ok());
+        assert!(children.bind_management_goal("replacement").is_err());
+    }
+
+    #[test]
     fn owner_source_install_failure_does_not_mint_correction() {
         let _faux = FAUX_TEST_LOCK
             .lock()

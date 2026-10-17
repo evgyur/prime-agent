@@ -92,6 +92,8 @@ pub(crate) struct Gate {
     management_obligation: Option<ManagementObligation>,
     #[serde(default)]
     pub(super) management_scope: Option<Value>,
+    #[serde(default)]
+    pub(super) consumed_managed_results: Vec<Value>,
 }
 impl Gate {
     pub(super) fn enabled(&self) -> bool {
@@ -116,6 +118,25 @@ impl SupervisorChildSessions {
         }
         gate.revision += 1;
     }
+    pub(crate) fn bind_management_goal(&self, goal_id: &str) -> Result<()> {
+        let mut gate = self.inner.gate.lock().expect("gate lock");
+        let mut next = gate.clone();
+        let Some(scope) = next.management_scope.as_mut() else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            scope["goalId"].is_null() || scope["goalId"] == goal_id,
+            "Management goal replacement requires trusted renewal"
+        );
+        if scope["goalId"] == goal_id {
+            return Ok(());
+        }
+        scope["goalId"] = json!(goal_id);
+        self.persist_gate(&next)?;
+        *gate = next;
+        Ok(())
+    }
+
     pub(crate) fn retain_management_obligation(&self, goal_id: &str) -> Result<()> {
         let session_id = self
             .inner
@@ -137,6 +158,12 @@ impl SupervisorChildSessions {
             return Ok(());
         }
         let mut next = gate.clone();
+        if let Some(scope) = next.management_scope.as_mut() {
+            if scope["goalId"].is_null() {
+                scope["goalId"] = json!(goal_id);
+            }
+            anyhow::ensure!(scope["goalId"] == goal_id, "Management goal changed");
+        }
         next.management_obligation = Some(obligation);
         self.persist_gate(&next)?;
         *gate = next;
@@ -206,27 +233,10 @@ impl SupervisorChildSessions {
                     || !matches!(status["decision"].as_str(), Some("pass" | "exception"))))
     }
     fn gate_path(&self) -> Option<PathBuf> {
-        self.inner
-            .identity
-            .lock()
-            .expect("identity lock")
-            .session_file
-            .as_ref()
-            .map(|file| PathBuf::from(format!("{file}.orchestration-gate.json")))
+        self.inner.gate_path()
     }
     pub(super) fn persist_gate(&self, gate: &Gate) -> Result<()> {
-        if let Some(path) = self.gate_path() {
-            let temp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-            let mut options = std::fs::OpenOptions::new();
-            options.create_new(true).write(true);
-            pa_core::platform::perms::set_private_mode(&mut options);
-            use std::io::Write;
-            let mut file = options.open(&temp)?;
-            file.write_all(&serde_json::to_vec(gate)?)?;
-            file.sync_all()?;
-            pa_core::platform::rename_onto(&temp, &path)?;
-        }
-        Ok(())
+        self.inner.persist_gate(gate)
     }
     pub(crate) fn restore_gate(&self) {
         let Some(path) = self.gate_path() else {
@@ -267,7 +277,8 @@ impl SupervisorChildSessions {
             "Only a root session may configure its orchestration gate"
         );
         anyhow::ensure!(
-            payload.get("rebindNextWorkSource").is_none()
+            payload.get("beginManagedReview").is_none()
+                && payload.get("rebindNextWorkSource").is_none()
                 && payload.get("managementScope").is_none()
                 && payload.get("nextWorkSource").is_none()
                 && payload.get("nextWork").is_none()
@@ -275,7 +286,7 @@ impl SupervisorChildSessions {
                 && payload.get("beginWorkStart").is_none(),
             "next_work source is installed only by the Studio owner"
         );
-        let policy: Policy = serde_json::from_value(payload["policy"].clone())?;
+        let mut policy: Policy = serde_json::from_value(payload["policy"].clone())?;
         anyhow::ensure!(
             scope.is_some() || policy.managed_pass_policy.is_none(),
             "Managed policy is installed only by the Studio owner"
@@ -366,6 +377,30 @@ impl SupervisorChildSessions {
                 "Orchestration revision conflict"
             );
             let mut next = guard.clone();
+            if scope.is_none()
+                && next
+                    .policy
+                    .as_ref()
+                    .is_some_and(|policy| policy.managed_pass_policy.is_some())
+            {
+                anyhow::ensure!(
+                    next.task.as_ref() == Some(&task)
+                        && policy.enabled
+                        && next
+                            .policy
+                            .as_ref()
+                            .is_some_and(|old| old.version == policy.version
+                                && old.min_active == policy.min_active
+                                && old.max_active == policy.max_active
+                                && old.root_writes_code == policy.root_writes_code
+                                && old.corrective_budget == policy.corrective_budget),
+                    "Managed policy alteration is owner-only"
+                );
+                policy.managed_pass_policy = next
+                    .policy
+                    .as_ref()
+                    .and_then(|policy| policy.managed_pass_policy.clone());
+            }
             if !next.same_task(&task) {
                 next.attempts = 0;
                 next.management_obligation = None;
@@ -495,7 +530,7 @@ impl SupervisorChildSessions {
             "decision":decision,"knownActive":active,"unknown":unknown,"observedAt":now_ms(),
             "complete":unknown==0 && !gate.suspended && !revision_changed,"exception":gate.exception,
             "correctiveAttempts":gate.attempts,"assignments":rows,
-            "managedContract":{"version":1,"sourceOnlyRebind":true,"causalResults":false},
+            "managedContract":{"version":1,"sourceOnlyRebind":true,"causalResults":true},
             "managementScope":gate.management_scope,
             "managementObligation":gate.management_obligation.as_ref().map(|obligation| json!({
                 "sessionId":obligation.session_id,"goalId":obligation.goal_id,
@@ -624,6 +659,32 @@ fn execution_kind(state: Option<&Value>, expected: Option<&str>) -> &'static str
     } // no job-generation ack yet
     "idle"
 }
+
+impl SupervisorChildSessionsInner {
+    pub(super) fn gate_path(&self) -> Option<PathBuf> {
+        self.identity
+            .lock()
+            .expect("identity lock")
+            .session_file
+            .as_ref()
+            .map(|file| PathBuf::from(format!("{file}.orchestration-gate.json")))
+    }
+    pub(super) fn persist_gate(&self, gate: &Gate) -> Result<()> {
+        if let Some(path) = self.gate_path() {
+            let temp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+            let mut options = std::fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            pa_core::platform::perms::set_private_mode(&mut options);
+            use std::io::Write;
+            let mut file = options.open(&temp)?;
+            file.write_all(&serde_json::to_vec(gate)?)?;
+            file.sync_all()?;
+            pa_core::platform::rename_onto(&temp, &path)?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -430,6 +430,19 @@ impl Worker {
         if let Err(response) = self.require_created("get_state") {
             return response;
         }
+        let message_facts = self
+            .recovery
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|journal| {
+                journal
+                    .message_facts(&self.core.lock().unwrap().active_session_id)
+                    .iter()
+                    .map(|fact| serde_json::to_value(fact).unwrap_or(Value::Null))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let (core, inputs) = self.summary_inputs();
         let summary = self.summary_locked(&core, inputs);
         response_success(
@@ -437,6 +450,7 @@ impl Worker {
             "get_state",
             Some({
                 let mut value = serde_json::to_value(&summary).unwrap_or(Value::Null);
+                value["messageLifecycleFacts"] = json!(message_facts);
                 value["ownExecutionStarted"] = json!(
                     core.busy
                         && core
