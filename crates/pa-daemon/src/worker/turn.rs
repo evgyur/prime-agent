@@ -209,6 +209,7 @@ impl TurnRunner {
                     self.idle_notify.notify_waiters();
                     continue;
                 }
+                let managed_starts = Self::take_managed_start_identities(&mut items);
                 // The permit is queue metadata, never model input or an accepted session row.
                 for item in &mut items {
                     if let Some(row) = item.custom_message.as_mut().and_then(Value::as_object_mut) {
@@ -249,7 +250,8 @@ impl TurnRunner {
                     let _ = self.emit_action_update(&snapshot);
                 }
                 self.push_roster_delta();
-                self.run_turn(engine, items).await;
+                self.run_turn_with_managed_starts(engine, items, managed_starts)
+                    .await;
             } else {
                 self.idle_notify.notify_waiters();
                 // Every park re-stamps the activity end: the idle-eviction
@@ -449,10 +451,42 @@ impl TurnRunner {
 
     /// One delivery: the first item anchors the turn and the rest ride
     /// as co-delivered user rows of the same run.
+    fn take_managed_start_identities(items: &mut [QueuedItem]) -> Vec<(String, Option<String>)> {
+        items
+            .iter()
+            .filter_map(|item| {
+                item.custom_message
+                    .as_ref()
+                    .filter(|row| row["nativeWorkPermit"]["managedResultTracking"] == true)
+                    .and_then(|row| {
+                        row["details"]["id"].as_str().map(|id| {
+                            (
+                                id.to_string(),
+                                row["nativeWorkPermit"]["admissionGeneration"]
+                                    .as_str()
+                                    .map(str::to_string),
+                            )
+                        })
+                    })
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
     pub(super) async fn run_turn(
         &self,
         engine: std::sync::Arc<dyn SessionEngine>,
         items: Vec<QueuedItem>,
+    ) {
+        self.run_turn_with_managed_starts(engine, items, Vec::new())
+            .await;
+    }
+
+    async fn run_turn_with_managed_starts(
+        &self,
+        engine: std::sync::Arc<dyn SessionEngine>,
+        items: Vec<QueuedItem>,
+        started_message_ids: Vec<(String, Option<String>)>,
     ) {
         let Some((first, batched)) = items.split_first() else {
             return;
@@ -525,24 +559,6 @@ impl TurnRunner {
         // The settled outcome reaches the waiting prompt only at full
         // settle: resolving at `Done` queued a follow-up behind the
         // indefinite suspension.
-        let started_message_ids: Vec<(String, Option<String>)> = items
-            .iter()
-            .filter_map(|item| {
-                item.custom_message
-                    .as_ref()
-                    .filter(|row| row["nativeWorkPermit"]["managedResultTracking"] == true)
-                    .and_then(|row| {
-                        row["details"]["id"].as_str().map(|id| {
-                            (
-                                id.to_string(),
-                                row["nativeWorkPermit"]["admissionGeneration"]
-                                    .as_str()
-                                    .map(str::to_string),
-                            )
-                        })
-                    })
-            })
-            .collect();
         let delivered_terminal_ids: Vec<String> = items
             .iter()
             .filter_map(|item| {
