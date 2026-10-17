@@ -186,7 +186,7 @@ impl SupervisorChildSessions {
                 && permit["incarnation"].as_str().is_some_and(
                     |instance| !instance.is_empty() && state["workerInstanceId"] == instance
                 ),
-            "Work start admission identity changed"
+            "identity_invalid: Work start admission identity changed; start_permitted=false"
         );
         let mut gate = self.inner.gate.lock().expect("gate lock");
         anyhow::ensure!(
@@ -196,11 +196,12 @@ impl SupervisorChildSessions {
                     .accounting_epoch
                     .load(std::sync::atomic::Ordering::SeqCst)
                     == epoch,
-            "Work start accounting changed; reconcile before admission"
+            "gate_changed: Work start accounting changed; revision expected={} current={}, epoch expected={} current={}; start_permitted=false",
+            revision,gate.revision,epoch,self.inner.accounting_epoch.load(std::sync::atomic::Ordering::SeqCst)
         );
         anyhow::ensure!(
             gate.start_accounting_complete(&accounting, permit),
-            "Work start global UNKNOWN accounting blocked"
+            "accounting_unknown: Work start global UNKNOWN accounting blocked; start_permitted=false"
         );
         anyhow::ensure!(
             gate.enabled() && !gate.suspended,

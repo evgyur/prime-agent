@@ -97,10 +97,11 @@ async fn changed_owner_snapshot_before_queued_child_provider_holds_item_without_
         assert_eq!(permit["admissionGeneration"], "generation");
         entered_tx.send(()).unwrap();
         release_rx.await.unwrap();
-        let response = crate::protocol::response_success(
+        let response = crate::protocol::response_failure(
             request["id"].as_str(),
             "configure_orchestration_gate",
-            Some(json!({"workStartPermitted":false})),
+            "gate_changed: Work start accounting changed; revision expected=3 current=4, epoch expected=1 current=1; start_permitted=false",
+            None,
         );
         writer
             .write_all(format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes())
@@ -301,4 +302,13 @@ async fn typed_gate_control_runs_through_real_queue_preflight() {
     assert_eq!(engine.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     core.lock().unwrap().shutdown_requested = true;
     running.abort();
+}
+
+#[test]
+fn start_denial_diagnostic_preserves_safe_fences_not_untrusted_payload() {
+    let reason="gate_changed: Work start accounting changed; revision expected=3 current=4, epoch expected=1 current=1; start_permitted=false";
+    assert_eq!(TurnRunner::start_denial_diagnostic(Some(reason)), reason);
+    assert!(
+        !TurnRunner::start_denial_diagnostic(Some("token=SECRET rawpayload")).contains("SECRET")
+    );
 }

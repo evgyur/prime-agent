@@ -163,10 +163,23 @@ impl TurnRunner {
                     let response = self.passivation.link.request(json!({
                         "type":"configure_orchestration_gate","activeSessionId":permit["ownerActiveSessionId"],"beginWorkStart":permit
                     }), Duration::from_millis(2_000)).await;
-                    let status = response
-                        .ok()
-                        .filter(|response| response.success)
-                        .and_then(|response| response.data);
+                    let status = match response {
+                        Ok(response) if response.success => response.data,
+                        Ok(response) => {
+                            let reason = Self::start_denial_diagnostic(response.error.as_deref());
+                            eprintln!(
+                                "pa-daemon: beginWorkStart denied child={} message={}: {reason}",
+                                permit["childId"].as_str().unwrap_or("missing"),
+                                permit["expectedMessageId"].as_str().unwrap_or("missing")
+                            );
+                            None
+                        }
+                        Err(_) => {
+                            eprintln!("pa-daemon: beginWorkStart transport_unknown child={} message={}; no retry",
+                                permit["childId"].as_str().unwrap_or("missing"),permit["expectedMessageId"].as_str().unwrap_or("missing"));
+                            None
+                        }
+                    };
                     work_allowed &= status
                         .as_ref()
                         .is_some_and(|status| status["workStartPermitted"] == true);
@@ -451,6 +464,24 @@ impl TurnRunner {
 
     /// One delivery: the first item anchors the turn and the rest ride
     /// as co-delivered user rows of the same run.
+    pub(super) fn start_denial_diagnostic(error: Option<&str>) -> String {
+        let reason = error.unwrap_or("missing denial reason");
+        // These start-gate errors contain only runtime-owned constants and numeric fences.
+        if ["gate_changed:", "accounting_unknown:", "identity_invalid:"]
+            .iter()
+            .any(|prefix| reason.starts_with(prefix))
+        {
+            reason.chars().take(512).collect()
+        } else if reason.starts_with("Work start")
+            || reason.starts_with("Stale work start")
+            || reason.starts_with("Work no longer ready")
+        {
+            "identity_invalid: start permit or owner state rejected; no retry".into()
+        } else {
+            "identity_invalid: unclassified owner denial; no retry".into()
+        }
+    }
+
     fn take_managed_start_identities(items: &mut [QueuedItem]) -> Vec<(String, Option<String>)> {
         items
             .iter()
