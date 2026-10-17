@@ -88,7 +88,7 @@ impl AgentSessionEngine {
                 {
                     return Ok(Vec::new());
                 }
-                if engine.gate_budget_or_quota_blocks() {
+                if scoped_gate && engine.gate_budget_or_quota_blocks() {
                     return Ok(Vec::new());
                 }
                 if scoped_gate
@@ -132,10 +132,14 @@ impl AgentSessionEngine {
             return Vec::new();
         }
         // Task gate owns the explicit scoped boundary before goal/all-child holds.
-        if self.gate_budget_or_quota_blocks() {
-            return Vec::new();
-        }
-        if let Some(children) = &self.children {
+        if let Some(children) = self
+            .children
+            .as_ref()
+            .filter(|children| children.gate_stops_continuation())
+        {
+            if self.gate_budget_or_quota_blocks() {
+                return Vec::new();
+            }
             children.consume_gate_correction();
             if message.stop_reason == pa_agent::types::StopReason::Error {
                 return Vec::new();
@@ -281,8 +285,15 @@ impl AgentSessionEngine {
         if self.session_is_closed() {
             return;
         }
-        if !self.session_input_queued() && !self.gate_budget_or_quota_blocks() {
-            if let Some(children) = &self.children {
+        if !self.session_input_queued() {
+            if let Some(children) = self
+                .children
+                .as_ref()
+                .filter(|children| children.gate_stops_continuation())
+            {
+                if self.gate_budget_or_quota_blocks() {
+                    return;
+                }
                 if let Some(text) = children.gate_correction().await {
                     if self.session_is_closed()
                         || self.session_input_queued()
@@ -678,5 +689,46 @@ mod tests {
             .goal_budget_crossed
             .load(std::sync::atomic::Ordering::SeqCst));
         assert!(engine.gate_budget_or_quota_blocks());
+    }
+    #[test]
+    fn disabled_gate_preserves_legacy_autonomous_after_terminal_goal_budget() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut engine, _dir) = faux_engine_with_settings(
+            &serde_json::json!({"responses":[
+            {"text":"cross budget"},{"text":"legacy work"},{"text":"legacy continuation"}]}),
+            u64::MAX,
+        );
+        engine.children = Some(Arc::new(crate::rlm_children::SupervisorChildSessions::new(
+            Arc::new(crate::supervisor_link::SupervisorLink::new(
+                std::path::PathBuf::new(),
+            )),
+            std::env::temp_dir(),
+            "root".into(),
+            Arc::new(crate::model_allowlist::ModelRefusalTelemetry::new(
+                std::env::temp_dir(),
+                true,
+            )),
+        )));
+        let engine = Arc::new(engine);
+        engine.register_arc();
+        let _goal_work = crate::agent_engine::tests::goal_admission_collector(&engine);
+        admit(
+            &engine,
+            "/goal --budget 10 tiny budget".into(),
+            &mut Vec::new(),
+        );
+        assert_eq!(
+            crate::engine::SessionEngine::goal_state_value(&*engine)["status"],
+            "budget_limited"
+        );
+        admit(
+            &engine,
+            "/autonomous on --max-continuations 1 --max-turns 5".into(),
+            &mut Vec::new(),
+        );
+        admit(&engine, "legacy work".into(), &mut Vec::new());
+        assert_eq!(engine.autonomous.blocking_lock().continuations_used, 1);
     }
 }
