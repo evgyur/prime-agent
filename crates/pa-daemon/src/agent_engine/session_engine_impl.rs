@@ -32,6 +32,9 @@ impl SessionEngine for AgentSessionEngine {
                 .ok_or_else(|| anyhow::anyhow!("Orchestration children unavailable"))?;
             match configure {
                 Some(mut payload) => {
+                    if let Some(permit) = payload.get("beginWorkStart") {
+                        return children.begin_work_start(permit).await;
+                    }
                     if payload["invalidateNextWork"] == true {
                         return children.invalidate_next_work().await;
                     }

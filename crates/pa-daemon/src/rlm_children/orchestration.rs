@@ -190,7 +190,8 @@ impl SupervisorChildSessions {
         anyhow::ensure!(
             payload.get("nextWorkSource").is_none()
                 && payload.get("nextWork").is_none()
-                && payload.get("invalidateNextWork").is_none(),
+                && payload.get("invalidateNextWork").is_none()
+                && payload.get("beginWorkStart").is_none(),
             "next_work source is installed only by the Studio owner"
         );
         let policy: Policy = serde_json::from_value(payload["policy"].clone())?;
@@ -420,12 +421,23 @@ impl SupervisorChildSessions {
         };
         let records = self.inner.children.lock().await.clone();
         let mut reserved = 0;
+        let mut child_ids = Vec::new();
         for record in records {
             let row = record.lock().await;
+            child_ids.push(row.rlm_child_id.clone());
             if !row.settled || row.admission_blocked {
                 reserved += 1;
             }
         }
+        reserved += self
+            .inner
+            .gate
+            .lock()
+            .expect("gate lock")
+            .work_bindings
+            .iter()
+            .filter(|binding| !child_ids.contains(&binding.child_id))
+            .count();
         anyhow::ensure!(
             reserved < limit,
             "Orchestration max admission capacity reached (UNKNOWN reserves capacity)"

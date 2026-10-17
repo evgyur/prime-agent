@@ -3,6 +3,8 @@
 //! `collect`, `rename`) over the supervisor's child-sessions registry,
 //! with the spawn-admission helpers only this surface uses.
 use super::subagent_policy;
+
+pub(crate) fn create_refused_error(message: String) -> anyhow::Error { anyhow::anyhow!(message) }
 use super::{
     assert_thinking_supported, bail, create_default_rlm_subagent_session_name, json, now_ms,
     resolve_child_model, rlm_child_label, rlm_depth_limit_error, spawn_name_unavailable_error, Arc,
@@ -155,7 +157,16 @@ impl RlmSubagentHost for SupervisorChildSessions {
                         // worker's env (filtered) instead.
                         Some(pa_types::daemon::launch_env::collect_process_launch_env()),
                     )
-                    .await?;
+                    .await;
+                let created = match created {
+                    Ok(created) => created,
+                    Err(error) => {
+                        if error.downcast_ref::<super::next_work::CreateNotSent>().is_some() {
+                            sessions.release_unsent_work(&child_id)?;
+                        }
+                        return Err(error);
+                    }
+                };
                 let record = ChildRecord {
                     rlm_child_id: child_id.clone(),
                     session_name: created.session_name.clone().unwrap_or_else(|| name.clone()),
@@ -231,7 +242,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
             {
                 parent_endpoint["sessionName"] = json!(name);
             }
-            let kickoff_row =
+            let mut kickoff_row =
                 pa_core::session_engine::agent_messaging::create_agent_session_message_row(
                     &pa_core::session_engine::agent_messaging::AgentSessionMessageRowPayload {
                         id: &kickoff_row_id,
@@ -246,6 +257,14 @@ impl RlmSubagentHost for SupervisorChildSessions {
                         timestamp: now_ms(),
                     },
                 );
+            if let Some(work) = &request.work {
+                let gate = this.gate.lock().expect("gate lock");
+                kickoff_row["nativeWorkPermit"] = json!({
+                    "ownerActiveSessionId":this.parent_active_session_id,
+                    "childId":child_id,"planId":work["planId"],"stepId":work["stepId"],
+                    "sourceInstanceId":gate.next_work_source.as_ref().map(|source|source.instance_id.as_str())
+                });
+            }
             let child_active_session_id = created.active_session_id.clone();
             let child_session_file = created.session_file.clone();
             // Dropping the caller while queue admission is in flight must not
@@ -259,6 +278,10 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     row.prompt_admitted = true;
                     row.admission_generation = Some(uuid::Uuid::new_v4().to_string());
                     row.expected_message_id = Some(kickoff_row_id.clone());
+                    if let Some(permit) = kickoff_row.get_mut("nativeWorkPermit") {
+                        permit["admissionGeneration"] = json!(row.admission_generation);
+                        permit["expectedMessageId"] = json!(row.expected_message_id);
+                    }
                     if let Some(mut display) =
                         crate::rlm_ledger::read_rlm_subagent_display(Path::new(&row.session_dir))
                     {

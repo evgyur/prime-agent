@@ -146,10 +146,16 @@ impl SupervisorChildSessionsInner {
             launch_env,
             rest: Map::default(),
         };
-        let summary = self
-            .command(&create, CREATE_TIMEOUT_MS)
-            .await
+        let response = self.link.request(serde_json::to_value(&create)?, Duration::from_millis(CREATE_TIMEOUT_MS)).await
             .with_context(|| format!("spawn RLM child session {child_id}"))?;
+        if !response.success {
+            let message = response.error.unwrap_or_else(|| "Child create refused".into());
+            if matches!(response.error_info, Some(pa_types::daemon::DaemonErrorInfo::UpdateRestarting | pa_types::daemon::DaemonErrorInfo::WorkerOverloaded)) {
+                return Err(super::next_work::CreateNotSent(message).into());
+            }
+            return Err(super::host::create_refused_error(message));
+        }
+        let summary = response.data.unwrap_or(Value::Null);
         let created = CreatedChild::from_summary(&summary, session_dir)?;
         Ok(created)
     }

@@ -3,6 +3,10 @@ use super::*;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(super) struct CreateNotSent(pub(super) String);
+
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct Source {
@@ -18,13 +22,69 @@ impl std::fmt::Debug for Source {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct Binding {
-    child_id: String,
+    pub(super) child_id: String,
     plan_id: String,
     step_id: String,
     snapshot_revision: u64,
     ownership: Vec<String>,
+    #[serde(default)]
+    start_permitted: bool,
 }
 impl SupervisorChildSessions {
+    pub(super) fn release_unsent_work(&self, child_id: &str) -> Result<()> {
+        let mut gate = self.inner.gate.lock().expect("gate lock");
+        gate.work_bindings
+            .retain(|binding| binding.child_id != child_id);
+        gate.revision += 1;
+        self.persist_gate(&gate)
+    }
+    pub(crate) async fn begin_work_start(&self, permit: &Value) -> Result<Value> {
+        self.refresh_next_work().await;
+        let _admissions = self.inner.spawn_gate.lock().await;
+        let mut gate = self.inner.gate.lock().expect("gate lock");
+        anyhow::ensure!(
+            gate.enabled() && !gate.suspended,
+            "Work start gate suspended"
+        );
+        anyhow::ensure!(
+            gate.next_work_source
+                .as_ref()
+                .is_some_and(|source| permit["sourceInstanceId"] == source.instance_id),
+            "Stale work start owner source"
+        );
+        let snapshot = gate
+            .next_work
+            .as_ref()
+            .ok_or_else(|| anyhow!("Work start source unknown"))?;
+        anyhow::ensure!(
+            snapshot["complete"] == true
+                && snapshot["items"]
+                    .as_array()
+                    .is_some_and(|items| items
+                        .iter()
+                        .any(|item| item["planId"] == permit["planId"]
+                            && item["stepId"] == permit["stepId"]
+                            && item["status"] == "ready")),
+            "Work no longer ready before provider start"
+        );
+        let binding = gate
+            .work_bindings
+            .iter_mut()
+            .find(|binding| {
+                permit["childId"] == binding.child_id
+                    && permit["planId"] == binding.plan_id
+                    && permit["stepId"] == binding.step_id
+            })
+            .ok_or_else(|| anyhow!("Work start binding missing"))?;
+        anyhow::ensure!(
+            !binding.start_permitted,
+            "Work start already admitted; reconcile without replay"
+        );
+        binding.start_permitted = true;
+        gate.revision += 1;
+        self.persist_gate(&gate)?;
+        Ok(json!({"workStartPermitted":true,"revision":gate.revision}))
+    }
     pub(crate) async fn invalidate_next_work(&self) -> Result<Value> {
         let _admissions = self.inner.spawn_gate.lock().await;
         let mut gate = self.inner.gate.lock().expect("gate lock");
@@ -185,7 +245,12 @@ impl SupervisorChildSessions {
         let reserved = rows
             .iter()
             .filter(|row| row["obligation"] == true || row["executionKind"] == "unknown")
-            .count();
+            .count()
+            + gate
+                .work_bindings
+                .iter()
+                .filter(|binding| !rows.iter().any(|row| row["childId"] == binding.child_id))
+                .count();
         let free = gate
             .policy
             .as_ref()
@@ -271,6 +336,7 @@ impl SupervisorChildSessions {
                 .into(),
             snapshot_revision: snapshot["revision"].as_u64().unwrap(),
             ownership,
+            start_permitted: false,
         };
         gate.work_bindings.push(binding);
         gate.attempts = 0;
@@ -461,5 +527,48 @@ mod tests {
             let error = sessions.configure_gate(&payload).await.unwrap_err();
             assert!(error.to_string().contains("Studio owner"));
         }
+    }
+
+    #[tokio::test]
+    async fn start_permit_linearizes_before_invalidation_and_never_replays() {
+        let sessions = sessions();
+        let _source = source(&sessions, projection()).await;
+        sessions
+            .reserve_work(
+                "B",
+                Some(&json!({"planId":"p","stepId":"B","snapshotRevision":7})),
+            )
+            .await
+            .unwrap();
+        let permit = json!({"childId":"B","planId":"p","stepId":"B","sourceInstanceId":"instance"});
+        assert_eq!(
+            sessions.begin_work_start(&permit).await.unwrap()["workStartPermitted"],
+            true
+        );
+        assert!(sessions.begin_work_start(&permit).await.is_err());
+        sessions.invalidate_next_work().await.unwrap();
+        assert!(sessions.inner.gate.lock().unwrap().work_bindings[0].start_permitted);
+    }
+
+    #[tokio::test]
+    async fn unsent_create_release_reopens_work_but_unknown_reservation_keeps_capacity() {
+        let sessions = sessions();
+        let _source = source(&sessions, projection()).await;
+        let work = json!({"planId":"p","stepId":"B","snapshotRevision":7});
+        sessions.reserve_work("pending", Some(&work)).await.unwrap();
+        assert!(sessions
+            .reserve_work("duplicate", Some(&work))
+            .await
+            .is_err());
+        let gate = sessions.inner.gate.lock().unwrap().clone();
+        assert_eq!(
+            sessions.next_work_view(&gate, &[])["runtime"]["freeSlots"],
+            1
+        );
+        sessions.release_unsent_work("pending").unwrap();
+        sessions
+            .reserve_work("replacement", Some(&work))
+            .await
+            .unwrap();
     }
 }

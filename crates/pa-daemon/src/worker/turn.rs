@@ -10,6 +10,7 @@ use super::{
 };
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Ignore a captured turn goal update if a newer driver state has reached the
 /// worker store first. Wall-clock time alone is not a state transition.
@@ -137,6 +138,54 @@ impl TurnRunner {
                             })
                         });
                     }
+                }
+                let mut work_allowed = true;
+                for permit in items.iter().filter_map(|item| {
+                    item.custom_message
+                        .as_ref()
+                        .and_then(|row| row.get("nativeWorkPermit"))
+                }) {
+                    let response = self.passivation.link.request(json!({
+                        "type":"configure_orchestration_gate","activeSessionId":permit["ownerActiveSessionId"],"beginWorkStart":permit
+                    }), Duration::from_millis(2_000)).await;
+                    let allowed = response
+                        .ok()
+                        .filter(|response| response.success)
+                        .and_then(|response| response.data)
+                        .is_some_and(|status| status["workStartPermitted"] == true);
+                    work_allowed &= allowed;
+                }
+                if items.iter().any(|item| {
+                    item.custom_message
+                        .as_ref()
+                        .is_some_and(|row| row.get("nativeWorkPermit").is_some())
+                }) {
+                    let core = self.core.lock().unwrap();
+                    work_allowed &= !core.shutdown_requested
+                        && !core.abort_requested
+                        && !core.queued_input_suspended
+                        && core.steering.is_empty();
+                    drop(core);
+                    work_allowed &= !engine.is_quota_parked()
+                        && engine.goal_state_value()["status"] != "budget_limited";
+                }
+                if !work_allowed {
+                    let mut core = self.core.lock().unwrap();
+                    core.queued_input_suspended = true;
+                    core.busy = false;
+                    for item in items.into_iter().rev() {
+                        core.follow_up.push_front(item);
+                    }
+                    drop(core);
+                    checkpoint_queue_recovery(
+                        &self.recovery,
+                        &self.core,
+                        QueueCheckpoint::Settle {
+                            operation: "next_work_unknown",
+                        },
+                    );
+                    self.idle_notify.notify_waiters();
+                    continue;
                 }
                 super::queue::retain_current_gate_controls(&mut items, engine.as_ref());
                 if items.is_empty() {
