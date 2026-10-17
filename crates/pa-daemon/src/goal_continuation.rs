@@ -735,6 +735,71 @@ mod tests {
     }
 
     #[test]
+    fn actual_python_goal_create_binds_scope_before_same_cell_status() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for fail_bind in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let marker = dir.path().join("same-cell.json");
+            let cell = if fail_bind {
+                format!("import json\ntry:\n    await goal.create('native same host reply')\nexcept Exception:\n    g=await goal.get()\n    s=await rlm.orchestration_status()\n    assert g['goal']['status']=='active' and s['managementScope']['goalId'] is None, (g,s)\n    open({:?},'w').write(json.dumps(s['managementScope']))\nelse:\n    raise AssertionError('bind failure returned success')",marker.display().to_string())
+            } else {
+                format!("import json\ng=await goal.create('native same host reply')\ns=await rlm.orchestration_status()\nassert s['managementScope']['goalId'] == g['goal']['goal_id'], (g,s)\nopen({:?},'w').write(json.dumps(s['managementScope']))",marker.display().to_string())
+            };
+            let engine = Arc::new(AgentSessionEngine::new(crate::agent_engine::AgentEngineConfig {
+            cwd:dir.path().into(),agent_dir:dir.path().join("agent"),provider:None,model:None,api_key:None,thinking:None,session_dir:None,session_file:None,
+            faux_script:Some(serde_json::json!({"responses":[{"content":[{"type":"toolCall","name":"python_repl","id":"create-one-cell","arguments":{"code":cell}}]},{"text":"same cell complete"}]}).to_string()),
+            supervisor_link:Some(crate::agent_engine::SupervisorLinkConfig{socket_path:dir.path().join("unused.sock"),active_session_id:"root".into(),worker_token:"fixture".into()}),telemetry_disabled:Some(true),cron_store:None,queued_steering_probe:None,
+        }).unwrap());
+            engine.register_arc();
+            engine
+                .children
+                .as_ref()
+                .unwrap()
+                .set_identity(crate::rlm_children::ParentIdentity {
+                    session_id: Some("root".into()),
+                    ..crate::rlm_children::ParentIdentity::with_default_depth()
+                });
+            let config = serde_json::json!({"expectedRevision":0,"policy":{"version":1,"enabled":true,"minActive":1,"maxActive":2,"rootWritesCode":false,"correctiveBudget":0,"managedPassPolicy":"causal_results_v1"},"task":{"projectId":"p","planId":"plan","stepId":"step","taskGeneration":1,"policyRevision":1},"assignments":[],"managementScope":{"rootSessionId":"root","goalId":null,"taskGeneration":1,"policyRevision":1,"envelope":{"planIds":["plan"],"requiredLeaves":[]}}});
+            engine
+                .runtime
+                .block_on(engine.orchestration_gate(Some(config)))
+                .unwrap();
+            if fail_bind {
+                engine.children.as_ref().unwrap().set_identity(
+                    crate::rlm_children::ParentIdentity {
+                        session_id: Some("root".into()),
+                        session_file: Some(
+                            dir.path()
+                                .join("missing-parent/session.jsonl")
+                                .display()
+                                .to_string(),
+                        ),
+                        ..crate::rlm_children::ParentIdentity::with_default_depth()
+                    },
+                );
+            }
+            let _work = goal_admission_collector(&engine);
+            let mut events = Vec::new();
+            admit(
+                &engine,
+                "create and inspect in one cell".into(),
+                &mut events,
+            );
+            assert!(marker.exists(), "same-cell tool failed: {events:?}");
+            let observed: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(marker).unwrap()).unwrap();
+            if fail_bind {
+                assert!(observed["goalId"].is_null());
+                assert_eq!(engine.goal_state_value()["status"], "active");
+            } else {
+                assert_eq!(observed["goalId"], engine.goal_state_value()["goalId"]);
+            }
+        }
+    }
+
+    #[test]
     fn pending_owner_scope_binds_only_actual_native_goal_and_rejects_replacement() {
         let _faux = FAUX_TEST_LOCK
             .lock()

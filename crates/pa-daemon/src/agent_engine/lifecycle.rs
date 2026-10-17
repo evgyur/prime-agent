@@ -963,6 +963,40 @@ impl AgentSessionEngine {
                     Ok(serde_json::json!({}))
                 })
             }));
+            let created_children = children.clone();
+            let created_engine = self
+                .self_weak
+                .lock()
+                .expect("engine self weak lock")
+                .clone();
+            handlers.register(
+                "orchestration.goal_created",
+                pa_core::kernel::shared::host_handler(move |payload| {
+                    let children = created_children.clone();
+                    let engine = created_engine.clone();
+                    Box::pin(async move {
+                        let engine = engine
+                            .as_ref()
+                            .and_then(std::sync::Weak::upgrade)
+                            .ok_or_else(|| anyhow::anyhow!("Native goal owner unavailable"))?;
+                        let goal_id =
+                            payload.data["goal"]["goal_id"].as_str().ok_or_else(|| {
+                                anyhow::anyhow!("Native created goal identity missing")
+                            })?;
+                        let actual = engine.current_goal_state().ok_or_else(|| {
+                            anyhow::anyhow!("Native goal state unavailable after creation")
+                        })?;
+                        anyhow::ensure!(
+                            actual.goal_id.as_deref() == Some(goal_id),
+                            "Native goal changed before management binding"
+                        );
+                        children.bind_management_goal(goal_id).map_err(|error| {
+                            anyhow::anyhow!("Goal exists but management binding blocked: {error:#}")
+                        })?;
+                        Ok(serde_json::json!({}))
+                    })
+                }),
+            );
             let status_children = children.clone();
             handlers.register(
                 "rlm.orchestration_status",

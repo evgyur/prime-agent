@@ -342,6 +342,26 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             }),
         );
     }
+    if let (Some(created), Some(create)) = (
+        handlers.get("orchestration.goal_created").cloned(),
+        handlers.get("goal.create").cloned(),
+    ) {
+        handlers.register(
+            "goal.create",
+            crate::kernel::shared::host_handler(move |payload| {
+                let created = created.clone();
+                let create = create.clone();
+                Box::pin(async move {
+                    let response = create(payload).await?;
+                    created(crate::kernel::shared::HostRequestPayload {
+                        data: response.clone(),
+                    })
+                    .await?;
+                    Ok(response)
+                })
+            }),
+        );
+    }
     // Per-session counters (MCP connector use, kernel boots, skills, RLM
     // child usage, feature outcomes) ride `agent session ended`; the seams
     // below count into them instead of emitting their own events.
