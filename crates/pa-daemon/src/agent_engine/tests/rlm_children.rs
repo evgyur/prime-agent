@@ -384,3 +384,40 @@ fn can_passivate_worker_mirrors_the_release_gates_and_adds_the_registry_rule() {
         ));
     assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
+
+#[test]
+fn orchestration_guard_prevents_goal_completion_from_worker_count() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = AgentSessionEngine::new(AgentEngineConfig {
+        cwd: dir.path().into(),
+        agent_dir: dir.path().join("agent"),
+        provider: None,
+        model: None,
+        api_key: None,
+        thinking: None,
+        session_dir: None,
+        session_file: None,
+        faux_script: None,
+        supervisor_link: Some(crate::agent_engine::SupervisorLinkConfig {
+            socket_path: dir.path().join("unused.sock"),
+            active_session_id: "root".into(),
+            worker_token: "fixture".into(),
+        }),
+        telemetry_disabled: Some(true),
+        cron_store: None,
+        queued_steering_probe: None,
+    })
+    .unwrap();
+    let children = engine.children.as_ref().unwrap();
+    engine.runtime.block_on(children.configure_gate(&json!({"expectedRevision":0,
+        "policy":{"version":1,"enabled":true,"minActive":5,"maxActive":20,"rootWritesCode":false,"correctiveBudget":0},
+        "task":{"projectId":"p","planId":"p","stepId":"s","taskGeneration":1,"policyRevision":1},"assignments":[]}))).unwrap();
+    let handlers = engine.extra_host_handlers().unwrap();
+    let guard = handlers.get("orchestration.goal_complete").unwrap();
+    let result = engine
+        .runtime
+        .block_on(guard(pa_core::kernel::shared::HostRequestPayload {
+            data: json!({}),
+        }));
+    assert!(result.is_err());
+}

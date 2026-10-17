@@ -605,6 +605,8 @@ impl Supervisor {
             model: display.as_ref().and_then(|entry| entry.model.clone()),
             status: "deleted".to_string(),
             admission_unresolved: None,
+            admission_generation: None,
+            expected_message_id: None,
             created_at: display.as_ref().map_or(0, |entry| entry.created_at),
         };
         if let Err(error) = crate::rlm_ledger::write_rlm_subagent_display(&tombstone) {

@@ -95,6 +95,21 @@ impl Worker {
                 self.handle_wait_for_headless_completion(payload).await
             }
             "get_state" => self.handle_get_state(),
+            "configure_orchestration_gate" | "get_orchestration_gate" => {
+                if let Err(response) = self.require_created(command_type) {
+                    return response;
+                }
+                match self
+                    .engine
+                    .orchestration_gate(
+                        (command_type == "configure_orchestration_gate").then(|| payload.clone()),
+                    )
+                    .await
+                {
+                    Ok(status) => response_success(None, command_type, Some(status)),
+                    Err(error) => response_failure(None, command_type, &format!("{error:#}"), None),
+                }
+            }
             "edit_goal_objective" => self.handle_edit_goal_objective(payload).await,
             "control_goal" => self.handle_control_goal(payload).await,
             "get_messages" => self.handle_get_messages(payload),
@@ -420,7 +435,22 @@ impl Worker {
         response_success(
             None,
             "get_state",
-            Some(serde_json::to_value(&summary).unwrap_or(Value::Null)),
+            Some({
+                let mut value = serde_json::to_value(&summary).unwrap_or(Value::Null);
+                value["ownExecutionStarted"] = json!(
+                    core.busy
+                        && core
+                            .active_action
+                            .as_ref()
+                            .is_some_and(|action| action.phase == "running")
+                );
+                value["runningMessageIds"] = json!(core
+                    .running_admission_ids
+                    .iter()
+                    .filter_map(|id| id.strip_prefix("message:"))
+                    .collect::<Vec<_>>());
+                value
+            }),
         )
     }
 

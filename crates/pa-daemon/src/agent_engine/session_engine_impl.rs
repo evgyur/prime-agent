@@ -11,6 +11,23 @@ use super::{
 };
 
 impl SessionEngine for AgentSessionEngine {
+    fn orchestration_gate(
+        &self,
+        configure: Option<Value>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Value>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let children = self
+                .children
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Orchestration children unavailable"))?;
+            match configure {
+                Some(payload) => children.configure_gate(&payload).await,
+                None => Ok(children.gate_status().await),
+            }
+        })
+    }
+
     /// Withdraw the queued minted goal-context turns so a state change leaves nothing stale to run.
     fn purge_queued_goal_contexts(&self) {
         let purge = self

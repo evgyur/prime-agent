@@ -715,7 +715,13 @@ impl Worker {
         response_success(
             None,
             "wait_for_headless_completion",
-            Some(serde_json::to_value(&status).unwrap_or(Value::Null)),
+            Some({
+                let mut value = serde_json::to_value(&status).unwrap_or(Value::Null);
+                if let Ok(gate) = self.engine.orchestration_gate(None).await {
+                    value["orchestrationGate"] = gate;
+                }
+                value
+            }),
         )
     }
 }

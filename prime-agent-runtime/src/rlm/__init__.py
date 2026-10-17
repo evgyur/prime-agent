@@ -336,6 +336,16 @@ def _subagent_from_payload(payload: Any, operation: str = "rlm.list_subagents") 
     )
 
 
+async def orchestration_status() -> dict[str, Any]:
+    """Fresh task-linked execution accounting, not the cached child roster."""
+    return await host_request("rlm.orchestration_status")
+
+
+async def configure_orchestration_gate(payload: dict[str, Any]) -> dict[str, Any]:
+    """CAS policy/bindings/exception update. Get revision and admissionGeneration from status first."""
+    return await host_request("rlm.configure_orchestration_gate", payload)
+
+
 async def list_subagents() -> list[RLMSubagent]:
     """List direct RLM children retained by the current parent session."""
     payload = await host_request("rlm.list_subagents")
@@ -629,6 +639,8 @@ class _RLMFactoryNamespace:
 
 
 class _RLMNamespace:
+    orchestration_status = staticmethod(orchestration_status)
+    configure_orchestration_gate = staticmethod(configure_orchestration_gate)
     harness = _harness_state
     get_harness_state = staticmethod(get_harness_state)
 

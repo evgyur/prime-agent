@@ -68,6 +68,10 @@ pub struct RlmSubagentDisplayEntry {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admission_unresolved: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_message_id: Option<String>,
     #[serde(default)]
     pub created_at: u64,
 }

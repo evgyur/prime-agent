@@ -64,6 +64,8 @@ fn record_with_file(child_id: &str, session_file: &Path) -> Arc<Mutex<ChildRecor
         replied_since_task: false,
         notice_delivered: false,
         prompt_admitted: true,
+        admission_generation: None,
+        expected_message_id: None,
         error: None,
         closed_by_parent: false,
         retirement_finished: false,
@@ -267,6 +269,8 @@ async fn reseed_lists_live_ledger_children_settled_and_bills_only_after_a_delive
                 model: None,
                 status: status.to_string(),
                 admission_unresolved: None,
+                admission_generation: None,
+                expected_message_id: None,
                 created_at: 1234,
             },
         )
@@ -450,6 +454,8 @@ async fn retask_unknown_marker_survives_parent_registry_restart() {
                 model: None,
                 status: status.to_string(),
                 admission_unresolved: None,
+                admission_generation: None,
+                expected_message_id: None,
                 created_at: 1234,
             },
         )

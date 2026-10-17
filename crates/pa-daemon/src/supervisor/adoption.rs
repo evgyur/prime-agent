@@ -849,6 +849,8 @@ impl Supervisor {
             model: metadata.get("model").cloned(),
             status: "running".to_string(),
             admission_unresolved: None,
+            admission_generation: None,
+            expected_message_id: None,
             created_at: metadata
                 .get("createdAt")
                 .and_then(Value::as_u64)

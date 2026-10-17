@@ -3,6 +3,8 @@
 //! keep the parent-side roster the kernel reads. Unlike TS, each child runs
 //! in its own supervised worker process; the kernel surface stays TS parity.
 
+mod orchestration;
+use orchestration::Gate;
 use serde_json::Map;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -169,6 +171,8 @@ struct ChildRecord {
     /// The task prompt was admitted; never settle a pre-prompt child (it
     /// is idle with an empty queue by construction).
     prompt_admitted: bool,
+    admission_generation: Option<String>,
+    expected_message_id: Option<String>,
     /// Terminal error text: the cancel reason for a cancelled run, the
     /// failure text for a failed one.
     error: Option<String>,
@@ -225,6 +229,8 @@ struct ChildTaskSnapshot {
     replied: bool,
     noticed: bool,
     error: Option<String>,
+    generation: Option<String>,
+    expected: Option<String>,
 }
 
 impl ChildAdmission {
@@ -243,6 +249,8 @@ impl ChildAdmission {
             row.replied_since_task |= self.prior.replied;
             row.notice_delivered = self.prior.noticed;
             row.error = self.prior.error;
+            row.admission_generation = self.prior.generation;
+            row.expected_message_id = self.prior.expected;
         }
         self.sessions.inner.refresh_running().await;
         if !self.prior.settled && !self.prior.blocked {
@@ -255,7 +263,22 @@ impl ChildAdmission {
         Ok(())
     }
 
-    pub(crate) async fn accepted(self) {
+    pub(crate) async fn accepted(self, message_id: &str) {
+        {
+            let mut row = self.record.lock().await;
+            row.expected_message_id = Some(message_id.to_string());
+            if let Some(mut display) =
+                crate::rlm_ledger::read_rlm_subagent_display(Path::new(&row.session_dir))
+            {
+                display.admission_generation = row.admission_generation.clone();
+                display.expected_message_id = row.expected_message_id.clone();
+                display.admission_unresolved = self.prior.blocked.then_some(true);
+                if let Err(error) = crate::rlm_ledger::write_rlm_subagent_display(&display) {
+                    eprintln!("pa-daemon: admission generation persistence failed: {error:#}");
+                    return;
+                }
+            }
+        }
         // An earlier unresolved delivery is not closed by a later receipt.
         self.record.lock().await.admission_blocked = self.prior.blocked;
         let inner = Arc::clone(&self.sessions.inner);
@@ -429,6 +452,9 @@ struct SupervisorChildSessionsInner {
     // an await, so sync engine paths can set it without a runtime `block_on`.
     identity: std::sync::Mutex<ParentIdentity>,
     children: Mutex<Vec<Arc<Mutex<ChildRecord>>>>,
+    gate: std::sync::Mutex<Gate>,
+    spawn_gate: Mutex<()>,
+    accounting_epoch: std::sync::atomic::AtomicU64,
     /// Confirmed-dead children whose final usage remains owed. Not roster or slot owners.
     retired_usage: std::sync::Mutex<Vec<RetiredChild>>,
     /// Spawn-name reservations held until admission is durable, so
@@ -496,6 +522,9 @@ impl SupervisorChildSessions {
                 parent_session_name: std::sync::Mutex::new(None),
                 identity: std::sync::Mutex::new(ParentIdentity::with_default_depth()),
                 children: Mutex::new(Vec::new()),
+                gate: std::sync::Mutex::new(Gate::default()),
+                spawn_gate: Mutex::new(()),
+                accounting_epoch: std::sync::atomic::AtomicU64::new(0),
                 retired_usage: std::sync::Mutex::new(Vec::new()),
                 pending_spawn_names: std::sync::Mutex::new(std::collections::HashSet::new()),
                 deleted_children: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -653,6 +682,7 @@ impl SupervisorChildSessions {
     /// Rebuild the children registry from the spawn ledger (a restarted
     /// parent lists its ledger children again).
     pub async fn reseed_from_ledger(&self) {
+        self.restore_gate();
         self.inner.reseed_from_ledger().await;
     }
 
@@ -723,6 +753,10 @@ impl SupervisorChildSessions {
         let Some(record) = self.inner.find_record(target).await else {
             return Ok(None);
         };
+        let _capacity = self.inner.spawn_gate.lock().await;
+        if record.lock().await.settled {
+            self.assert_gate_capacity().await?;
+        }
         let admission_lock = record.lock().await.admission_lock.clone();
         let lock = admission_lock.lock_owned().await;
         let prior_display = {
@@ -740,6 +774,8 @@ impl SupervisorChildSessions {
                 .ok_or_else(|| anyhow!("Child admission display identity unavailable"))?;
             let mut pending = display.clone();
             pending.admission_unresolved = Some(true);
+            pending.admission_generation = Some(uuid::Uuid::new_v4().to_string());
+            pending.expected_message_id = None;
             if !crate::rlm_ledger::write_rlm_subagent_display(&pending)? {
                 bail!("Child admission display was deleted");
             }
@@ -757,7 +793,12 @@ impl SupervisorChildSessions {
                 replied: row.replied_since_task,
                 noticed: row.notice_delivered,
                 error: row.error.take(),
+                generation: row.admission_generation.take(),
+                expected: row.expected_message_id.take(),
             };
+            row.admission_generation =
+                crate::rlm_ledger::read_rlm_subagent_display(Path::new(&row.session_dir))
+                    .and_then(|d| d.admission_generation);
             row.admission_blocked = true;
             row.settled_status = None;
             row.settled = false;
@@ -766,6 +807,9 @@ impl SupervisorChildSessions {
             row.notice_delivered = false;
             prior
         };
+        self.inner
+            .accounting_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.refresh_running().await;
         Ok(Some(ChildAdmission {
             sessions: self.clone(),
@@ -851,6 +895,8 @@ impl SupervisorChildSessions {
                 replied_since_task: false,
                 notice_delivered: false,
                 prompt_admitted: true,
+                admission_generation: None,
+                expected_message_id: None,
                 error: None,
                 closed_by_parent: false,
                 retirement_finished: false,
@@ -994,7 +1040,12 @@ impl SupervisorChildSessionsInner {
     /// the record settled and wakes the barrier only after the terminal
     /// notice is delivered.
     pub(crate) async fn fire_settle_hook(&self, record: &Arc<Mutex<ChildRecord>>) {
-        record.lock().await.settled = true;
+        {
+            let mut row = record.lock().await;
+            row.settled = true;
+            self.accounting_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         self.refresh_running().await;
         self.settle_notify.notify_waiters();
         let hook = self

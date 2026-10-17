@@ -76,7 +76,16 @@ impl TurnRunner {
                     let items = gather_delivery_batch(&mut core, Lane::Steering);
                     core.running_admission_ids = items
                         .iter()
-                        .filter_map(|item| item.admission_id.clone())
+                        .flat_map(|item| {
+                            item.admission_id.clone().into_iter().chain(
+                                item.custom_message
+                                    .as_ref()
+                                    .and_then(|row| row.get("details"))
+                                    .and_then(|details| details.get("id"))
+                                    .and_then(Value::as_str)
+                                    .map(|id| format!("message:{id}")),
+                            )
+                        })
                         .collect();
                     core.busy = true;
                     core.abort_requested = false;
@@ -87,7 +96,16 @@ impl TurnRunner {
                     let items = gather_delivery_batch(&mut core, Lane::FollowUp);
                     core.running_admission_ids = items
                         .iter()
-                        .filter_map(|item| item.admission_id.clone())
+                        .flat_map(|item| {
+                            item.admission_id.clone().into_iter().chain(
+                                item.custom_message
+                                    .as_ref()
+                                    .and_then(|row| row.get("details"))
+                                    .and_then(|details| details.get("id"))
+                                    .and_then(Value::as_str)
+                                    .map(|id| format!("message:{id}")),
+                            )
+                        })
                         .collect();
                     core.busy = true;
                     core.abort_requested = false;
@@ -108,7 +126,7 @@ impl TurnRunner {
                 let anchor = visible_index.map(|index| &items[index]);
                 {
                     let mut core = self.core.lock().unwrap();
-                    if let Some(anchor) = anchor {
+                    if let Some(anchor) = anchor.or_else(|| items.first()) {
                         core.active_action = Some(crate::types::SessionActionActive {
                             kind: "turn".to_string(),
                             phase: "preparing".to_string(),

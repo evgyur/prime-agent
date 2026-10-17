@@ -645,6 +645,8 @@ fn display_entries_round_trip_and_tombstones_stick() {
         model: Some(json!({"provider": "p", "modelId": "m"})),
         status: "running".into(),
         admission_unresolved: None,
+        admission_generation: None,
+        expected_message_id: None,
         created_at: 1,
     };
     assert!(write_rlm_subagent_display(&entry).unwrap());
@@ -674,6 +676,8 @@ fn display_entry_file_is_owner_only() {
         model: None,
         status: "running".into(),
         admission_unresolved: None,
+        admission_generation: None,
+        expected_message_id: None,
         created_at: 1,
     };
     assert!(write_rlm_subagent_display(&entry).unwrap());

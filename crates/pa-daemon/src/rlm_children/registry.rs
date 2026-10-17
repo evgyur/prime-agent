@@ -532,6 +532,10 @@ fn ledger_child_records(
             replied_since_task: false,
             notice_delivered: !unresolved,
             prompt_admitted: true,
+            admission_generation: display
+                .as_ref()
+                .and_then(|d| d.admission_generation.clone()),
+            expected_message_id: display.as_ref().and_then(|d| d.expected_message_id.clone()),
             error: None,
             closed_by_parent: false,
             retirement_finished: false,

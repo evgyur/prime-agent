@@ -24,6 +24,23 @@ pub(crate) struct AutonomousBoundaryMirror {
 }
 
 impl AgentSessionEngine {
+    fn gate_budget_or_quota_blocks(&self) -> bool {
+        if self
+            .goal_budget_crossed
+            .load(std::sync::atomic::Ordering::SeqCst)
+            || self.is_quota_parked()
+        {
+            return true;
+        }
+        let handles = self.goal_runtime.lock().expect("goal runtime lock").clone();
+        let Some(handles) = handles else {
+            return false;
+        };
+        let Ok(driver) = handles.driver.try_lock() else {
+            return true;
+        };
+        driver.state_with_creation_elapsed().status == pa_core::goals::GoalStatus::BudgetLimited
+    }
     /// The built session's consult mirror (cleared with the runtime's retirement).
     fn autonomous_boundary_mirror(&self) -> Option<AutonomousBoundaryMirror> {
         self.autonomous_boundary
@@ -60,7 +77,30 @@ impl AgentSessionEngine {
                 if signal.is_aborted() || engine.session_is_closed() {
                     return Ok(Vec::new());
                 }
-                Ok(engine.autonomous_continuation_rows(&context.message).await)
+                let scoped_gate = engine
+                    .children
+                    .as_ref()
+                    .is_some_and(|children| children.gate_stops_continuation());
+                let rows = engine.autonomous_continuation_rows(&context.message).await;
+                if signal.is_aborted()
+                    || engine.session_is_closed()
+                    || engine.session_input_queued()
+                {
+                    return Ok(Vec::new());
+                }
+                if engine.gate_budget_or_quota_blocks() {
+                    return Ok(Vec::new());
+                }
+                if scoped_gate
+                    && !rows.is_empty()
+                    && engine
+                        .children
+                        .as_ref()
+                        .is_some_and(|children| !children.gate_correction_is_current())
+                {
+                    return Ok(Vec::new());
+                }
+                Ok(rows)
             })
                 as pa_agent::BoxFut<'static, anyhow::Result<Vec<pa_agent::types::AgentMessage>>>
         })));
@@ -90,6 +130,25 @@ impl AgentSessionEngine {
         // Queued session input owns the boundary before any continuation work.
         if self.session_input_queued() {
             return Vec::new();
+        }
+        // Task gate owns the explicit scoped boundary before goal/all-child holds.
+        if self.gate_budget_or_quota_blocks() {
+            return Vec::new();
+        }
+        if let Some(children) = &self.children {
+            children.consume_gate_correction();
+            if message.stop_reason == pa_agent::types::StopReason::Error {
+                return Vec::new();
+            }
+            if let Some(text) = children.gate_correction().await {
+                return vec![pa_core::autonomous::autonomous_continuation_loop_row(
+                    &text,
+                    pa_core::autonomous::now_millis(),
+                )];
+            }
+            if children.gate_stops_continuation() {
+                return Vec::new();
+            }
         }
         // The goal arm takes exclusive priority (an active goal owns the boundary).
         if self.goal_owns_continuation_wakeup().await {
@@ -221,6 +280,28 @@ impl AgentSessionEngine {
         // A closed session (killed/stopped) drops the retry.
         if self.session_is_closed() {
             return;
+        }
+        if !self.session_input_queued() && !self.gate_budget_or_quota_blocks() {
+            if let Some(children) = &self.children {
+                if let Some(text) = children.gate_correction().await {
+                    if self.session_is_closed()
+                        || self.session_input_queued()
+                        || self.gate_budget_or_quota_blocks()
+                        || !children.gate_correction_is_current()
+                    {
+                        return;
+                    }
+                    let sink = self
+                        .autonomous_admission
+                        .lock()
+                        .expect("autonomous admission lock")
+                        .clone();
+                    if let Some(admit) = sink {
+                        admit(text);
+                    }
+                    return;
+                }
+            }
         }
         if !self
             .autonomous_awaits_rlm_work
@@ -471,5 +552,131 @@ mod tests {
         );
         let state = engine.autonomous.blocking_lock();
         assert_eq!(state.continuations_used, 1);
+    }
+    #[tokio::test]
+    async fn cancelled_or_queued_input_during_gate_snapshot_drops_correction_admission() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        for mode in ["cancel", "input", "disable", "budget"] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let socket = dir.path().join("fake.sock");
+            let listener = pa_types::platform::transport::bind_transport(&socket)
+                .await
+                .unwrap();
+            let engine = Arc::new(
+                AgentSessionEngine::new(crate::agent_engine::AgentEngineConfig {
+                    cwd: dir.path().into(),
+                    agent_dir: dir.path().join("agent"),
+                    provider: None,
+                    model: None,
+                    api_key: None,
+                    thinking: None,
+                    session_dir: None,
+                    session_file: None,
+                    faux_script: None,
+                    supervisor_link: Some(crate::agent_engine::SupervisorLinkConfig {
+                        socket_path: socket,
+                        active_session_id: "root".into(),
+                        worker_token: "fixture".into(),
+                    }),
+                    telemetry_disabled: Some(true),
+                    cron_store: None,
+                    queued_steering_probe: None,
+                })
+                .unwrap(),
+            );
+            let children = engine.children.as_ref().unwrap();
+            children.configure_gate(&serde_json::json!({"expectedRevision":0,
+                "policy":{"version":1,"enabled":true,"minActive":5,"maxActive":20,"rootWritesCode":false,"correctiveBudget":2},
+                "task":{"projectId":"p","planId":"p","stepId":"s","taskGeneration":1,"policyRevision":1},"assignments":[]})).await.unwrap();
+            children
+                .push_test_child(crate::rlm_children::RlmChildIdentity {
+                    rlm_child_id: "kid".into(),
+                    active_session_id: "kid".into(),
+                    session_id: None,
+                    session_name: "kid".into(),
+                })
+                .await;
+            let queued = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let probe = queued.clone();
+            *engine.goal_input_probe.lock().unwrap() = Some(Arc::new(move || {
+                probe.load(std::sync::atomic::Ordering::SeqCst)
+            }));
+            let admitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let sink = admitted.clone();
+            engine.set_autonomous_admission(Arc::new(move |_| {
+                sink.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }));
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let stream = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.split();
+                writer.write_all(b"{\"type\":\"daemon_hello\",\"protocol\":{\"name\":\"prime-agent.daemon\",\"version\":7}}\n").await.unwrap();
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                started_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                let response = crate::protocol::response_success(
+                    request["id"].as_str(),
+                    "get_state",
+                    Some(
+                        serde_json::json!({"workerInstanceId":"worker","ownExecutionStarted":false,"runningMessageIds":[]}),
+                    ),
+                );
+                writer
+                    .write_all(
+                        format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            });
+            let running = engine.clone();
+            let task = tokio::spawn(async move { running.autonomous_children_settled().await });
+            started_rx.await.unwrap();
+            match mode {
+                "cancel" => engine.mark_session_closed(),
+                "input" => queued.store(true, std::sync::atomic::Ordering::SeqCst),
+                "budget" => engine
+                    .goal_budget_crossed
+                    .store(true, std::sync::atomic::Ordering::SeqCst),
+                "disable" => {
+                    // Change policy while the first snapshot is held; configure also observes
+                    // children so release the held read before checking its final receipt.
+                    children.inner_disable_gate_for_test();
+                }
+                _ => unreachable!(),
+            }
+            release_tx.send(()).unwrap();
+            task.await.unwrap();
+            assert_eq!(admitted.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn budget_limited_goal_still_blocks_after_crossing_flag_consumed() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (engine, _dir) = faux_engine_with_settings(
+            &serde_json::json!({"responses":[{"text":"cross budget"}]}),
+            1,
+        );
+        let engine = Arc::new(engine);
+        let _goal_work = crate::agent_engine::tests::goal_admission_collector(&engine);
+        admit(
+            &engine,
+            "/goal --budget 10 budget guard fixture".into(),
+            &mut Vec::new(),
+        );
+        assert_eq!(
+            crate::engine::SessionEngine::goal_state_value(&*engine)["status"],
+            "budget_limited"
+        );
+        assert!(!engine
+            .goal_budget_crossed
+            .load(std::sync::atomic::Ordering::SeqCst));
+        assert!(engine.gate_budget_or_quota_blocks());
     }
 }

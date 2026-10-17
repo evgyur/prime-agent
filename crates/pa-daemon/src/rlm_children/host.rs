@@ -6,11 +6,11 @@ use super::subagent_policy;
 use super::{
     assert_thinking_supported, bail, create_default_rlm_subagent_session_name, json, now_ms,
     resolve_child_model, rlm_child_label, rlm_depth_limit_error, spawn_name_unavailable_error, Arc,
-    ChildCloseReason, ChildRecord, Context, DaemonCommand, Duration, Instant, Mutex, Path, PathBuf,
-    Result, RlmChildResult, RlmCreateSessionHandle, RlmCreateSessionRequest,
-    RlmDeleteSubagentResult, RlmHostFuture, RlmSpawnHandle, RlmSpawnRequest, RlmSubagentEntry,
-    RlmSubagentHost, SpawnNameReservationGuard, SupervisorChildSessions,
-    SupervisorChildSessionsInner, Value, KILL_TIMEOUT_MS, RENAME_TIMEOUT_MS,
+    ChildRecord, Context, DaemonCommand, Duration, Instant, Mutex, Path, PathBuf, Result,
+    RlmChildResult, RlmCreateSessionHandle, RlmCreateSessionRequest, RlmDeleteSubagentResult,
+    RlmHostFuture, RlmSpawnHandle, RlmSpawnRequest, RlmSubagentEntry, RlmSubagentHost,
+    SpawnNameReservationGuard, SupervisorChildSessions, SupervisorChildSessionsInner, Value,
+    KILL_TIMEOUT_MS, RENAME_TIMEOUT_MS,
 };
 
 /// Resolve the child model with the daemon `allowedModels` allowlist enforced, refusing loudly with
@@ -80,7 +80,10 @@ fn create_session_launch_env(model: &str) -> std::collections::BTreeMap<String, 
 impl RlmSubagentHost for SupervisorChildSessions {
     fn spawn(&self, request: RlmSpawnRequest) -> RlmHostFuture<RlmSpawnHandle> {
         let this = Arc::clone(&self.inner);
+        let sessions = self.clone();
         Box::pin(async move {
+            let _spawn = this.spawn_gate.lock().await;
+            sessions.assert_gate_capacity().await?;
             let identity = this.identity.lock().expect("identity lock").clone();
             if identity.rlm_depth >= identity.rlm_max_depth {
                 bail!(rlm_depth_limit_error(
@@ -171,6 +174,8 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     replied_since_task: false,
                     notice_delivered: false,
                     prompt_admitted: false,
+                    admission_generation: None,
+                    expected_message_id: None,
                     error: None,
                     closed_by_parent: false,
                     retirement_finished: false,
@@ -188,6 +193,8 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 };
                 let record = Arc::new(Mutex::new(record));
                 this.children.lock().await.push(Arc::clone(&record));
+                this.accounting_epoch
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 this.refresh_running().await;
                 this.emit_child_update(&record).await;
                 anyhow::Ok((record, created, model))
@@ -237,14 +244,27 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 );
             let child_active_session_id = created.active_session_id.clone();
             let child_session_file = created.session_file.clone();
-            let child_log_id = child_id.clone();
             // Dropping the caller while queue admission is in flight must not
             // cancel the registered child's kickoff or its settle observation.
             let admission = tokio::spawn(async move {
                 if record.lock().await.closed_by_parent {
                     bail!("Child closed before initial task admission");
                 }
-                record.lock().await.prompt_admitted = true;
+                {
+                    let mut row = record.lock().await;
+                    row.prompt_admitted = true;
+                    row.admission_generation = Some(uuid::Uuid::new_v4().to_string());
+                    row.expected_message_id = Some(kickoff_row_id.clone());
+                    if let Some(mut display) =
+                        crate::rlm_ledger::read_rlm_subagent_display(Path::new(&row.session_dir))
+                    {
+                        display.admission_generation = row.admission_generation.clone();
+                        display.expected_message_id = row.expected_message_id.clone();
+                        crate::rlm_ledger::write_rlm_subagent_display(&display)?;
+                    } else if watcher_this.gate.lock().expect("gate lock").enabled() {
+                        bail!("Spawn admission display unavailable");
+                    }
+                }
                 if let Err(error) = watcher_this
                     .prompt_child(
                         &child_active_session_id,
@@ -253,15 +273,23 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     )
                     .await
                 {
-                    // The route can fail ambiguously around a worker
-                    // replacement. The durable session file arbitrates: a
-                    // kickoff row in the file landed (re-sending would
-                    // duplicate the first turn); one retry is safe.
+                    if watcher_this.gate.lock().expect("gate lock").enabled() {
+                        // Unknown delivery reserves capacity; never resend.
+                        watcher_record.lock().await.admission_blocked = true;
+                        if let Some(mut display) = crate::rlm_ledger::read_rlm_subagent_display(
+                            Path::new(&watcher_record.lock().await.session_dir),
+                        ) {
+                            display.admission_unresolved = Some(true);
+                            crate::rlm_ledger::write_rlm_subagent_display(&display)?;
+                        }
+                        return Err(error);
+                    }
+                    // Preserve ungated legacy admission behavior.
                     let landed = session_file_carries_spawn_kickoff(
                         child_session_file.as_deref(),
                         &kickoff_row_id,
                     );
-                    let retried = if landed {
+                    let retry = if landed {
                         Ok(())
                     } else {
                         watcher_this
@@ -272,13 +300,11 @@ impl RlmSubagentHost for SupervisorChildSessions {
                             )
                             .await
                     };
-                    if let Err(retry_error) = retried {
-                        eprintln!(
-                            "pa-daemon: RLM child task prompt failed for {child_log_id}: {error:#}; retry failed: {retry_error:#}"
-                        );
-                        let _ = watcher_this
-                            .kill_child(&child_active_session_id, ChildCloseReason::Killed)
-                            .await;
+                    if let Err(retry_error) = retry {
+                        watcher_this
+                            .kill_child(&child_active_session_id, super::ChildCloseReason::Killed)
+                            .await
+                            .ok();
                         watcher_this
                             .settle_failed(
                                 &watcher_record,

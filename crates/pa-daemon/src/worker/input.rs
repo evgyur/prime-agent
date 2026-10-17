@@ -154,7 +154,15 @@ impl Worker {
         }
         match done_rx.await {
             Ok(settle) => match settle.wire_error() {
-                None => response_success(None, "prompt_and_wait", None),
+                None => response_success(
+                    None,
+                    "prompt_and_wait",
+                    self.engine
+                        .orchestration_gate(None)
+                        .await
+                        .ok()
+                        .map(|gate| json!({"orchestrationGate":gate})),
+                ),
                 Some(error) => response_failure(None, "prompt_and_wait", &error, None),
             },
             Err(_) => response_failure(None, "prompt_and_wait", "Prompt did not complete", None),

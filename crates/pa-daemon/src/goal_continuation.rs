@@ -117,6 +117,13 @@ impl AgentSessionEngine {
             }
             return GoalBoundary::End;
         }
+        if self
+            .children
+            .as_ref()
+            .is_some_and(|children| children.gate_stops_continuation())
+        {
+            return GoalBoundary::End;
+        }
         self.mint_goal_continuation()
     }
 
@@ -195,6 +202,13 @@ impl AgentSessionEngine {
     /// The settle-site body: exactly-once delivery under the driver lock,
     /// deferral kept while descendants or queued input own the boundary.
     async fn goal_children_settled(&self) {
+        if self
+            .children
+            .as_ref()
+            .is_some_and(|children| children.gate_stops_continuation())
+        {
+            return;
+        }
         // A closed session (killed/stopped) drops the retry.
         if self.session_is_closed() {
             return;

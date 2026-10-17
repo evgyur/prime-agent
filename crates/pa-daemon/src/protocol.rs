@@ -110,6 +110,8 @@ pub const KNOWN_COMMAND_TYPES: &[&str] = &[
     "get_connection_state",
     "get_messages",
     "get_rlm_children",
+    "configure_orchestration_gate",
+    "get_orchestration_gate",
     "get_session_stats",
     "get_context_tree",
     "get_commands",
@@ -362,6 +364,7 @@ pub fn default_server_capabilities() -> Vec<DaemonServerCapability> {
                 "goal_objective_edit",
                 "goal_lifecycle_control",
                 "authoritative_child_roster",
+                "orchestration_gate_v1",
                 "owned_session_recovery_context",
                 "rlm_quiescence_barrier",
                 "session_input_pause",
@@ -728,6 +731,12 @@ pub fn command_active_session_id(command: &DaemonCommand) -> Option<&str> {
         | DaemonCommand::GetMessages {
             active_session_id, ..
         }
+        | DaemonCommand::ConfigureOrchestrationGate {
+            active_session_id, ..
+        }
+        | DaemonCommand::GetOrchestrationGate {
+            active_session_id, ..
+        }
         | DaemonCommand::GetRlmChildren {
             active_session_id, ..
         }
@@ -1011,6 +1020,8 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
         DaemonCommand::ControlGoal { .. } => "control_goal",
         DaemonCommand::GetConnectionState { .. } => "get_connection_state",
         DaemonCommand::GetMessages { .. } => "get_messages",
+        DaemonCommand::ConfigureOrchestrationGate { .. } => "configure_orchestration_gate",
+        DaemonCommand::GetOrchestrationGate { .. } => "get_orchestration_gate",
         DaemonCommand::GetRlmChildren { .. } => "get_rlm_children",
         DaemonCommand::GetSessionStats { .. } => "get_session_stats",
         DaemonCommand::GetContextTree { .. } => "get_context_tree",

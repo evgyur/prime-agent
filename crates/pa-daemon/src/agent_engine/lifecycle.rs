@@ -934,7 +934,7 @@ impl AgentSessionEngine {
 
     /// Kernel host-request handlers for messaging and observation,
     /// routed through the supervisor link. `None` outside a daemon worker.
-    fn extra_host_handlers(&self) -> Option<HostRequestHandlers> {
+    pub(super) fn extra_host_handlers(&self) -> Option<HostRequestHandlers> {
         let config = self.config.supervisor_link.as_ref()?;
         let sender = Arc::new(LinkAgentMessageController::new(
             Arc::clone(&self.link),
@@ -953,6 +953,32 @@ impl AgentSessionEngine {
         register_agent_message_host_handlers(sender, &mut handlers);
         register_agent_observe_host_handlers(observer, &mut handlers);
         self.register_bash_notice_host_handlers(&mut handlers);
+        if let Some(children) = &self.children {
+            let complete_children = children.clone();
+            handlers.register("orchestration.goal_complete", pa_core::kernel::shared::host_handler(move |_| {
+                let children=complete_children.clone();
+                Box::pin(async move {
+                    anyhow::ensure!(!children.gate_stops_continuation(), "Close/disable the task gate after verified acceptance before goal.complete; worker counts never prove the goal");
+                    Ok(serde_json::json!({}))
+                })
+            }));
+            let status_children = children.clone();
+            handlers.register(
+                "rlm.orchestration_status",
+                pa_core::kernel::shared::host_handler(move |_| {
+                    let children = status_children.clone();
+                    Box::pin(async move { Ok(children.gate_status().await) })
+                }),
+            );
+            let configure_children = children.clone();
+            handlers.register(
+                "rlm.configure_orchestration_gate",
+                pa_core::kernel::shared::host_handler(move |payload| {
+                    let children = configure_children.clone();
+                    Box::pin(async move { children.configure_gate(&payload.data).await })
+                }),
+            );
+        }
         Some(handlers)
     }
 

@@ -222,7 +222,7 @@ impl AgentMessageController for LinkAgentMessageController {
         let receipt = match outcome {
             Ok(receipt) => {
                 if let Some(admission) = admission {
-                    admission.accepted().await;
+                    admission.accepted(&receipt.id).await;
                 }
                 receipt
             }

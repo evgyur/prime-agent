@@ -326,6 +326,22 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     if let Some(extra) = config.extra_host_handlers.clone() {
         handlers.merge(extra);
     }
+    if let (Some(guard), Some(complete)) = (
+        handlers.get("orchestration.goal_complete").cloned(),
+        handlers.get("goal.complete").cloned(),
+    ) {
+        handlers.register(
+            "goal.complete",
+            crate::kernel::shared::host_handler(move |payload| {
+                let guard = guard.clone();
+                let complete = complete.clone();
+                Box::pin(async move {
+                    guard(payload.clone()).await?;
+                    complete(payload).await
+                })
+            }),
+        );
+    }
     // Per-session counters (MCP connector use, kernel boots, skills, RLM
     // child usage, feature outcomes) ride `agent session ended`; the seams
     // below count into them instead of emitting their own events.

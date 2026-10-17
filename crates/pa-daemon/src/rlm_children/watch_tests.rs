@@ -1595,6 +1595,8 @@ fn an_already_settled_child_never_re_scores_as_an_unreachable_error() {
         replied_since_task: false,
         notice_delivered: false,
         prompt_admitted: true,
+        admission_generation: None,
+        expected_message_id: None,
         error: None,
         closed_by_parent: false,
         retirement_finished: false,
@@ -1668,6 +1670,8 @@ async fn the_unreachable_give_up_skips_the_exit_capture_when_a_capture_stands() 
         replied_since_task: false,
         notice_delivered: false,
         prompt_admitted: true,
+        admission_generation: None,
+        expected_message_id: None,
         error: None,
         closed_by_parent: false,
         retirement_finished: false,
@@ -1857,4 +1861,46 @@ async fn background_bash_state_keeps_child_busy_before_answer_capture() {
     assert_eq!(state.answer_reads.load(Ordering::SeqCst), 0);
     state.background_bash.store(false, Ordering::SeqCst);
     assert!(!sessions.inner.child_busy("child-live").await.unwrap());
+}
+
+#[tokio::test]
+async fn orchestration_max_admission_serializes_concurrent_twentieth_and_twenty_first() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let (sessions, _) =
+        sessions_with_fake_supervisor(tx, 0, FakeKill::Success, FakeChild::StateHangs).await;
+    sessions.configure_gate(&json!({"expectedRevision":0,
+        "policy":{"version":1,"enabled":true,"minActive":5,"maxActive":20,"rootWritesCode":false,"correctiveBudget":2},
+        "task":{"projectId":"fixture","planId":"p","stepId":"s","taskGeneration":1,"policyRevision":1},"assignments":[]})).await.unwrap();
+    for i in 0..19 {
+        sessions
+            .push_test_child(RlmChildIdentity {
+                rlm_child_id: format!("existing-{i}"),
+                active_session_id: format!("live-{i}"),
+                session_id: None,
+                session_name: format!("existing-{i}"),
+            })
+            .await;
+    }
+    // Fake supervisor doesn't own a display file: seed the real create display seam below.
+    // Capacity refusal happens before create for the losing contender.
+    let requests = (0..2).map(|i| {
+        sessions.spawn(RlmSpawnRequest {
+            prompt: "independent capacity fixture".into(),
+            name: Some(format!("contender-{i}")),
+            model: None,
+            thinking: None,
+            spawned_by_request_id: None,
+        })
+    });
+    let results = futures::future::join_all(requests).await;
+    let capacity_errors = results
+        .iter()
+        .filter(|r| {
+            r.as_ref()
+                .err()
+                .is_some_and(|e| format!("{e:#}").contains("max admission capacity"))
+        })
+        .count();
+    assert_eq!(capacity_errors, 1, "{results:?}");
+    assert_eq!(sessions.inner.children.lock().await.len(), 20);
 }

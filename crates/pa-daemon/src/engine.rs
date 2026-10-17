@@ -29,6 +29,14 @@ mod scripted;
 
 /// The turn behavior a worker session runs.
 pub trait SessionEngine: Send + Sync {
+    /// Native task-scoped orchestration control; unsupported engines fail explicitly.
+    fn orchestration_gate(
+        &self,
+        _configure: Option<Value>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send + '_>> {
+        Box::pin(async { anyhow::bail!("Orchestration gate unavailable") })
+    }
+
     /// The session's shared MCP manager, when the engine owns one: the
     /// `replace_acp_mcp_servers` command writes through it.
     fn acp_mcp_manager(
