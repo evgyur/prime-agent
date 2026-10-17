@@ -13,6 +13,7 @@ use super::{
 impl SessionEngine for AgentSessionEngine {
     fn orchestration_permit_is_current(&self, permit: &Value) -> bool {
         !self.session_is_closed()
+            && !self.gate_budget_or_quota_blocks()
             && self
                 .children
                 .as_ref()
@@ -30,7 +31,20 @@ impl SessionEngine for AgentSessionEngine {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Orchestration children unavailable"))?;
             match configure {
-                Some(payload) => children.configure_gate(&payload).await,
+                Some(mut payload) => {
+                    if payload["invalidateNextWork"] == true {
+                        return children.invalidate_next_work().await;
+                    }
+                    let source = payload
+                        .as_object_mut()
+                        .and_then(|object| object.remove("nextWorkSource"));
+                    let status = children.configure_gate(&payload).await?;
+                    if let Some(source) = source {
+                        children.install_next_work_source(&source)?;
+                        return Ok(children.gate_status().await);
+                    }
+                    Ok(status)
+                }
                 None => Ok(children.gate_status().await),
             }
         })

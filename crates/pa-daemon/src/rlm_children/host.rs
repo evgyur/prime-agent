@@ -82,6 +82,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
         let this = Arc::clone(&self.inner);
         let sessions = self.clone();
         Box::pin(async move {
+            sessions.refresh_next_work().await;
             let _spawn = this.spawn_gate.lock().await;
             sessions.assert_gate_capacity().await?;
             let identity = this.identity.lock().expect("identity lock").clone();
@@ -131,6 +132,9 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     "rlmDepth": identity.rlm_depth + 1,
                     "createdAt": now_ms(),
                 });
+                sessions
+                    .reserve_work(&child_id, request.work.as_ref())
+                    .await?;
                 let created = this
                     .create_child(
                         &child_id,

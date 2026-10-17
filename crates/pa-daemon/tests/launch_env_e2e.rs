@@ -543,6 +543,7 @@ async fn an_rlm_spawn_child_inherits_the_parent_worker_env() {
             model: None,
             thinking: None,
             spawned_by_request_id: None,
+            work: None,
         })
         .await
         .expect("spawn");

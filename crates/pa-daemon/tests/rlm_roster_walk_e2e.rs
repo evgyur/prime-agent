@@ -358,6 +358,7 @@ async fn subscribe_after_spawn_then_shutdown_seeds_the_passive_child() {
             model: None,
             thinking: None,
             spawned_by_request_id: None,
+            work: None,
         })
         .await
         .expect("spawn child");

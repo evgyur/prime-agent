@@ -118,6 +118,26 @@ impl TurnRunner {
                 }
             };
             if let Some(mut items) = item {
+                if items.iter().any(|item| {
+                    item.custom_message.as_ref().is_some_and(|row| {
+                        row["customType"] == super::queue::ORCHESTRATION_CONTROL_TYPE
+                    })
+                }) {
+                    // Pull the owner projection again at pickup, not only at mint time.
+                    let refreshed = engine.orchestration_gate(None).await.is_ok();
+                    let core = self.core.lock().unwrap();
+                    if !refreshed
+                        || core.shutdown_requested
+                        || core.abort_requested
+                        || !core.steering.is_empty()
+                    {
+                        items.retain(|item| {
+                            !item.custom_message.as_ref().is_some_and(|row| {
+                                row["customType"] == super::queue::ORCHESTRATION_CONTROL_TYPE
+                            })
+                        });
+                    }
+                }
                 super::queue::retain_current_gate_controls(&mut items, engine.as_ref());
                 if items.is_empty() {
                     self.core.lock().unwrap().busy = false;

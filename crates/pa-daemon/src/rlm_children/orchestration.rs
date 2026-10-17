@@ -14,7 +14,7 @@ pub(crate) struct Policy {
     version: u32,
     enabled: bool,
     min_active: usize,
-    max_active: usize,
+    pub(super) max_active: usize,
     root_writes_code: bool,
     #[serde(default = "default_budget")]
     corrective_budget: u32,
@@ -57,18 +57,26 @@ pub(crate) struct Exception {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Gate {
-    revision: u64,
-    policy: Option<Policy>,
+    pub(super) revision: u64,
+    pub(super) policy: Option<Policy>,
     task: Option<Task>,
     assignments: Vec<Assignment>,
     exception: Option<Exception>,
-    attempts: u32,
+    pub(super) attempts: u32,
     #[serde(default)]
-    suspended: bool,
+    pub(super) suspended: bool,
     #[serde(default)]
-    correction_pending: bool,
+    pub(super) correction_pending: bool,
     #[serde(default)]
     pending_revision: u64,
+    #[serde(default)]
+    pub(super) next_work_enabled: bool,
+    #[serde(skip)]
+    pub(super) next_work_source: Option<super::next_work::Source>,
+    #[serde(skip)]
+    pub(super) next_work: Option<Value>,
+    #[serde(default)]
+    pub(super) work_bindings: Vec<super::next_work::Binding>,
 }
 impl Gate {
     pub(super) fn enabled(&self) -> bool {
@@ -136,7 +144,7 @@ impl SupervisorChildSessions {
             .as_ref()
             .map(|file| PathBuf::from(format!("{file}.orchestration-gate.json")))
     }
-    fn persist_gate(&self, gate: &Gate) -> Result<()> {
+    pub(super) fn persist_gate(&self, gate: &Gate) -> Result<()> {
         if let Some(path) = self.gate_path() {
             let temp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
             let mut options = std::fs::OpenOptions::new();
@@ -178,6 +186,12 @@ impl SupervisorChildSessions {
         anyhow::ensure!(
             self.inner.identity.lock().expect("identity lock").rlm_depth == 0,
             "Only a root session may configure its orchestration gate"
+        );
+        anyhow::ensure!(
+            payload.get("nextWorkSource").is_none()
+                && payload.get("nextWork").is_none()
+                && payload.get("invalidateNextWork").is_none(),
+            "next_work source is installed only by the Studio owner"
         );
         let policy: Policy = serde_json::from_value(payload["policy"].clone())?;
         let task: Task = serde_json::from_value(payload["task"].clone())?;
@@ -277,6 +291,7 @@ impl SupervisorChildSessions {
         Ok(self.gate_status().await)
     }
     pub(crate) async fn gate_status(&self) -> Value {
+        self.refresh_next_work().await;
         let gate = self.inner.gate.lock().expect("gate lock").clone();
         let epoch = self
             .inner
@@ -315,12 +330,23 @@ impl SupervisorChildSessions {
                     })
             })
             .count();
+        let next_work = self.next_work_view(&gate, &rows);
         let decision = if revision_changed {
             "unknown"
         } else if gate.suspended {
             "suspended"
         } else if !gate.enabled() {
             "disabled"
+        } else if gate.next_work_enabled && next_work["complete"] != true {
+            "unknown"
+        } else if gate.next_work_enabled && next_work["actionRequired"] == true {
+            if gate.attempts >= gate.policy.as_ref().map_or(0, |p| p.corrective_budget) {
+                "suspended"
+            } else {
+                "corrective"
+            }
+        } else if gate.next_work_enabled {
+            "pass"
         } else if gate.exception.is_some() {
             "exception"
         } else if unknown == 0
@@ -344,7 +370,7 @@ impl SupervisorChildSessions {
             "decision":decision,"knownActive":active,"unknown":unknown,"observedAt":now_ms(),
             "complete":unknown==0 && !gate.suspended && !revision_changed,"exception":gate.exception,
             "correctiveAttempts":gate.attempts,"assignments":rows,
-            "rootWritesCodeEnforcement":"policy-audit-only"})
+            "nextWorkSourceInstanceId":gate.next_work_source.as_ref().map(|source| source.instance_id.as_str()),"nextWork":next_work,"rootWritesCodeEnforcement":"policy-audit-only"})
     }
     pub(crate) async fn gate_correction(&self) -> Option<String> {
         if !self.gate_stops_continuation() {
@@ -377,6 +403,9 @@ impl SupervisorChildSessions {
             gate.suspended = true;
             eprintln!("pa-daemon: orchestration attempt persistence failed: {error:#}");
             return None;
+        }
+        if gate.next_work_enabled {
+            return Some(format!("[next-work]\nCurrent owner-scoped Roadmap and runtime projection: {}. Accept completed artifacts first, then start an uncovered ready branch with rlm.spawn(..., work={{planId,stepId,snapshotRevision}}). UNKNOWN reserves capacity; never resend it. Files remain owned until confirmed STOP and acceptance/handoff. If no safe action exists, report the exact dependency and suspend. No fake work or silent scope reduction. Correction {} of {}.", status["nextWork"], gate.attempts, gate.policy.as_ref()?.corrective_budget));
         }
         Some(format!("[orchestration-gate]\nTask-linked executing workers: {}; unknown: {}. Reconcile current assignments with rlm.orchestration_status(), then bind real work with rlm.configure_orchestration_gate(payload), or record an evidence-backed exception. UNKNOWN delivery must not be resent. No fake work. This does not complete a goal. Corrective attempt {} of {}.",
             status["knownActive"],status["unknown"],gate.attempts,gate.policy.as_ref()?.corrective_budget))

@@ -24,7 +24,7 @@ pub(crate) struct AutonomousBoundaryMirror {
 }
 
 impl AgentSessionEngine {
-    fn gate_budget_or_quota_blocks(&self) -> bool {
+    pub(crate) fn gate_budget_or_quota_blocks(&self) -> bool {
         if self
             .goal_budget_crossed
             .load(std::sync::atomic::Ordering::SeqCst)

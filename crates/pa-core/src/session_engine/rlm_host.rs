@@ -146,6 +146,8 @@ pub struct RlmSpawnRequest {
     /// The parent's in-flight turn request the spawn anchors to (TS
     /// `spawnedByRequestId`): `None` for a spawn outside an active run.
     pub spawned_by_request_id: Option<String>,
+    /// Owner-scoped Roadmap reference; checked before child admission.
+    pub work: Option<Value>,
 }
 
 /// Validated `rlm.create_session` request handed to the host.
@@ -644,7 +646,7 @@ fn register_run(handlers: &mut HostRequestHandlers, bridge: &Arc<RlmHostBridge>)
 fn spawn_request_from_payload(prompt: &str, data: &Value) -> anyhow::Result<RlmSpawnRequest> {
     const OPERATION: &str = "rlm.spawn";
     let kwargs = kwargs_from_payload(data);
-    reject_unsupported_kwargs(&kwargs, OPERATION, &["name", "model", "thinking"])?;
+    reject_unsupported_kwargs(&kwargs, OPERATION, &["name", "model", "thinking", "work"])?;
     let name = optional_string_kwarg(&kwargs, "name", OPERATION)?;
     let name = normalize_requested_rlm_subagent_session_name(name, OPERATION)?;
     if let Some(name) = &name {
@@ -661,6 +663,7 @@ fn spawn_request_from_payload(prompt: &str, data: &Value) -> anyhow::Result<RlmS
         model,
         thinking,
         spawned_by_request_id: None,
+        work: kwargs.get("work").cloned(),
     })
 }
 

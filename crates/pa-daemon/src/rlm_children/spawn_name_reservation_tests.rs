@@ -190,6 +190,7 @@ fn spawn_request(name: &str, prompt: &str) -> RlmSpawnRequest {
         model: None,
         thinking: None,
         spawned_by_request_id: None,
+        work: None,
     }
 }
 
@@ -561,7 +562,10 @@ async fn exercise_initial_task_admission(cancel_caller: bool) {
             .await
             .unwrap()
             .expect_err("refused initial admission returned a handle");
-        assert!(format!("{error:#}").contains("kickoff refused"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("kickoff refused"),
+            "{error:#}"
+        );
         assert!(!sessions.spawn_name_reserved("gated-kickoff"));
         return;
     }

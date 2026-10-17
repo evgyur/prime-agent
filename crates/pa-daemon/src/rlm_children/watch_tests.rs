@@ -382,6 +382,7 @@ async fn spawn_child(sessions: &SupervisorChildSessions) -> RlmSpawnHandle {
             model: None,
             thinking: None,
             spawned_by_request_id: None,
+            work: None,
         })
         .await
         .expect("spawn must succeed against the fake supervisor")
@@ -399,6 +400,7 @@ async fn begin_failed_spawn(
         model: None,
         thinking: None,
         spawned_by_request_id: None,
+        work: None,
     }));
     PROMPT_FAILURE_STARTED.notified().await;
     let child_id = sessions.inner.children.lock().await[0]
@@ -1890,6 +1892,7 @@ async fn orchestration_max_admission_serializes_concurrent_twentieth_and_twenty_
             model: None,
             thinking: None,
             spawned_by_request_id: None,
+            work: None,
         })
     });
     let results = futures::future::join_all(requests).await;

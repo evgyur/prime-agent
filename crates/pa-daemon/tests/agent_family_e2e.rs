@@ -422,6 +422,7 @@ async fn parent_child_agent_message_round_trip_end_to_end() {
             model: None,
             thinking: None,
             spawned_by_request_id: None,
+            work: None,
         })
         .await
         .expect("spawn the child");
@@ -750,6 +751,7 @@ async fn family_edges_never_cross_families_end_to_end() {
                 model: None,
                 thinking: None,
                 spawned_by_request_id: None,
+                work: None,
             })
             .await
             .expect("spawn the child");
@@ -889,6 +891,7 @@ async fn family_edges_never_cross_families_end_to_end() {
             model: None,
             thinking: None,
             spawned_by_request_id: None,
+            work: None,
         })
         .await
         .expect("spawn the grandchild");
@@ -1197,6 +1200,7 @@ async fn parent_renames_a_child_end_to_end() {
             model: None,
             thinking: None,
             spawned_by_request_id: None,
+            work: None,
         })
         .await
         .expect("spawn the child");

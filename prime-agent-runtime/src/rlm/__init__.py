@@ -182,6 +182,7 @@ async def spawn(
     name: str,
     model: str | None = None,
     thinking: str | None = None,
+    work: dict[str, Any] | None = None,
 ) -> RLMSpawnHandle:
     """Spawn a recursive Prime Agent child and return once its task is admitted.
 
@@ -197,6 +198,8 @@ async def spawn(
         kwargs["model"] = model
     if thinking is not None:
         kwargs["thinking"] = thinking
+    if work is not None:
+        kwargs["work"] = work
     # Wire type stays "rlm.run" so kernels and hosts of different versions stay compatible.
     payload = await host_request("rlm.run", {"prompt": prompt, "kwargs": kwargs})
     return _spawn_handle_from_payload(payload)
@@ -651,8 +654,9 @@ class _RLMNamespace:
         name: str,
         model: str | None = None,
         thinking: str | None = None,
+        work: dict[str, Any] | None = None,
     ) -> RLMSpawnHandle:
-        return await spawn(prompt, name=name, model=model, thinking=thinking)
+        return await spawn(prompt, name=name, model=model, thinking=thinking, work=work)
 
     async def create_session(
         self,
