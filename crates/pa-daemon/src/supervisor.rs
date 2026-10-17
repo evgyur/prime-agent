@@ -48,6 +48,16 @@ use update_restart::{salvage_command_type, salvage_id, streamed_attach_lines};
 
 pub(crate) use clients::client_command_payload;
 
+/// Total read-only observation policy, not a guarantee of stop completion.
+/// Finalizers may outlive this bound; readers then preserve the waiting intent.
+pub(crate) fn owned_worker_cleanup_wait_timeout_ms() -> u64 {
+    (clients::OWNED_WORKER_DISCONNECT_GRACE
+        + Duration::from_millis(ROUTE_TIMEOUT_MS)
+        + crate::boot_reap::TERM_GRACE
+        + crate::boot_reap::STOP_FORCE_TIMEOUT)
+        .as_millis() as u64
+}
+
 // The routing consts and refusal string keep their crate::supervisor::* paths stable
 // (external callers: supervisor_parent_death, create_reuse, prompt_admission, update_restore).
 pub(crate) use routing::{

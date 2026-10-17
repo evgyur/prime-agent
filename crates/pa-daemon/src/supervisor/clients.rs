@@ -13,7 +13,7 @@ use super::{
 
 /// TS `OWNED_WORKER_DISCONNECT_GRACE_MS`: how long a client-owned worker
 /// keeps running after its owner's last connection closes.
-const OWNED_WORKER_DISCONNECT_GRACE: Duration = Duration::from_secs(30);
+pub(super) const OWNED_WORKER_DISCONNECT_GRACE: Duration = Duration::from_secs(30);
 
 struct OwnedCleanupRunning {
     supervisor: Arc<Supervisor>,

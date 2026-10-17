@@ -113,11 +113,12 @@ impl Supervisor {
         else {
             return Self::owned_failure(command_id, type_name, "invalid command");
         };
-        if *wait_timeout_ms > 30_000 {
+        let max_wait_ms = crate::supervisor::owned_worker_cleanup_wait_timeout_ms();
+        if *wait_timeout_ms > max_wait_ms {
             return Self::owned_failure(
                 command_id,
                 type_name,
-                "waitTimeoutMs must be at most 30000",
+                &format!("waitTimeoutMs must be at most {max_wait_ms}"),
             );
         }
         let identity = OwnedWorkerCleanupIdentity {
@@ -553,12 +554,76 @@ mod tests {
         supervisor.record_owned_worker_cleanup(identity);
         let (reply, _) = wait.await.unwrap();
         assert_eq!(reply[0]["data"]["status"], "verified_stopped");
-        value["waitTimeoutMs"] = json!(30_001);
+        value["waitTimeoutMs"] =
+            json!(crate::supervisor::owned_worker_cleanup_wait_timeout_ms() + 1);
         let command: DaemonCommand = serde_json::from_value(value).unwrap();
         let (reply, _) = supervisor
             .handle_get_owned_worker_cleanup(&command, "read", "get_owned_worker_cleanup")
             .await;
         assert_eq!(reply[0]["success"], false);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_total_observation_covers_grace_and_delayed_stop_without_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = supervisor_with_stale_identity(dir.path()).await;
+        let resident = supervisor.registry.get("w-a").await.unwrap();
+        {
+            let mut descriptor = resident.descriptor.lock().await;
+            descriptor.owner_client_id = Some("owner".into());
+            descriptor.worker_instance_id = Some("instance".into());
+        }
+        let identity = supervisor
+            .owned_worker_cleanup_identity(&resident)
+            .await
+            .unwrap();
+        supervisor
+            .owner_cleanup_receipts
+            .lock()
+            .unwrap()
+            .push_back((identity.clone(), false));
+        let make_command = |wait| {
+            let mut value = serde_json::to_value(&identity).unwrap();
+            value["type"] = json!("get_owned_worker_cleanup");
+            value["waitTimeoutMs"] = json!(wait);
+            serde_json::from_value::<DaemonCommand>(value).unwrap()
+        };
+        let budget = crate::supervisor::owned_worker_cleanup_wait_timeout_ms();
+        let command = make_command(budget);
+        let reader = Arc::clone(&supervisor);
+        let wait = tokio::spawn(async move {
+            reader
+                .handle_get_owned_worker_cleanup(&command, "proof", "get_owned_worker_cleanup")
+                .await
+        });
+        tokio::task::yield_now().await;
+        // The existing disconnect grace consumed the old entire observation bound.
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+        assert!(!wait.is_finished());
+        // A real stop may finish after grace, without a second proof request.
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        supervisor.record_owned_worker_cleanup(identity.clone());
+        let (reply, _) = wait.await.unwrap();
+        assert_eq!(reply[0]["data"]["status"], "verified_stopped");
+        supervisor.owner_cleanup_receipts.lock().unwrap().clear();
+        supervisor
+            .owner_cleanup_receipts
+            .lock()
+            .unwrap()
+            .push_back((identity.clone(), false));
+        let command = make_command(30_000);
+        let reader = Arc::clone(&supervisor);
+        let started = tokio::time::Instant::now();
+        let (reply, _) = reader
+            .handle_get_owned_worker_cleanup(&command, "proof", "get_owned_worker_cleanup")
+            .await;
+        assert_eq!(reply[0]["data"]["status"], "pending");
+        assert_eq!(
+            started.elapsed(),
+            std::time::Duration::from_secs(30),
+            "waitTimeoutMs remains a total deadline, never implicit grace plus budget"
+        );
     }
 
     /// One supervisor with one registered resident whose persisted identity

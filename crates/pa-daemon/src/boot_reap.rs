@@ -12,12 +12,12 @@ use crate::supervisor::Supervisor;
 
 /// Grace after SIGTERM before the force escalation (the CLI stop contract's
 /// worker grace).
-const TERM_GRACE: Duration = Duration::from_secs(2);
+pub(crate) const TERM_GRACE: Duration = Duration::from_secs(2);
 /// Verify window after SIGKILL before the reap reports the survivor.
 const KILL_VERIFY: Duration = Duration::from_secs(1);
 /// Hard deadline after SIGKILL on the intentional-stop path (TS `STOP_FORCE_TIMEOUT`):
 /// a killed worker's teardown may still take before the stop reports the survivor.
-const STOP_FORCE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const STOP_FORCE_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(not(windows))]
 const POLL: Duration = Duration::from_millis(25);
 

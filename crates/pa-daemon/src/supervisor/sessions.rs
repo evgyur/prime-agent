@@ -639,6 +639,8 @@ impl Supervisor {
         let mut summary = summary;
         if let Some(identity) = self.owned_worker_cleanup_identity(&resident).await {
             summary["ownedWorkerCleanup"] = serde_json::to_value(identity)?;
+            summary["ownedWorkerCleanupWaitTimeoutMs"] =
+                json!(super::owned_worker_cleanup_wait_timeout_ms());
         }
         Ok(summary)
     }
