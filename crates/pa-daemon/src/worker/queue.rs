@@ -453,8 +453,14 @@ pub(crate) fn admit_gate_follow_up(
     text: String,
     permit: Value,
 ) {
-    let custom = serde_json::json!({"role":"custom","customType":ORCHESTRATION_CONTROL_TYPE,
-        "content":text,"display":false,"details":permit});
+    let custom = crate::session_commands::custom_message_value(&pa_types::session::CustomMessage {
+        custom_type: ORCHESTRATION_CONTROL_TYPE.into(),
+        content: pa_types::ai::UserContent::Text(text.clone()),
+        display: false,
+        details: Some(permit),
+        timestamp: crate::util::now_ms(),
+        rest: serde_json::Map::default(),
+    });
     admit_continuation_follow_up(recovery, core, work_notify, text, Some(custom));
 }
 
@@ -743,6 +749,19 @@ mod orchestration_queue_tests {
             let notify = Arc::new(Notify::new());
             let recovery = Mutex::new(None);
             admit_gate_follow_up(&recovery, &core, &notify, text.clone(), permit.clone());
+            let row = core
+                .lock()
+                .unwrap()
+                .follow_up
+                .front()
+                .unwrap()
+                .custom_message
+                .clone()
+                .unwrap();
+            assert!(matches!(
+                serde_json::from_value::<pa_types::session::AgentMessage>(row),
+                Ok(pa_types::session::AgentMessage::Custom(_))
+            ));
             // The same production pickup path accepts the current queued permit.
             let mut current = core.lock().unwrap().follow_up.drain(..).collect::<Vec<_>>();
             retain_current_gate_controls(&mut current, &engine);

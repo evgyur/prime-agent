@@ -558,6 +558,16 @@ impl SupervisorChildSessions {
             || !gate.enabled()
             || gate.suspended
             || gate.correction_pending
+            || (status["unknown"] == 0
+                && status["complete"] == true
+                && gate.policy.as_ref().is_some_and(|policy| {
+                    policy.managed_pass_policy.as_deref() == Some("causal_results_v1")
+                })
+                && gate.work_bindings.iter().any(|binding| {
+                    binding.started_result.is_some()
+                        && binding.terminal_delivery.is_some()
+                        && binding.accepted_closure.is_none()
+                }))
             || gate.exception.is_some()
             || gate.attempts >= gate.policy.as_ref()?.corrective_budget
         {

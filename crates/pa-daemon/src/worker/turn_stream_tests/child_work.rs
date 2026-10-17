@@ -1,8 +1,30 @@
 //! A queued child consults its owner before the provider is called.
 use super::*;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+fn managed_kickoff(permit: Value) -> Value {
+    let mut rest = serde_json::Map::new();
+    rest.insert("nativeWorkPermit".into(), permit);
+    crate::session_commands::custom_message_value(&pa_types::session::CustomMessage {
+        custom_type: "agent_message".into(),
+        content: pa_types::ai::UserContent::Text("child task".into()),
+        display: true,
+        details: Some(json!({"id":"kickoff"})),
+        timestamp: 1,
+        rest,
+    })
+}
 struct ProviderProbe(std::sync::atomic::AtomicUsize);
 impl SessionEngine for ProviderProbe {
+    fn orchestration_permit_is_current(&self, _permit: &Value) -> bool {
+        true
+    }
+    fn orchestration_gate(
+        &self,
+        _configure: Option<Value>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Value>> + Send + '_>>
+    {
+        Box::pin(async { Ok(json!({})) })
+    }
     fn run_prompt(
         &self,
         _index: usize,
@@ -88,7 +110,7 @@ async fn changed_owner_snapshot_before_queued_child_provider_holds_item_without_
     let engine = Arc::new(ProviderProbe(std::sync::atomic::AtomicUsize::new(0)));
     let mut runner = burst_runner(engine.clone());
     runner.passivation.link = Arc::new(crate::supervisor_link::SupervisorLink::new(socket));
-    runner.core.lock().unwrap().follow_up.push_back(QueuedItem {message:"child task".into(),priority:QueuePriority::Background,preview:None,custom_message:Some(json!({"role":"custom","customType":"agent_message","details":{"id":"kickoff"},"nativeWorkPermit":{"ownerActiveSessionId":"owner","sourceInstanceId":"source","childId":"child","childActiveSessionId":"burst-session","childSessionId":"durable","admissionGeneration":"generation","expectedMessageId":"kickoff","planId":"p","stepId":"d","startToken":"private"}})),agent_message:None,queue_key:None,admission_id:None,images:Vec::new(),done:None,queue_visible:false,policy:TurnPolicy::Injected,forced_batch:false});
+    runner.core.lock().unwrap().follow_up.push_back(QueuedItem {message:"child task".into(),priority:QueuePriority::Background,preview:None,custom_message:Some(managed_kickoff(json!({"ownerActiveSessionId":"owner","sourceInstanceId":"source","childId":"child","childActiveSessionId":"burst-session","childSessionId":"durable","admissionGeneration":"generation","expectedMessageId":"kickoff","planId":"p","stepId":"d","startToken":"private"}))),agent_message:None,queue_key:None,admission_id:None,images:Vec::new(),done:None,queue_visible:false,policy:TurnPolicy::Injected,forced_batch:false});
     let core = runner.core.clone();
     let idle = runner.idle_notify.clone();
     let running = tokio::spawn(runner.run());
@@ -198,7 +220,7 @@ async fn validated_managed_start_survives_private_permit_strip_in_real_queue_pat
     runner.recovery = Arc::new(Mutex::new(Some(
         crate::journal::WorkerRecoveryJournal::open(&path).unwrap(),
     )));
-    runner.core.lock().unwrap().follow_up.push_back(QueuedItem{message:"child task".into(),priority:QueuePriority::Background,preview:None,custom_message:Some(json!({"role":"custom","customType":"agent_message","details":{"id":"kickoff"},"nativeWorkPermit":{"ownerActiveSessionId":"owner","childId":"child","childActiveSessionId":"burst-session","admissionGeneration":"generation","expectedMessageId":"kickoff","startToken":"private"}})),agent_message:None,queue_key:None,admission_id:None,images:Vec::new(),done:None,queue_visible:false,policy:TurnPolicy::Injected,forced_batch:false});
+    runner.core.lock().unwrap().follow_up.push_back(QueuedItem{message:"child task".into(),priority:QueuePriority::Background,preview:None,custom_message:Some(managed_kickoff(json!({"ownerActiveSessionId":"owner","childId":"child","childActiveSessionId":"burst-session","admissionGeneration":"generation","expectedMessageId":"kickoff","startToken":"private"}))),agent_message:None,queue_key:None,admission_id:None,images:Vec::new(),done:None,queue_visible:false,policy:TurnPolicy::Injected,forced_batch:false});
     let core = runner.core.clone();
     let idle = runner.idle_notify.clone();
     let settled = idle.notified();
@@ -216,4 +238,67 @@ async fn validated_managed_start_survives_private_permit_strip_in_real_queue_pat
     core.lock().unwrap().shutdown_requested = true;
     running.abort();
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn malformed_managed_notice_never_reaches_provider_or_delivery_claim() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = Arc::new(ProviderProbe(std::sync::atomic::AtomicUsize::new(0)));
+    let runner = burst_runner(engine.clone());
+    let recovery = runner.recovery.clone();
+    *recovery.lock().unwrap() = Some(
+        crate::journal::WorkerRecoveryJournal::open(&dir.path().join("worker.jsonl")).unwrap(),
+    );
+    let item = QueuedItem {
+        message: "notice".into(),
+        priority: QueuePriority::Background,
+        preview: None,
+        custom_message: Some(
+            json!({"role":"custom","customType":"rlm_child_terminal_notice","content":"notice","display":true,"details":{"childId":"A","terminalDeliveryId":"t","nativeManagedResult":true}}),
+        ),
+        agent_message: None,
+        queue_key: None,
+        admission_id: None,
+        images: Vec::new(),
+        done: None,
+        queue_visible: false,
+        policy: TurnPolicy::Injected,
+        forced_batch: false,
+    };
+    runner.run_turn(engine.clone(), vec![item]).await;
+    assert_eq!(engine.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(recovery
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .message_facts("burst-session")
+        .is_empty());
+}
+
+#[tokio::test]
+async fn typed_gate_control_runs_through_real_queue_preflight() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = Arc::new(ProviderProbe(std::sync::atomic::AtomicUsize::new(0)));
+    let runner = burst_runner(engine.clone());
+    *runner.recovery.lock().unwrap() = Some(
+        crate::journal::WorkerRecoveryJournal::open(&dir.path().join("worker.jsonl")).unwrap(),
+    );
+    crate::worker::queue::admit_gate_follow_up(
+        &runner.recovery,
+        &runner.core,
+        &runner.work_notify,
+        "control".into(),
+        json!({"revision":1}),
+    );
+    let idle = runner.idle_notify.clone();
+    let core = runner.core.clone();
+    let settled = idle.notified();
+    tokio::pin!(settled);
+    settled.as_mut().enable();
+    let running = tokio::spawn(runner.run());
+    settled.await;
+    assert_eq!(engine.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    core.lock().unwrap().shutdown_requested = true;
+    running.abort();
 }

@@ -743,6 +743,17 @@ mod tests {
         engine.runtime.block_on(async {
             handles.driver.lock().await.continuation_consumed();
         });
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe_count = probes.clone();
+        *engine.goal_input_probe.lock().unwrap() = Some(Arc::new(move || {
+            probe_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0
+        }));
+        assert!(engine
+            .runtime
+            .block_on(engine.orchestration_gate(Some(request())))
+            .is_err());
+        assert!(!children.inner.gate.lock().unwrap().work_bindings[0].review_consumed);
+        *engine.goal_input_probe.lock().unwrap() = Some(Arc::new(|| false));
         assert!(engine
             .runtime
             .block_on(engine.orchestration_gate(Some(request())))
@@ -751,6 +762,23 @@ mod tests {
             .runtime
             .block_on(engine.orchestration_gate(Some(request())))
             .is_err());
+        {
+            let mut gate = children.inner.gate.lock().unwrap();
+            let mut late = gate.work_bindings[0].clone();
+            late.child_id = "late".into();
+            late.terminal_delivery = Some("late-terminal".into());
+            late.review_consumed = false;
+            gate.work_bindings.push(late);
+        }
+        let late_probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let late_count = late_probes.clone();
+        *engine.goal_input_probe.lock().unwrap() = Some(Arc::new(move || {
+            late_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 2
+        }));
+        assert!(engine.runtime.block_on(engine.orchestration_gate(Some(json!({"beginManagedReview":{"childId":"late","terminalDeliveryId":"late-terminal","nativeNonce":crate::child_status_notices::mint()}})))).is_err());
+        assert!(children.inner.gate.lock().unwrap().work_bindings[1].review_consumed);
+        *engine.goal_input_probe.lock().unwrap() = Some(Arc::new(|| false));
+        assert!(engine.runtime.block_on(engine.orchestration_gate(Some(json!({"beginManagedReview":{"childId":"late","terminalDeliveryId":"late-terminal","nativeNonce":crate::child_status_notices::mint()}})))).is_err());
         let before_tokens = engine.goal_state_value()["tokensUsed"].as_u64().unwrap();
         let mut events = Vec::new();
         crate::agent_engine::tests::admit(&engine, "review actual A result".into(), &mut events);
@@ -936,12 +964,66 @@ mod tests {
                 json!({"childId":"A","expectedMessageId":"m","admissionGeneration":"g","incarnation":"i"}),
             );
         }
+        assert!(sessions.gate_correction().await.is_none());
         let candidate = sessions.managed_review_candidate(&request).await.unwrap();
         sessions.consume_managed_review(&candidate).unwrap();
+        assert!(sessions.gate_correction().await.is_none());
         assert!(sessions.consume_managed_review(&candidate).is_err());
         assert!(sessions.managed_review_candidate(&request).await.is_err());
         let gate = sessions.inner.gate.lock().unwrap();
         assert_eq!(gate.attempts, 2);
+        assert_eq!(gate.consumed_managed_results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn causal_result_reserves_gate_boundary_against_settle_correction() {
+        let sessions = sessions();
+        let scope = json!({"rootSessionId":"root","goalId":"goal","taskGeneration":1,"policyRevision":1,
+            "envelope":{"planIds":["p"],"requiredLeaves":[{"planId":"p","stepId":"leaf"}]}});
+        let config = json!({"expectedRevision":0,"policy":{"version":1,"enabled":true,"minActive":1,"maxActive":2,
+            "rootWritesCode":false,"correctiveBudget":2,"managedPassPolicy":"causal_results_v1"},
+            "task":{"projectId":"project","planId":"p","stepId":"root","taskGeneration":1,"policyRevision":1},"assignments":[]});
+        sessions
+            .configure_gate_scoped(&config, Some(scope), None)
+            .await
+            .unwrap();
+        {
+            let mut gate = sessions.inner.gate.lock().unwrap();
+            gate.attempts = 0;
+            let task = gate.task.clone();
+            let policy = gate.policy.clone();
+            gate.work_bindings.push(Binding {
+                child_id: "A".into(),
+                plan_id: "p".into(),
+                step_id: "leaf".into(),
+                snapshot_revision: 1,
+                ownership: vec!["a".into()],
+                start_permitted: true,
+                task,
+                policy,
+                start_token: None,
+                started_result: None,
+                terminal_delivery: Some("terminal".into()),
+                review_consumed: false,
+                accepted_closure: None,
+            });
+        }
+        let request = json!({"childId":"A","terminalDeliveryId":"terminal"});
+        assert!(sessions.managed_review_candidate(&request).await.is_err());
+        {
+            let mut gate = sessions.inner.gate.lock().unwrap();
+            gate.work_bindings[0].started_result = Some(
+                json!({"childId":"A","expectedMessageId":"m","admissionGeneration":"g","incarnation":"i"}),
+            );
+        }
+        assert!(sessions.gate_correction().await.is_none());
+        let candidate = sessions.managed_review_candidate(&request).await.unwrap();
+        sessions.consume_managed_review(&candidate).unwrap();
+        assert!(sessions.gate_correction().await.is_none());
+        assert!(sessions.consume_managed_review(&candidate).is_err());
+        assert!(sessions.managed_review_candidate(&request).await.is_err());
+        let gate = sessions.inner.gate.lock().unwrap();
+        assert_eq!(gate.attempts, 0);
         assert_eq!(gate.consumed_managed_results.len(), 1);
     }
 

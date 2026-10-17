@@ -71,13 +71,19 @@ impl SessionEngine for AgentSessionEngine {
                             minted.is_some(),
                             "Managed review private goal guard refused"
                         );
+                        if self.session_is_closed() || self.session_input_queued() {
+                            let _ = driver.rollback_continuation_mint(&mut session);
+                            anyhow::bail!(
+                                "Managed review admission cancelled before result consumption"
+                            );
+                        }
                         if let Err(error) = children.consume_managed_review(&candidate) {
                             let _ = driver.rollback_continuation_mint(&mut session);
                             return Err(error);
                         }
                         if self.session_is_closed() || self.session_input_queued() {
                             let _ = driver.rollback_continuation_mint(&mut session);
-                            anyhow::bail!("Managed review consumed but admission cancelled; reconcile without replay");
+                            anyhow::bail!("Managed review admission changed after durable consumption; reconcile without replay");
                         }
                         driver.continuation_consumed();
                         return Ok(json!({"managedReviewPermitted":true,"result":candidate}));

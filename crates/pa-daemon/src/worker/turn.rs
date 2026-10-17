@@ -1263,6 +1263,24 @@ impl TurnRunner {
             if file_backed {
                 engine.set_prompt_context_boundary(prompt_context_leaf);
             }
+            // Validate the exact row the engine will accept before spending a result review.
+            if let Some(custom) = &request.custom_message {
+                match serde_json::from_value::<pa_types::session::AgentMessage>(custom.clone()) {
+                    Ok(pa_types::session::AgentMessage::Custom(_)) => {}
+                    Ok(_) => {
+                        emit(EngineEvent::Done(Err(
+                            "Injected row must be a custom message".into(),
+                        )));
+                        return;
+                    }
+                    Err(error) => {
+                        emit(EngineEvent::Done(Err(format!(
+                            "Injected row preflight failed: {error}"
+                        ))));
+                        return;
+                    }
+                }
+            }
             let fact_result = (|| -> Result<()> {
                 let (active_session_id, session_id) = {
                     let core = core.lock().unwrap();
