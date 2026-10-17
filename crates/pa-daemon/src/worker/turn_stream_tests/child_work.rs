@@ -69,6 +69,10 @@ async fn changed_owner_snapshot_before_queued_child_provider_holds_item_without_
         let request: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(request["command"]["type"], "configure_orchestration_gate");
         assert_eq!(request["command"]["activeSessionId"], "owner");
+        let permit = &request["command"]["beginWorkStart"];
+        assert_eq!(permit["childActiveSessionId"], "burst-session");
+        assert_eq!(permit["expectedMessageId"], "kickoff");
+        assert_eq!(permit["admissionGeneration"], "generation");
         entered_tx.send(()).unwrap();
         release_rx.await.unwrap();
         let response = crate::protocol::response_success(
@@ -84,7 +88,7 @@ async fn changed_owner_snapshot_before_queued_child_provider_holds_item_without_
     let engine = Arc::new(ProviderProbe(std::sync::atomic::AtomicUsize::new(0)));
     let mut runner = burst_runner(engine.clone());
     runner.passivation.link = Arc::new(crate::supervisor_link::SupervisorLink::new(socket));
-    runner.core.lock().unwrap().follow_up.push_back(QueuedItem {message:"child task".into(),priority:QueuePriority::Background,preview:None,custom_message:Some(json!({"role":"custom","customType":"agent_message","nativeWorkPermit":{"ownerActiveSessionId":"owner","sourceInstanceId":"source","childId":"child","planId":"p","stepId":"d"}})),agent_message:None,queue_key:None,admission_id:None,images:Vec::new(),done:None,queue_visible:false,policy:TurnPolicy::Injected,forced_batch:false});
+    runner.core.lock().unwrap().follow_up.push_back(QueuedItem {message:"child task".into(),priority:QueuePriority::Background,preview:None,custom_message:Some(json!({"role":"custom","customType":"agent_message","details":{"id":"kickoff"},"nativeWorkPermit":{"ownerActiveSessionId":"owner","sourceInstanceId":"source","childId":"child","childActiveSessionId":"burst-session","childSessionId":"durable","admissionGeneration":"generation","expectedMessageId":"kickoff","planId":"p","stepId":"d","startToken":"private"}})),agent_message:None,queue_key:None,admission_id:None,images:Vec::new(),done:None,queue_visible:false,policy:TurnPolicy::Injected,forced_batch:false});
     let core = runner.core.clone();
     let idle = runner.idle_notify.clone();
     let running = tokio::spawn(runner.run());

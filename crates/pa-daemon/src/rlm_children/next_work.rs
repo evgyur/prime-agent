@@ -29,6 +29,12 @@ pub(super) struct Binding {
     ownership: Vec<String>,
     #[serde(default)]
     start_permitted: bool,
+    #[serde(default)]
+    task: Option<super::orchestration::Task>,
+    #[serde(default)]
+    policy: Option<super::orchestration::Policy>,
+    #[serde(skip)]
+    pub(super) start_token: Option<String>,
 }
 impl SupervisorChildSessions {
     pub(super) fn release_unsent_work(&self, child_id: &str) -> Result<()> {
@@ -40,7 +46,24 @@ impl SupervisorChildSessions {
     }
     pub(crate) async fn begin_work_start(&self, permit: &Value) -> Result<Value> {
         self.refresh_next_work().await;
+        let child_id = permit["childId"].as_str().ok_or_else(|| anyhow!("Missing start child identity"))?;
+        let record = self.inner.find_record(child_id).await.ok_or_else(|| anyhow!("Current start child missing"))?;
+        let state = self.inner.command(&DaemonCommand::GetState {
+            id: None,
+            active_session_id: permit["childActiveSessionId"].as_str().ok_or_else(|| anyhow!("Missing start session identity"))?.into(),
+            rest: Map::default(),
+        }, 2_000).await?;
         let _admissions = self.inner.spawn_gate.lock().await;
+        let row = record.lock().await;
+        anyhow::ensure!(
+            row.rlm_child_id == child_id && !row.closed_by_parent && !row.settled && !row.admission_blocked && row.prompt_admitted
+                && row.admission_generation.as_deref().is_some_and(|generation| permit["admissionGeneration"] == generation)
+                && row.expected_message_id.as_deref().is_some_and(|message| permit["expectedMessageId"] == message)
+                && permit["childActiveSessionId"] == row.active_session_id
+                && permit["childSessionId"].as_str() == row.session_id.as_deref()
+                && permit["incarnation"].as_str().is_some_and(|instance| !instance.is_empty() && state["workerInstanceId"] == instance),
+            "Work start admission identity changed"
+        );
         let mut gate = self.inner.gate.lock().expect("gate lock");
         anyhow::ensure!(
             gate.enabled() && !gate.suspended,
@@ -67,6 +90,8 @@ impl SupervisorChildSessions {
                             && item["status"] == "ready")),
             "Work no longer ready before provider start"
         );
+        let task = gate.task.clone();
+        let policy = gate.policy.clone();
         let binding = gate
             .work_bindings
             .iter_mut()
@@ -76,6 +101,10 @@ impl SupervisorChildSessions {
                     && permit["stepId"] == binding.step_id
             })
             .ok_or_else(|| anyhow!("Work start binding missing"))?;
+        anyhow::ensure!(binding.task.is_some() && binding.task == task && binding.policy == policy,
+            "Work start task or policy changed");
+        anyhow::ensure!(binding.start_token.as_deref().is_some_and(|token| permit["startToken"] == token),
+            "Work start private identity changed");
         anyhow::ensure!(
             !binding.start_permitted,
             "Work start already admitted; reconcile without replay"
@@ -337,6 +366,9 @@ impl SupervisorChildSessions {
             snapshot_revision: snapshot["revision"].as_u64().unwrap(),
             ownership,
             start_permitted: false,
+            task: gate.task.clone(),
+            policy: gate.policy.clone(),
+            start_token: Some(uuid::Uuid::new_v4().to_string()),
         };
         gate.work_bindings.push(binding);
         gate.attempts = 0;
@@ -416,6 +448,7 @@ mod tests {
             )
             .unwrap();
         let mut gate = sessions.inner.gate.lock().unwrap();
+        gate.task = Some(serde_json::from_value(json!({"projectId":"project","planId":"p","stepId":"root","taskGeneration":1,"policyRevision":1})).unwrap());
         gate.policy = Some(serde_json::from_value(json!({"version":1,"enabled":true,"minActive":1,"maxActive":2,"rootWritesCode":false,"correctiveBudget":2})).unwrap());
         drop(gate);
         sessions.refresh_next_work().await;
@@ -521,7 +554,7 @@ mod tests {
     #[tokio::test]
     async fn model_cannot_install_or_invalidate_owner_source() {
         let sessions = sessions();
-        for field in ["nextWorkSource", "nextWork", "invalidateNextWork"] {
+        for field in ["nextWorkSource", "nextWork", "invalidateNextWork", "beginWorkStart"] {
             let mut payload = json!({"expectedRevision":0,"policy":{},"task":{},"assignments":[]});
             payload[field] = json!(true);
             let error = sessions.configure_gate(&payload).await.unwrap_err();
@@ -529,25 +562,101 @@ mod tests {
         }
     }
 
+    async fn start_fixture() -> (SupervisorChildSessions, tempfile::TempDir, Value, Arc<tokio::sync::Notify>) {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut sessions = sessions();
+        let source = source(&sessions, projection()).await;
+        let socket = source.path().join("supervisor.sock");
+        let listener = pa_types::platform::transport::bind_transport(&socket).await.unwrap();
+        Arc::get_mut(&mut sessions.inner).unwrap().link = Arc::new(crate::supervisor_link::SupervisorLink::new(socket));
+        let state_read = Arc::new(tokio::sync::Notify::new());
+        let server_read = state_read.clone();
+        tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.unwrap();
+                let state_read = server_read.clone();
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.split();
+                    writer.write_all(b"{\"type\":\"daemon_hello\",\"protocol\":{\"name\":\"prime-agent.daemon\",\"version\":7}}\n").await.unwrap();
+                    let mut reader = BufReader::new(reader);
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await.unwrap();
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    let response = crate::protocol::response_success(request["id"].as_str(), "get_state", Some(json!({"workerInstanceId":"worker"})));
+                    writer.write_all(format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes()).await.unwrap();
+                    state_read.notify_one();
+                });
+            }
+        });
+        sessions.reserve_work("B", Some(&json!({"planId":"p","stepId":"B","snapshotRevision":7}))).await.unwrap();
+        sessions.push_test_child(RlmChildIdentity { rlm_child_id:"B".into(), active_session_id:"active".into(), session_id:Some("durable".into()), session_name:"B".into() }).await;
+        let record = sessions.inner.find_record("B").await.unwrap();
+        {
+            let mut row = record.lock().await;
+            row.admission_generation = Some("generation".into());
+            row.expected_message_id = Some("message".into());
+        }
+        let token = sessions.inner.gate.lock().unwrap().work_bindings[0].start_token.clone();
+        let permit = json!({"childId":"B","childActiveSessionId":"active","childSessionId":"durable","planId":"p","stepId":"B","sourceInstanceId":"instance","admissionGeneration":"generation","expectedMessageId":"message","incarnation":"worker","startToken":token});
+        (sessions, source, permit, state_read)
+    }
+
     #[tokio::test]
     async fn start_permit_linearizes_before_invalidation_and_never_replays() {
-        let sessions = sessions();
-        let _source = source(&sessions, projection()).await;
-        sessions
-            .reserve_work(
-                "B",
-                Some(&json!({"planId":"p","stepId":"B","snapshotRevision":7})),
-            )
-            .await
-            .unwrap();
-        let permit = json!({"childId":"B","planId":"p","stepId":"B","sourceInstanceId":"instance"});
-        assert_eq!(
-            sessions.begin_work_start(&permit).await.unwrap()["workStartPermitted"],
-            true
-        );
+        let (sessions, _source, permit, _state_read) = start_fixture().await;
+        assert_eq!(sessions.begin_work_start(&permit).await.unwrap()["workStartPermitted"], true);
         assert!(sessions.begin_work_start(&permit).await.is_err());
         sessions.invalidate_next_work().await.unwrap();
         assert!(sessions.inner.gate.lock().unwrap().work_bindings[0].start_permitted);
+    }
+
+    #[tokio::test]
+    async fn start_permit_rejects_stale_or_forged_identity_without_consuming_current() {
+        let (sessions, _source, permit, _state_read) = start_fixture().await;
+        for field in ["admissionGeneration", "expectedMessageId", "childActiveSessionId", "childSessionId", "incarnation", "startToken"] {
+            let mut stale = permit.clone();
+            stale[field] = json!("stale");
+            assert!(sessions.begin_work_start(&stale).await.is_err(), "{field}");
+            assert!(!sessions.inner.gate.lock().unwrap().work_bindings[0].start_permitted);
+        }
+        let mut missing = permit.clone();
+        missing["childId"] = json!("missing");
+        assert!(sessions.begin_work_start(&missing).await.is_err());
+        let serialized = serde_json::to_value(&*sessions.inner.gate.lock().unwrap()).unwrap();
+        assert!(serialized["workBindings"][0].get("startToken").is_none());
+        assert_eq!(sessions.begin_work_start(&permit).await.unwrap()["workStartPermitted"], true);
+    }
+
+    #[tokio::test]
+    async fn start_permit_rechecks_record_and_task_after_waiting_for_admission_lock() {
+        for change in ["generation", "closed", "settled", "blocked", "task", "policy"] {
+            let (sessions, _source, permit, state_read) = start_fixture().await;
+            let admission = sessions.inner.spawn_gate.lock().await;
+            let starting_sessions = sessions.clone();
+            let starting = tokio::spawn(async move { starting_sessions.begin_work_start(&permit).await });
+            state_read.notified().await;
+            assert!(!starting.is_finished());
+            let record = sessions.inner.find_record("B").await.unwrap();
+            {
+                let mut row = record.lock().await;
+                match change {
+                    "generation" => row.admission_generation = Some("replacement".into()),
+                    "closed" => row.closed_by_parent = true,
+                    "settled" => row.settled = true,
+                    "blocked" => row.admission_blocked = true,
+                    _ => {}
+                }
+            }
+            if change == "task" || change == "policy" {
+                let mut gate = sessions.inner.gate.lock().unwrap();
+                let mut task = serde_json::to_value(gate.task.as_ref().unwrap()).unwrap();
+                task[if change == "task" { "taskGeneration" } else { "policyRevision" }] = json!(2);
+                gate.task = Some(serde_json::from_value(task).unwrap());
+            }
+            drop(admission);
+            assert!(starting.await.unwrap().is_err(), "{change}");
+            assert!(!sessions.inner.gate.lock().unwrap().work_bindings[0].start_permitted);
+        }
     }
 
     #[tokio::test]

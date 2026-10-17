@@ -8,7 +8,7 @@ pub(crate) const DEFAULT_MIN_ACTIVE: usize = 5;
 pub(crate) const MAX_ACTIVE: usize = 20;
 const SNAPSHOT_TIMEOUT_MS: u64 = 2_000;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Policy {
     version: u32,
@@ -59,7 +59,7 @@ pub(crate) struct Exception {
 pub(crate) struct Gate {
     pub(super) revision: u64,
     pub(super) policy: Option<Policy>,
-    task: Option<Task>,
+    pub(super) task: Option<Task>,
     assignments: Vec<Assignment>,
     exception: Option<Exception>,
     pub(super) attempts: u32,

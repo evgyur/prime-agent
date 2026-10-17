@@ -140,11 +140,18 @@ impl TurnRunner {
                     }
                 }
                 let mut work_allowed = true;
-                for permit in items.iter().filter_map(|item| {
+                for (message_id, permit) in items.iter().filter_map(|item| {
                     item.custom_message
                         .as_ref()
-                        .and_then(|row| row.get("nativeWorkPermit"))
+                        .and_then(|row| row.get("nativeWorkPermit").map(|permit| (row["details"]["id"].as_str(), permit)))
                 }) {
+                    let mut permit = permit.clone();
+                    if message_id.is_none() || message_id != permit["expectedMessageId"].as_str()
+                        || permit["childActiveSessionId"] != self.active_session_id {
+                        work_allowed = false;
+                        continue;
+                    }
+                    permit["incarnation"] = json!(std::env::var(super::WORKER_INSTANCE_ID_ENV).unwrap_or_default());
                     let response = self.passivation.link.request(json!({
                         "type":"configure_orchestration_gate","activeSessionId":permit["ownerActiveSessionId"],"beginWorkStart":permit
                     }), Duration::from_millis(2_000)).await;
@@ -186,6 +193,12 @@ impl TurnRunner {
                     );
                     self.idle_notify.notify_waiters();
                     continue;
+                }
+                // The permit is queue metadata, never model input or an accepted session row.
+                for item in &mut items {
+                    if let Some(row) = item.custom_message.as_mut().and_then(Value::as_object_mut) {
+                        row.remove("nativeWorkPermit");
+                    }
                 }
                 super::queue::retain_current_gate_controls(&mut items, engine.as_ref());
                 if items.is_empty() {

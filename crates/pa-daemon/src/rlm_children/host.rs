@@ -261,6 +261,9 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 let gate = this.gate.lock().expect("gate lock");
                 kickoff_row["nativeWorkPermit"] = json!({
                     "ownerActiveSessionId":this.parent_active_session_id,
+                    "childActiveSessionId":created.active_session_id,
+                    "childSessionId":created.session_id,
+                    "startToken":gate.work_bindings.iter().find(|binding| binding.child_id == child_id).and_then(|binding| binding.start_token.as_deref()),
                     "childId":child_id,"planId":work["planId"],"stepId":work["stepId"],
                     "sourceInstanceId":gate.next_work_source.as_ref().map(|source|source.instance_id.as_str())
                 });
