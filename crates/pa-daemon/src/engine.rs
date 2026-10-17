@@ -26,9 +26,15 @@ pub use wire::{
 };
 
 mod scripted;
+pub(crate) const ORCHESTRATION_CONTROL_TYPE: &str = "orchestration_gate_control";
 
 /// The turn behavior a worker session runs.
 pub trait SessionEngine: Send + Sync {
+    /// Validate queued orchestration control immediately before execution.
+    fn orchestration_permit_is_current(&self, _permit: &Value) -> bool {
+        false
+    }
+
     /// Native task-scoped orchestration control; unsupported engines fail explicitly.
     fn orchestration_gate(
         &self,

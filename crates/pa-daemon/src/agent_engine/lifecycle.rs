@@ -127,6 +127,7 @@ impl AgentSessionEngine {
         // unseeded (None keeps the TS default "one-at-a-time").
         let queue_modes = std::sync::Mutex::new((None, None));
         Ok(Self {
+            gate_admission: std::sync::Mutex::new(None),
             runtime,
             config,
             mcp,

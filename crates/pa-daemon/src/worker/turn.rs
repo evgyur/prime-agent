@@ -117,7 +117,19 @@ impl TurnRunner {
                     None
                 }
             };
-            if let Some(items) = item {
+            if let Some(mut items) = item {
+                super::queue::retain_current_gate_controls(&mut items, engine.as_ref());
+                if items.is_empty() {
+                    self.core.lock().unwrap().busy = false;
+                    checkpoint_queue_recovery(
+                        &self.recovery,
+                        &self.core,
+                        QueueCheckpoint::Settle {
+                            operation: "queue_purged",
+                        },
+                    );
+                    continue;
+                }
                 // No pickup checkpoint: admission recorded its busy evidence; the
                 // settle's `turn_end` verdict parks the session later. The item leaves
                 // the queue projection BEFORE its turn starts (a stale row would

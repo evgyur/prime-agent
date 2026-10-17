@@ -11,6 +11,14 @@ use super::{
 };
 
 impl SessionEngine for AgentSessionEngine {
+    fn orchestration_permit_is_current(&self, permit: &Value) -> bool {
+        !self.session_is_closed()
+            && self
+                .children
+                .as_ref()
+                .is_some_and(|children| children.gate_permit_is_current(permit))
+    }
+
     fn orchestration_gate(
         &self,
         configure: Option<Value>,
@@ -1406,6 +1414,13 @@ impl SessionEngine for AgentSessionEngine {
         aborted: &dyn Fn() -> bool,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     ) {
+        if request.custom_message.as_ref().is_some_and(|row| {
+            row["customType"] == crate::engine::ORCHESTRATION_CONTROL_TYPE
+                && !self.orchestration_permit_is_current(&row["details"])
+        }) {
+            emit(EngineEvent::Done(Ok(())));
+            return;
+        }
         let mut emit = self.goal_tracking_emit(emit);
         // The accepted-turn row carries the skill-expanded text (the
         // transcript renders the skill card).

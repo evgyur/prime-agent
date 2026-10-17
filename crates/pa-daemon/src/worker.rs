@@ -471,6 +471,19 @@ impl Worker {
                     })
                 };
                 concrete.set_autonomous_admission(autonomous_sink);
+                let gate_core = Arc::clone(&core);
+                let gate_notify = Arc::clone(&work_notify);
+                let gate_recovery = Arc::clone(&recovery);
+                *concrete.gate_admission.lock().expect("gate admission lock") =
+                    Some(Arc::new(move |text, permit| {
+                        queue::admit_gate_follow_up(
+                            &gate_recovery,
+                            &gate_core,
+                            &gate_notify,
+                            text,
+                            permit,
+                        );
+                    }));
                 let purge_core = Arc::clone(&core);
                 let purge_recovery = Arc::clone(&recovery);
                 let purge_engine = Arc::downgrade(concrete);

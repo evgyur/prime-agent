@@ -303,12 +303,12 @@ impl AgentSessionEngine {
                         return;
                     }
                     let sink = self
-                        .autonomous_admission
+                        .gate_admission
                         .lock()
-                        .expect("autonomous admission lock")
+                        .expect("gate admission lock")
                         .clone();
                     if let Some(admit) = sink {
-                        admit(text);
+                        admit(text, children.gate_correction_permit());
                     }
                     return;
                 }
@@ -614,7 +614,7 @@ mod tests {
             }));
             let admitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let sink = admitted.clone();
-            engine.set_autonomous_admission(Arc::new(move |_| {
+            *engine.gate_admission.lock().unwrap() = Some(Arc::new(move |_, _| {
                 sink.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }));
             let (started_tx, started_rx) = tokio::sync::oneshot::channel();

@@ -422,11 +422,47 @@ pub(crate) fn restore_queue_snapshot(
 
 /// Admit one held autonomous continuation through the follow-up lane:
 /// the item runs as its own queue item after the current run settles.
+pub(crate) use crate::engine::ORCHESTRATION_CONTROL_TYPE;
+
+pub(crate) fn retain_current_gate_controls(
+    items: &mut Vec<QueuedItem>,
+    engine: &dyn crate::engine::SessionEngine,
+) {
+    items.retain(|item| match item.custom_message.as_ref() {
+        Some(row) if row["customType"] == ORCHESTRATION_CONTROL_TYPE => {
+            engine.orchestration_permit_is_current(&row["details"])
+        }
+        _ => true,
+    });
+}
+
+pub(crate) fn admit_gate_follow_up(
+    recovery: &std::sync::Mutex<Option<WorkerRecoveryJournal>>,
+    core: &Arc<Mutex<SessionCore>>,
+    work_notify: &Arc<Notify>,
+    text: String,
+    permit: Value,
+) {
+    let custom = serde_json::json!({"role":"custom","customType":ORCHESTRATION_CONTROL_TYPE,
+        "content":text,"display":false,"details":permit});
+    admit_continuation_follow_up(recovery, core, work_notify, text, Some(custom));
+}
+
 pub(crate) fn admit_autonomous_follow_up(
     recovery: &std::sync::Mutex<Option<WorkerRecoveryJournal>>,
     core: &Arc<Mutex<SessionCore>>,
     work_notify: &Arc<Notify>,
     text: String,
+) {
+    admit_continuation_follow_up(recovery, core, work_notify, text, None);
+}
+
+fn admit_continuation_follow_up(
+    recovery: &std::sync::Mutex<Option<WorkerRecoveryJournal>>,
+    core: &Arc<Mutex<SessionCore>>,
+    work_notify: &Arc<Notify>,
+    text: String,
+    custom_message: Option<Value>,
 ) {
     {
         let mut core = core.lock().unwrap();
@@ -434,7 +470,7 @@ pub(crate) fn admit_autonomous_follow_up(
             priority: QueuePriority::Background,
             preview: None,
             message: text,
-            custom_message: None,
+            custom_message,
             agent_message: None,
             queue_key: Some(AUTONOMOUS_QUEUE_KEY.to_string()),
             admission_id: None,
@@ -648,4 +684,112 @@ fn is_bash_completion_notice_for(
     let details = row.get("details").unwrap_or(&Value::Null);
     details.get("pid").and_then(Value::as_u64) == Some(u64::from(notice.pid))
         && details.get("command").and_then(Value::as_str) == Some(notice.command.as_str())
+}
+
+#[cfg(test)]
+mod orchestration_queue_tests {
+    use super::*;
+    use crate::engine::SessionEngine;
+    #[test]
+    fn current_gate_control_delivers_but_exception_disable_and_retask_revoke_queued_control() {
+        for change in ["exception", "disable", "retask"] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let engine = crate::agent_engine::AgentSessionEngine::new(
+                crate::agent_engine::AgentEngineConfig {
+                    cwd: dir.path().into(),
+                    agent_dir: dir.path().join("agent"),
+                    provider: None,
+                    model: None,
+                    api_key: None,
+                    thinking: None,
+                    session_dir: None,
+                    session_file: None,
+                    faux_script: None,
+                    supervisor_link: Some(crate::agent_engine::SupervisorLinkConfig {
+                        socket_path: dir.path().join("unused.sock"),
+                        active_session_id: "root".into(),
+                        worker_token: "fixture".into(),
+                    }),
+                    telemetry_disabled: Some(true),
+                    cron_store: None,
+                    queued_steering_probe: None,
+                },
+            )
+            .unwrap();
+            let children = engine.children.as_ref().unwrap();
+            let mut config = json!({"expectedRevision":0,
+                "policy":{"version":1,"enabled":true,"minActive":5,"maxActive":20,"rootWritesCode":false,"correctiveBudget":2},
+                "task":{"projectId":"p","planId":"p","stepId":"s","taskGeneration":1,"policyRevision":1},"assignments":[]});
+            engine
+                .runtime
+                .block_on(children.configure_gate(&config))
+                .unwrap();
+            let text = engine.runtime.block_on(children.gate_correction()).unwrap();
+            let permit = children.gate_correction_permit();
+            let core = Arc::new(Mutex::new(SessionCore::test_core(
+                None,
+                dir.path().display().to_string(),
+            )));
+            let notify = Arc::new(Notify::new());
+            let recovery = Mutex::new(None);
+            admit_gate_follow_up(&recovery, &core, &notify, text.clone(), permit.clone());
+            // The same production pickup path accepts the current queued permit.
+            let mut current = core.lock().unwrap().follow_up.drain(..).collect::<Vec<_>>();
+            retain_current_gate_controls(&mut current, &engine);
+            assert_eq!(current.len(), 1);
+            core.lock().unwrap().follow_up.extend(current);
+            admit_autonomous_follow_up(
+                &recovery,
+                &core,
+                &notify,
+                "ordinary autonomous obligation".into(),
+            );
+            admit_autonomous_follow_up(
+                &recovery,
+                &core,
+                &notify,
+                "terminal notice obligation".into(),
+            );
+            core.lock()
+                .unwrap()
+                .follow_up
+                .back_mut()
+                .unwrap()
+                .custom_message =
+                Some(json!({"customType":"rlm_child_terminal","content":"terminal notice"}));
+            admit_autonomous_follow_up(&recovery, &core, &notify, "ordinary user input".into());
+            config["expectedRevision"] = json!(1);
+            match change {
+                "exception" => {
+                    config["exception"] = json!({"reason":"draining","evidence":"fixture work accepted","dependency":"four workers","clearCondition":"all settle","taskGeneration":1,"policyRevision":1})
+                }
+                "disable" => config["policy"]["enabled"] = json!(false),
+                "retask" => config["task"]["taskGeneration"] = json!(2),
+                _ => unreachable!(),
+            }
+            engine
+                .runtime
+                .block_on(children.configure_gate(&config))
+                .unwrap();
+            let mut queued = core.lock().unwrap().follow_up.drain(..).collect::<Vec<_>>();
+            retain_current_gate_controls(&mut queued, &engine);
+            assert_eq!(
+                queued
+                    .iter()
+                    .map(|item| item.message.as_str())
+                    .collect::<Vec<_>>(),
+                vec![
+                    "ordinary autonomous obligation",
+                    "terminal notice obligation",
+                    "ordinary user input"
+                ]
+            );
+            // Even an item already picked before configuration cannot reach a model call.
+            let mut events = Vec::new();
+            engine.run_prompt(0,crate::engine::PromptRequest {message:text,images:Vec::new(),source:"user".into(),agent_message_id:None,
+                custom_message:Some(json!({"role":"custom","customType":ORCHESTRATION_CONTROL_TYPE,"content":"control","display":false,"details":permit})),batch:Vec::new()},
+                &||false,&mut |event|{events.push(event);true});
+            assert_eq!(events, vec![crate::engine::EngineEvent::Done(Ok(()))]);
+        }
+    }
 }

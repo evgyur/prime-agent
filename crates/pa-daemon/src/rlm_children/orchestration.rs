@@ -93,6 +93,21 @@ impl SupervisorChildSessions {
         }
         gate.revision += 1;
     }
+    pub(crate) fn gate_correction_permit(&self) -> Value {
+        let gate = self.inner.gate.lock().expect("gate lock");
+        json!({"revision":gate.pending_revision,"attempt":gate.attempts,"taskGeneration":gate.task.as_ref().map(|task|task.task_generation)})
+    }
+    pub(crate) fn gate_permit_is_current(&self, permit: &Value) -> bool {
+        let gate = self.inner.gate.lock().expect("gate lock");
+        gate.enabled()
+            && !gate.suspended
+            && gate.exception.is_none()
+            && gate.correction_pending
+            && permit["revision"].as_u64() == Some(gate.revision)
+            && permit["attempt"].as_u64() == Some(u64::from(gate.attempts))
+            && permit["taskGeneration"].as_u64()
+                == gate.task.as_ref().map(|task| task.task_generation)
+    }
     pub(crate) fn gate_correction_is_current(&self) -> bool {
         let gate = self.inner.gate.lock().expect("gate lock");
         gate.enabled()
