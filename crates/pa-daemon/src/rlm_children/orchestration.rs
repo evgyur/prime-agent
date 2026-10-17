@@ -99,6 +99,38 @@ impl Gate {
     pub(super) fn enabled(&self) -> bool {
         self.policy.as_ref().is_some_and(|p| p.enabled)
     }
+    pub(super) fn start_accounting_complete(&self, rows: &[Value], permit: &Value) -> bool {
+        if !rows.iter().any(|row| {
+            row["childId"] == permit["childId"]
+                && row["admissionGeneration"] == permit["admissionGeneration"]
+                && row["incarnation"] == permit["incarnation"]
+                && row["expectedMessageId"] == permit["expectedMessageId"]
+                && matches!(row["executionKind"].as_str(), Some("queued" | "executing"))
+        }) {
+            return false;
+        }
+        if self.assignments.iter().any(|assignment| {
+            !rows
+                .iter()
+                .any(|row| assignment_matches(assignment, row) && row["executionKind"] != "unknown")
+        }) {
+            return false;
+        }
+        rows.iter()
+            .filter(|row| row["obligation"] == true)
+            .all(|row| {
+                let current = row["childId"] == permit["childId"]
+                    && row["admissionGeneration"] == permit["admissionGeneration"]
+                    && row["incarnation"] == permit["incarnation"]
+                    && row["expectedMessageId"] == permit["expectedMessageId"]
+                    && matches!(row["executionKind"].as_str(), Some("queued" | "executing"));
+                current
+                    || self.assignments.iter().any(|assignment| {
+                        assignment_matches(assignment, row) && row["executionKind"] != "unknown"
+                    })
+            })
+    }
+
     fn same_task(&self, task: &Task) -> bool {
         self.task.as_ref().is_some_and(|t| {
             t.project_id == task.project_id

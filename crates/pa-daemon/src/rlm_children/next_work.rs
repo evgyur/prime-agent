@@ -137,6 +137,11 @@ impl SupervisorChildSessions {
 
     pub(crate) async fn begin_work_start(&self, permit: &Value) -> Result<Value> {
         self.refresh_next_work().await;
+        let revision = self.inner.gate.lock().expect("gate lock").revision;
+        let epoch = self
+            .inner
+            .accounting_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
         let child_id = permit["childId"]
             .as_str()
             .ok_or_else(|| anyhow!("Missing start child identity"))?;
@@ -159,6 +164,7 @@ impl SupervisorChildSessions {
                 2_000,
             )
             .await?;
+        let accounting = self.accounting_rows().await;
         let _admissions = self.inner.spawn_gate.lock().await;
         let row = record.lock().await;
         anyhow::ensure!(
@@ -183,6 +189,19 @@ impl SupervisorChildSessions {
             "Work start admission identity changed"
         );
         let mut gate = self.inner.gate.lock().expect("gate lock");
+        anyhow::ensure!(
+            gate.revision == revision
+                && self
+                    .inner
+                    .accounting_epoch
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    == epoch,
+            "Work start accounting changed; reconcile before admission"
+        );
+        anyhow::ensure!(
+            gate.start_accounting_complete(&accounting, permit),
+            "Work start global UNKNOWN accounting blocked"
+        );
         anyhow::ensure!(
             gate.enabled() && !gate.suspended,
             "Work start gate suspended"
@@ -1264,6 +1283,16 @@ mod tests {
         Value,
         Arc<tokio::sync::Notify>,
     ) {
+        start_fixture_with_state(json!({"workerInstanceId":"worker","isStreaming":true,"ownExecutionStarted":false,"runningMessageIds":[],"sessionActions":{"queuedCount":1}})).await
+    }
+    async fn start_fixture_with_state(
+        state: Value,
+    ) -> (
+        SupervisorChildSessions,
+        tempfile::TempDir,
+        Value,
+        Arc<tokio::sync::Notify>,
+    ) {
         use tokio::io::{AsyncBufReadExt, BufReader};
         let mut sessions = sessions();
         let source = source(&sessions, projection()).await;
@@ -1279,6 +1308,7 @@ mod tests {
             loop {
                 let stream = listener.accept().await.unwrap();
                 let state_read = server_read.clone();
+                let state = state.clone();
                 tokio::spawn(async move {
                     let (reader, mut writer) = stream.split();
                     writer.write_all(b"{\"type\":\"daemon_hello\",\"protocol\":{\"name\":\"prime-agent.daemon\",\"version\":7}}\n").await.unwrap();
@@ -1289,7 +1319,7 @@ mod tests {
                     let response = crate::protocol::response_success(
                         request["id"].as_str(),
                         "get_state",
-                        Some(json!({"workerInstanceId":"worker"})),
+                        Some(state),
                     );
                     writer
                         .write_all(
@@ -1327,6 +1357,53 @@ mod tests {
             .clone();
         let permit = json!({"childId":"B","childActiveSessionId":"active","childSessionId":"durable","planId":"p","stepId":"B","sourceInstanceId":"instance","admissionGeneration":"generation","expectedMessageId":"message","incarnation":"worker","startToken":token});
         (sessions, source, permit, state_read)
+    }
+
+    #[tokio::test]
+    async fn uncertain_current_start_does_not_consume_private_token() {
+        let (sessions, _source, permit, _) =
+            start_fixture_with_state(json!({"workerInstanceId":"worker"})).await;
+        assert!(sessions
+            .begin_work_start(&permit)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("global UNKNOWN"));
+        assert!(!sessions.inner.gate.lock().unwrap().work_bindings[0].start_permitted);
+    }
+
+    #[tokio::test]
+    async fn stale_other_assignment_blocks_known_current_start_until_supported_reconciliation() {
+        let (sessions, _source, permit, _) = start_fixture().await;
+        let status = sessions.gate_status().await;
+        let mut config = json!({"expectedRevision":status["revision"],"policy":status["policy"],"task":status["task"],
+            "assignments":[{"childId":"stale-A","admissionGeneration":"old","incarnation":"old-worker","assignmentId":"A","taskGeneration":1,"ownership":"a","acceptanceRef":"review","artifactRef":"artifact","dependenciesSatisfied":true}]});
+        // An already configured, now retired child is represented by the prior contract.
+        {
+            let mut gate = sessions.inner.gate.lock().unwrap();
+            let mut persisted = serde_json::to_value(&*gate).unwrap();
+            persisted["assignments"] = config["assignments"].clone();
+            let mut stale: Gate = serde_json::from_value(persisted).unwrap();
+            stale.next_work_source = gate.next_work_source.clone();
+            stale.next_work = gate.next_work.clone();
+            stale.work_bindings[0].start_token = gate.work_bindings[0].start_token.clone();
+            *gate = stale;
+        }
+        assert!(sessions
+            .begin_work_start(&permit)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("global UNKNOWN"));
+        assert!(!sessions.inner.gate.lock().unwrap().work_bindings[0].start_permitted);
+        config["expectedRevision"] = sessions.gate_status().await["revision"].clone();
+        config["assignments"] = json!([]);
+        sessions.configure_gate(&config).await.unwrap();
+        assert_eq!(
+            sessions.begin_work_start(&permit).await.unwrap()["workStartPermitted"],
+            true
+        );
+        assert!(sessions.begin_work_start(&permit).await.is_err());
     }
 
     #[tokio::test]
@@ -1377,6 +1454,8 @@ mod tests {
             "blocked",
             "task",
             "policy",
+            "epoch",
+            "revision",
         ] {
             let (sessions, _source, permit, state_read) = start_fixture().await;
             let admission = sessions.inner.spawn_gate.lock().await;
@@ -1395,6 +1474,15 @@ mod tests {
                     "blocked" => row.admission_blocked = true,
                     _ => {}
                 }
+            }
+            if change == "epoch" {
+                sessions
+                    .inner
+                    .accounting_epoch
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            if change == "revision" {
+                sessions.inner.gate.lock().unwrap().revision += 1;
             }
             if change == "task" || change == "policy" {
                 let mut gate = sessions.inner.gate.lock().unwrap();
