@@ -54,6 +54,15 @@ pub(crate) struct Exception {
     task_generation: u64,
     policy_revision: u64,
 }
+/// A retained management boundary, not permission to admit a model or worker turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ManagementObligation {
+    session_id: Option<String>,
+    goal_id: String,
+    task_generation: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Gate {
@@ -77,6 +86,8 @@ pub(crate) struct Gate {
     pub(super) next_work: Option<Value>,
     #[serde(default)]
     pub(super) work_bindings: Vec<super::next_work::Binding>,
+    #[serde(default)]
+    management_obligation: Option<ManagementObligation>,
 }
 impl Gate {
     pub(super) fn enabled(&self) -> bool {
@@ -101,6 +112,42 @@ impl SupervisorChildSessions {
         }
         gate.revision += 1;
     }
+    pub(crate) fn retain_management_obligation(&self, goal_id: &str) -> Result<()> {
+        let session_id = self
+            .inner
+            .identity
+            .lock()
+            .expect("identity lock")
+            .session_id
+            .clone();
+        let mut gate = self.inner.gate.lock().expect("gate lock");
+        let Some(task) = gate.task.as_ref().filter(|_| gate.enabled()) else {
+            return Ok(());
+        };
+        let obligation = ManagementObligation {
+            session_id,
+            goal_id: goal_id.to_string(),
+            task_generation: task.task_generation,
+        };
+        if gate.management_obligation.as_ref() == Some(&obligation) {
+            return Ok(());
+        }
+        let mut next = gate.clone();
+        next.management_obligation = Some(obligation);
+        self.persist_gate(&next)?;
+        *gate = next;
+        Ok(())
+    }
+
+    pub(crate) fn has_management_obligation(&self) -> bool {
+        self.inner
+            .gate
+            .lock()
+            .expect("gate lock")
+            .management_obligation
+            .is_some()
+    }
+
     pub(crate) fn gate_correction_permit(&self) -> Value {
         let gate = self.inner.gate.lock().expect("gate lock");
         json!({"revision":gate.pending_revision,"attempt":gate.attempts,"taskGeneration":gate.task.as_ref().map(|task|task.task_generation)})
@@ -298,6 +345,7 @@ impl SupervisorChildSessions {
             let mut next = guard.clone();
             if !next.same_task(&task) {
                 next.attempts = 0;
+                next.management_obligation = None;
             }
             next.revision += 1;
             next.policy = Some(policy);
@@ -390,6 +438,11 @@ impl SupervisorChildSessions {
             "decision":decision,"knownActive":active,"unknown":unknown,"observedAt":now_ms(),
             "complete":unknown==0 && !gate.suspended && !revision_changed,"exception":gate.exception,
             "correctiveAttempts":gate.attempts,"assignments":rows,
+            "managementObligation":gate.management_obligation.as_ref().map(|obligation| json!({
+                "sessionId":obligation.session_id,"goalId":obligation.goal_id,
+                "taskGeneration":obligation.task_generation,"state":if gate.correction_pending {"pending"} else {"owed"},
+                "blockReason":if gate.suspended {Some("reconciliation_required")} else if unknown > 0 {Some("unknown_obligation")} else if decision == "suspended" {Some("corrective_budget_exhausted")} else {None},
+                "admissionPermission":false})),
             "nextWorkSourceInstanceId":gate.next_work_source.as_ref().map(|source| source.instance_id.as_str()),"nextWork":next_work,"rootWritesCodeEnforcement":"policy-audit-only"})
     }
     pub(crate) async fn gate_correction(&self) -> Option<String> {
@@ -544,6 +597,62 @@ mod tests {
             "task":{"projectId":"p","planId":"plan","stepId":"step","taskGeneration":1,"policyRevision":1},
             "assignments":[]})
     }
+    #[tokio::test]
+    async fn retained_debt_never_duplicates_pending_correction() {
+        let sessions = sessions();
+        sessions.configure_gate(&configure(2)).await.unwrap();
+        sessions.retain_management_obligation("goal").unwrap();
+        assert!(sessions.gate_correction().await.is_some());
+        let permit = sessions.gate_correction_permit();
+        for _ in 0..3 {
+            sessions.retain_management_obligation("goal").unwrap();
+            assert!(sessions.gate_correction().await.is_none());
+            assert_eq!(sessions.gate_correction_permit(), permit);
+        }
+        assert_eq!(sessions.gate_status().await["correctiveAttempts"], 1);
+    }
+
+    #[tokio::test]
+    async fn management_debt_coalesces_persists_and_never_resets_exhausted_budget() {
+        let sessions = sessions();
+        let temp = tempfile::TempDir::new().unwrap();
+        sessions.set_identity(ParentIdentity {
+            session_file: Some(temp.path().join("session.jsonl").display().to_string()),
+            ..ParentIdentity::with_default_depth()
+        });
+        let mut config = configure(2);
+        sessions.configure_gate(&config).await.unwrap();
+        for _ in 0..2 {
+            sessions.gate_correction().await.unwrap();
+            sessions.consume_gate_correction();
+        }
+        sessions.retain_management_obligation("goal").unwrap();
+        let before = std::fs::read(sessions.gate_path().unwrap()).unwrap();
+        sessions.retain_management_obligation("goal").unwrap();
+        assert_eq!(
+            std::fs::read(sessions.gate_path().unwrap()).unwrap(),
+            before
+        );
+        let debt = sessions.gate_status().await["managementObligation"].clone();
+        assert_eq!(debt["blockReason"], "corrective_budget_exhausted");
+        assert_eq!(debt["admissionPermission"], false);
+        assert!(sessions.gate_correction().await.is_none());
+        sessions.restore_gate();
+        let restored = sessions.gate_status().await;
+        assert_eq!(restored["correctiveAttempts"], 2);
+        assert_eq!(restored["managementObligation"]["goalId"], "goal");
+        assert_eq!(
+            restored["managementObligation"]["blockReason"],
+            "reconciliation_required"
+        );
+        assert!(sessions.gate_correction().await.is_none());
+        config["expectedRevision"] = json!(1);
+        let reconciled = sessions.configure_gate(&config).await.unwrap();
+        assert_eq!(reconciled["correctiveAttempts"], 2);
+        assert_eq!(reconciled["managementObligation"]["goalId"], "goal");
+        assert!(sessions.gate_correction().await.is_none());
+    }
+
     #[tokio::test]
     async fn budget_is_bounded_and_reads_or_policy_revision_do_not_reset_it() {
         let sessions = sessions();

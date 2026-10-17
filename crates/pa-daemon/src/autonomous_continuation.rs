@@ -24,6 +24,18 @@ pub(crate) struct AutonomousBoundaryMirror {
 }
 
 impl AgentSessionEngine {
+    pub(crate) fn retain_management_boundary(&self) {
+        let Some(goal) = self.current_goal_state().filter(|goal| goal.active) else {
+            return;
+        };
+        let (Some(children), Some(goal_id)) = (&self.children, goal.goal_id.as_deref()) else {
+            return;
+        };
+        if let Err(error) = children.retain_management_obligation(goal_id) {
+            eprintln!("pa-daemon: management boundary persistence failed: {error:#}");
+        }
+    }
+
     pub(crate) fn gate_budget_or_quota_blocks(&self) -> bool {
         if self
             .goal_budget_crossed
@@ -140,6 +152,7 @@ impl AgentSessionEngine {
             if self.gate_budget_or_quota_blocks() {
                 return Vec::new();
             }
+            self.retain_management_boundary();
             children.consume_gate_correction();
             if message.stop_reason == pa_agent::types::StopReason::Error {
                 return Vec::new();
@@ -291,6 +304,7 @@ impl AgentSessionEngine {
                 .as_ref()
                 .filter(|children| children.gate_stops_continuation())
             {
+                self.retain_management_boundary();
                 if self.gate_budget_or_quota_blocks() {
                     return;
                 }

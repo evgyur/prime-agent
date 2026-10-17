@@ -122,6 +122,7 @@ impl AgentSessionEngine {
             .as_ref()
             .is_some_and(|children| self.runtime.block_on(children.gate_owns_goal_boundary()))
         {
+            self.retain_management_boundary();
             return GoalBoundary::End;
         }
         self.mint_goal_continuation()
@@ -731,6 +732,74 @@ mod tests {
             assert_eq!(status["correctiveAttempts"], 2);
         });
         config
+    }
+
+    #[test]
+    fn owner_source_install_failure_does_not_mint_correction() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (engine, _dir) = gated_goal_engine();
+        engine.register_arc();
+        let mut config = serde_json::json!({"expectedRevision":0,
+            "policy":{"version":1,"enabled":true,"minActive":5,"maxActive":20,
+                "rootWritesCode":false,"correctiveBudget":2},
+            "task":{"projectId":"p","planId":"plan","stepId":"step",
+                "taskGeneration":1,"policyRevision":1}, "assignments":[]});
+        let children = engine.children.as_ref().unwrap();
+        engine
+            .runtime
+            .block_on(children.configure_gate(&config))
+            .unwrap();
+        children
+            .retain_management_obligation("retained-goal")
+            .unwrap();
+        config["expectedRevision"] = serde_json::json!(1);
+        config["nextWorkSource"] = serde_json::json!({});
+        assert!(engine
+            .runtime
+            .block_on(engine.orchestration_gate(Some(config)))
+            .is_err());
+        let status = engine.runtime.block_on(children.gate_status());
+        assert_eq!(status["correctiveAttempts"], 0);
+        assert!(!children.gate_correction_is_current());
+        assert_eq!(status["managementObligation"]["goalId"], "retained-goal");
+    }
+
+    #[test]
+    fn exhausted_normal_final_retains_management_debt_without_mint() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (engine, _dir) = gated_goal_engine();
+        let mut config = exhausted_gate_exception(&engine);
+        config["expectedRevision"] = serde_json::json!(2);
+        config.as_object_mut().unwrap().remove("exception");
+        let children = engine.children.as_ref().unwrap();
+        engine
+            .runtime
+            .block_on(children.configure_gate(&config))
+            .unwrap();
+        let work = goal_admission_collector(&engine);
+        let mut events = Vec::new();
+        admit(&engine, "/goal retain owed management".into(), &mut events);
+        let status = engine.runtime.block_on(children.gate_status());
+        assert_eq!(status["correctiveAttempts"], 2);
+        assert_eq!(
+            status["managementObligation"]["blockReason"],
+            "corrective_budget_exhausted"
+        );
+        assert_eq!(status["managementObligation"]["admissionPermission"], false);
+        assert_eq!(
+            status["managementObligation"]["goalId"],
+            engine.goal_state_value()["goalId"]
+        );
+        assert!(work.lock().unwrap().is_empty());
+        assert_eq!(engine.goal_state_value()["continuationsUsed"], 0);
+        assert_eq!(
+            engine.runtime.block_on(engine.headless_goal_wait_state()),
+            HeadlessGoalWait::Settled
+        );
     }
 
     #[test]

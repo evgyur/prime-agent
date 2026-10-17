@@ -972,11 +972,27 @@ impl AgentSessionEngine {
                 }),
             );
             let configure_children = children.clone();
+            let configure_engine = self
+                .self_weak
+                .lock()
+                .expect("engine self weak lock")
+                .clone();
             handlers.register(
                 "rlm.configure_orchestration_gate",
                 pa_core::kernel::shared::host_handler(move |payload| {
                     let children = configure_children.clone();
-                    Box::pin(async move { children.configure_gate(&payload.data).await })
+                    let engine = configure_engine.clone();
+                    Box::pin(async move {
+                        let status = children.configure_gate(&payload.data).await?;
+                        if let Some(engine) = engine
+                            .as_ref()
+                            .and_then(std::sync::Weak::upgrade)
+                            .filter(|_| children.has_management_obligation())
+                        {
+                            engine.retry_owed_autonomous_continuation();
+                        }
+                        Ok(status)
+                    })
                 }),
             );
         }

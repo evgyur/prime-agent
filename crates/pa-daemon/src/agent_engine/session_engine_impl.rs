@@ -41,10 +41,19 @@ impl SessionEngine for AgentSessionEngine {
                     let source = payload
                         .as_object_mut()
                         .and_then(|object| object.remove("nextWorkSource"));
-                    let status = children.configure_gate(&payload).await?;
+                    let mut status = children.configure_gate(&payload).await?;
                     if let Some(source) = source {
                         children.install_next_work_source(&source)?;
-                        return Ok(children.gate_status().await);
+                        status = children.gate_status().await;
+                    }
+                    let engine = self
+                        .self_weak
+                        .lock()
+                        .expect("engine self weak lock")
+                        .as_ref()
+                        .and_then(std::sync::Weak::upgrade);
+                    if let Some(engine) = engine.filter(|_| children.has_management_obligation()) {
+                        engine.retry_owed_autonomous_continuation();
                     }
                     Ok(status)
                 }
