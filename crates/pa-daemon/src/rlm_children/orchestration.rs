@@ -135,6 +135,25 @@ impl SupervisorChildSessions {
         let gate = self.inner.gate.lock().expect("gate lock");
         gate.suspended || gate.enabled()
     }
+    /// Gate control owns the goal boundary only while reconciliation is
+    /// needed. A passing gate or a scoped exception is not goal completion:
+    /// it hands continuation back to the existing goal driver.
+    pub(crate) async fn gate_owns_goal_boundary(&self) -> bool {
+        let status = self.gate_status().await;
+        let gate = self.inner.gate.lock().expect("gate lock");
+        gate.suspended
+            || (gate.enabled()
+                && (status["revision"].as_u64() != Some(gate.revision)
+                    || status["accountingEpoch"].as_u64()
+                        != Some(
+                            self.inner
+                                .accounting_epoch
+                                .load(std::sync::atomic::Ordering::SeqCst),
+                        )
+                    || status["unknown"].as_u64() != Some(0)
+                    || (gate.correction_pending && gate.pending_revision == gate.revision)
+                    || !matches!(status["decision"].as_str(), Some("pass" | "exception"))))
+    }
     fn gate_path(&self) -> Option<PathBuf> {
         self.inner
             .identity
@@ -586,7 +605,36 @@ mod tests {
         let status = sessions.gate_status().await;
         assert_eq!(status["decision"], "suspended");
         assert_eq!(status["correctiveAttempts"], 1);
+        assert!(sessions.gate_owns_goal_boundary().await);
         assert!(sessions.gate_correction().await.is_none());
+    }
+    #[tokio::test]
+    async fn historical_unbound_unknown_without_obligation_does_not_hold_goal() {
+        let sessions = sessions();
+        let mut config = configure(2);
+        config["exception"] = json!({"reason":"scoped dependency", "evidence":"known input",
+            "dependency":"integration", "clearCondition":"input arrives",
+            "taskGeneration":1,"policyRevision":1});
+        sessions.configure_gate(&config).await.unwrap();
+        sessions
+            .push_test_child(RlmChildIdentity {
+                rlm_child_id: "historical".into(),
+                active_session_id: "gone".into(),
+                session_id: None,
+                session_name: "historical".into(),
+            })
+            .await;
+        let record = sessions.inner.find_record("historical").await.unwrap();
+        {
+            let mut record = record.lock().await;
+            record.settled_status = Some("completed");
+            record.settled = true;
+        }
+        let status = sessions.gate_status().await;
+        assert_eq!(status["assignments"][0]["executionKind"], "unknown");
+        assert_eq!(status["assignments"][0]["obligation"], false);
+        assert_eq!(status["unknown"], 0);
+        assert!(!sessions.gate_owns_goal_boundary().await);
     }
     #[test]
     fn five_queued_or_maintenance_rows_are_never_execution() {

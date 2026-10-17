@@ -120,7 +120,7 @@ impl AgentSessionEngine {
         if self
             .children
             .as_ref()
-            .is_some_and(|children| children.gate_stops_continuation())
+            .is_some_and(|children| self.runtime.block_on(children.gate_owns_goal_boundary()))
         {
             return GoalBoundary::End;
         }
@@ -202,12 +202,10 @@ impl AgentSessionEngine {
     /// The settle-site body: exactly-once delivery under the driver lock,
     /// deferral kept while descendants or queued input own the boundary.
     async fn goal_children_settled(&self) {
-        if self
-            .children
-            .as_ref()
-            .is_some_and(|children| children.gate_stops_continuation())
-        {
-            return;
+        if let Some(children) = &self.children {
+            if children.gate_owns_goal_boundary().await {
+                return;
+            }
         }
         // A closed session (killed/stopped) drops the retry.
         if self.session_is_closed() {
@@ -561,7 +559,7 @@ mod tests {
     use crate::agent_engine::tests::{
         admit, faux_engine_with_settings, goal_admission_collector, FAUX_TEST_LOCK,
     };
-    use crate::engine::EngineEvent;
+    use crate::engine::{EngineEvent, SessionEngine};
 
     /// Inject the engine's background-bash liveness probe (a `true`
     /// probe = a live background `bash()` handle).
@@ -679,6 +677,259 @@ mod tests {
             HeadlessGoalWait::Pending
         );
         *engine.goal_backoff_wake_job_id.lock().unwrap() = None;
+    }
+
+    fn gated_goal_engine() -> (Arc<AgentSessionEngine>, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = AgentSessionEngine::new(crate::agent_engine::AgentEngineConfig {
+            cwd: dir.path().into(),
+            agent_dir: dir.path().join("agent"),
+            provider: None,
+            model: None,
+            api_key: None,
+            thinking: None,
+            session_dir: None,
+            session_file: None,
+            faux_script: Some(
+                serde_json::json!({"responses":[
+                {"text":"goal started"}, {"text":"child result accepted"},
+                {"text":"useful next work"}]})
+                .to_string(),
+            ),
+            supervisor_link: Some(crate::agent_engine::SupervisorLinkConfig {
+                socket_path: dir.path().join("unused.sock"),
+                active_session_id: "root".into(),
+                worker_token: "fixture".into(),
+            }),
+            telemetry_disabled: Some(true),
+            cron_store: None,
+            queued_steering_probe: None,
+        })
+        .unwrap();
+        (Arc::new(engine), dir)
+    }
+
+    fn exhausted_gate_exception(engine: &AgentSessionEngine) -> serde_json::Value {
+        let children = engine.children.as_ref().unwrap();
+        let mut config = serde_json::json!({"expectedRevision":0,
+            "policy":{"version":1,"enabled":true,"minActive":5,"maxActive":20,
+                "rootWritesCode":false,"correctiveBudget":2},
+            "task":{"projectId":"p","planId":"plan","stepId":"step",
+                "taskGeneration":1,"policyRevision":1}, "assignments":[]});
+        engine.runtime.block_on(async {
+            children.configure_gate(&config).await.unwrap();
+            for _ in 0..2 {
+                assert!(children.gate_correction().await.is_some());
+                children.consume_gate_correction();
+            }
+            config["expectedRevision"] = serde_json::json!(1);
+            config["exception"] = serde_json::json!({"reason":"concrete_dependency_execution",
+                "evidence":"integration waits; independent work remains", "dependency":"integration input",
+                "clearCondition":"input arrives", "taskGeneration":1,"policyRevision":1});
+            let status = children.configure_gate(&config).await.unwrap();
+            assert_eq!(status["decision"], "exception");
+            assert_eq!(status["correctiveAttempts"], 2);
+        });
+        config
+    }
+
+    #[test]
+    fn v1_exception_hands_terminal_and_child_notice_back_to_goal() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (engine, _dir) = gated_goal_engine();
+        exhausted_gate_exception(&engine);
+        let work = goal_admission_collector(&engine);
+        let mut events = Vec::new();
+        admit(
+            &engine,
+            "/goal continue independent work".into(),
+            &mut events,
+        );
+        assert_eq!(events.last(), Some(&EngineEvent::Done(Ok(()))));
+        let minted = work.lock().unwrap().drain(..).collect::<Vec<_>>();
+        let [GoalTurnEndWork::Continuation(first)] = minted.as_slice() else {
+            panic!("expected one goal continuation");
+        };
+        let first = first.request.clone();
+        assert_eq!(engine.goal_state_value()["continuationsUsed"], 1);
+        // A real terminal-notification turn must re-consult the active goal.
+        events.clear();
+        let notice = serde_json::json!({"role":"custom", "customType":"rlm_child_terminal_notice",
+            "content":"child completed", "display":true, "details":{"childId":"child"},
+            "timestamp":crate::util::now_ms()});
+        engine.run_prompt(
+            0,
+            PromptRequest {
+                message: "child completed".into(),
+                images: vec![],
+                source: "user".into(),
+                agent_message_id: None,
+                custom_message: Some(notice),
+                batch: vec![],
+            },
+            &|| false,
+            &mut |event| {
+                events.push(event);
+                true
+            },
+        );
+        assert_eq!(events.last(), Some(&EngineEvent::Done(Ok(()))));
+        assert_eq!(work.lock().unwrap().len(), 1);
+        assert_eq!(engine.goal_state_value()["continuationsUsed"], 2);
+        // Dispatch the actual minted row through the same engine consumer.
+        events.clear();
+        engine.run_prompt(0, first, &|| false, &mut |event| {
+            events.push(event);
+            true
+        });
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, EngineEvent::CustomMessage(row)
+            if row["customType"] == "goal_context")));
+    }
+
+    #[test]
+    fn v1_exception_keeps_child_debt_and_settles_exactly_once() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (engine, _dir) = gated_goal_engine();
+        exhausted_gate_exception(&engine);
+        let work = goal_admission_collector(&engine);
+        let children = engine.children.as_ref().unwrap();
+        let mut events = Vec::new();
+        admit(
+            &engine,
+            "warm session before wiring bash probe".into(),
+            &mut events,
+        );
+        set_background_bash_probe(&engine, Arc::new(|| true));
+        assert!(engine.has_live_background_bash_handles());
+        admit(&engine, "/goal wait for actual child".into(), &mut events);
+        assert!(engine.has_live_background_bash_handles());
+        assert!(work.lock().unwrap().is_empty());
+        engine.runtime.block_on(
+            children.push_test_child(crate::rlm_children::RlmChildIdentity {
+                rlm_child_id: "child".into(),
+                active_session_id: "child-session".into(),
+                session_id: None,
+                session_name: "worker".into(),
+            }),
+        );
+        set_background_bash_probe(&engine, Arc::new(|| false));
+        assert!(
+            engine.runtime.block_on(children.gate_owns_goal_boundary()),
+            "an unbound UNKNOWN child retains gate ownership despite the exception"
+        );
+        assert!(work.lock().unwrap().is_empty());
+        let handles = engine.goal_runtime.lock().unwrap().clone().unwrap();
+        assert!(engine
+            .runtime
+            .block_on(async { handles.driver.lock().await.owes_continuation() }));
+        engine.runtime.block_on(async {
+            engine.goal_children_settled().await;
+            assert!(work.lock().unwrap().is_empty());
+            children.cancel_child_run("child").await;
+            engine.goal_children_settled().await;
+            engine.goal_children_settled().await;
+        });
+        assert_eq!(work.lock().unwrap().len(), 1);
+        assert_eq!(engine.goal_state_value()["continuationsUsed"], 1);
+    }
+
+    #[test]
+    fn pending_gate_control_keeps_goal_boundary() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (engine, _dir) = gated_goal_engine();
+        let mut config = exhausted_gate_exception(&engine);
+        let work = goal_admission_collector(&engine);
+        let children = engine.children.as_ref().unwrap();
+        // Reconcile to a new task requiring correction, with a pending control.
+        config["expectedRevision"] = serde_json::json!(2);
+        config["task"]["taskGeneration"] = serde_json::json!(2);
+        config["exception"] = serde_json::Value::Null;
+        engine.runtime.block_on(async {
+            children.configure_gate(&config).await.unwrap();
+            assert!(children.gate_correction().await.is_some());
+            assert!(children.gate_owns_goal_boundary().await);
+        });
+        let mut events = Vec::new();
+        admit(&engine, "/goal no duplicate gate turn".into(), &mut events);
+        assert!(work.lock().unwrap().is_empty());
+        assert_eq!(engine.goal_state_value()["continuationsUsed"], 0);
+    }
+
+    #[test]
+    fn exception_goal_still_respects_pause_completion_close_and_input() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for stop in ["pause", "complete", "close", "input"] {
+            let (engine, _dir) = gated_goal_engine();
+            exhausted_gate_exception(&engine);
+            let work = goal_admission_collector(&engine);
+            let mut events = Vec::new();
+            admit(&engine, "/goal bounded continuation".into(), &mut events);
+            work.lock().unwrap().clear();
+            let count = engine.goal_state_value()["continuationsUsed"].clone();
+            match stop {
+                "pause" => admit(&engine, "/goal pause".into(), &mut events),
+                "complete" => {
+                    let handles = engine.goal_runtime.lock().unwrap().clone().unwrap();
+                    engine.runtime.block_on(async {
+                        let mut driver = handles.driver.lock().await;
+                        let mut session = handles.session.lock().await;
+                        driver.complete(&mut session).unwrap();
+                    });
+                }
+                "close" => engine.mark_session_closed(),
+                "input" => *engine.goal_input_probe.lock().unwrap() = Some(Arc::new(|| true)),
+                _ => unreachable!(),
+            }
+            engine.goal_turn_end_boundary();
+            engine.runtime.block_on(engine.goal_children_settled());
+            assert!(work.lock().unwrap().is_empty(), "stop={stop}");
+            assert_eq!(
+                engine.goal_state_value()["continuationsUsed"],
+                count,
+                "stop={stop}"
+            );
+        }
+    }
+
+    #[test]
+    fn recovered_exception_suspends_until_explicit_reconciliation() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (engine, dir) = gated_goal_engine();
+        let children = engine.children.as_ref().unwrap();
+        children.set_identity(crate::rlm_children::ParentIdentity {
+            session_file: Some(dir.path().join("gate-session.jsonl").display().to_string()),
+            ..crate::rlm_children::ParentIdentity::with_default_depth()
+        });
+        let mut config = exhausted_gate_exception(&engine);
+        children.restore_gate();
+        assert!(engine.runtime.block_on(children.gate_owns_goal_boundary()));
+        let work = goal_admission_collector(&engine);
+        let mut events = Vec::new();
+        admit(
+            &engine,
+            "/goal recovery requires reconciliation".into(),
+            &mut events,
+        );
+        assert!(work.lock().unwrap().is_empty());
+        config["expectedRevision"] = serde_json::json!(2);
+        engine
+            .runtime
+            .block_on(children.configure_gate(&config))
+            .unwrap();
+        engine.goal_turn_end_boundary();
+        assert_eq!(work.lock().unwrap().len(), 1);
     }
 
     #[test]
