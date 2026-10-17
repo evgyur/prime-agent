@@ -140,6 +140,7 @@ pub(crate) struct ResidentWorker {
     pub(crate) compaction: crate::compaction_supervision::CompactionSupervision,
     /// The pending owner-disconnect stop (TS `ownerCleanupTimer`).
     pub(crate) owner_cleanup: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
+    pub(crate) owner_cleanup_running: AtomicBool,
     /// The client-forwarded launch env (TS `ResidentWorker.launchEnv`):
     /// in memory ONLY — never the descriptor, never the durable create
     /// command, never the update roster. The spawn merges it under the
@@ -196,6 +197,7 @@ impl ResidentWorker {
             connection_epoch: AtomicU64::new(0),
             compaction: crate::compaction_supervision::CompactionSupervision::default(),
             owner_cleanup: std::sync::Mutex::new(None),
+            owner_cleanup_running: AtomicBool::new(false),
             launch_env: std::sync::Mutex::new(None),
         })
     }

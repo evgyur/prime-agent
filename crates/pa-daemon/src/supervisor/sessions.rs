@@ -636,6 +636,10 @@ impl Supervisor {
                 self.spawn_seeded_hydration(seeded);
             }
         }
+        let mut summary = summary;
+        if let Some(identity) = self.owned_worker_cleanup_identity(&resident).await {
+            summary["ownedWorkerCleanup"] = serde_json::to_value(identity)?;
+        }
         Ok(summary)
     }
 

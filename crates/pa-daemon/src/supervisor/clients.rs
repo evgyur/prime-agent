@@ -15,6 +15,28 @@ use super::{
 /// keeps running after its owner's last connection closes.
 const OWNED_WORKER_DISCONNECT_GRACE: Duration = Duration::from_secs(30);
 
+struct OwnedCleanupRunning {
+    supervisor: Arc<Supervisor>,
+    resident: Arc<ResidentWorker>,
+    identity: Option<crate::ownership::OwnedWorkerCleanupIdentity>,
+}
+
+impl Drop for OwnedCleanupRunning {
+    fn drop(&mut self) {
+        self.resident
+            .owner_cleanup_running
+            .store(false, Ordering::SeqCst);
+        if let Some(identity) = &self.identity {
+            self.supervisor
+                .owner_cleanup_receipts
+                .lock()
+                .unwrap()
+                .retain(|(existing, verified)| existing != identity || *verified);
+        }
+        self.supervisor.owner_cleanup_notify.notify_waiters();
+    }
+}
+
 async fn write_line<W: AsyncWriteExt + Unpin>(writer: &mut W, value: &Value) -> Result<usize> {
     let mut line = serde_json::to_string(value)?;
     line.push('\n');
@@ -133,7 +155,7 @@ impl Supervisor {
                 entrypoint_path: None,
                 launcher_path: None,
             }),
-            supervisor_generation: Some(format!("sup:{}", std::process::id())),
+            supervisor_generation: Some(self.owner_cleanup_generation.clone()),
             supervisor_pid: Some(u64::from(std::process::id())),
             supervisor_owner_token: Some(uuid::Uuid::new_v4().to_string()),
             supervisor_process_start_id: crate::protocol::process_start_id(std::process::id()),
@@ -398,6 +420,7 @@ impl Supervisor {
         if self.client_connected(&owner) {
             return;
         }
+        let cleanup_identity = self.owned_worker_cleanup_identity(resident).await;
         let supervisor = Arc::clone(self);
         let timer_resident = Arc::clone(resident);
         let deadline = tokio::time::Instant::now() + OWNED_WORKER_DISCONNECT_GRACE;
@@ -411,8 +434,23 @@ impl Supervisor {
                 if slot.as_ref().map(tokio::task::AbortHandle::id) != Some(tokio::task::id()) {
                     return;
                 }
+                timer_resident
+                    .owner_cleanup_running
+                    .store(true, Ordering::SeqCst);
+                if let Some(identity) = &cleanup_identity {
+                    let mut receipts = supervisor.owner_cleanup_receipts.lock().unwrap();
+                    if receipts.len() == 1024 {
+                        receipts.pop_front();
+                    }
+                    receipts.push_back((identity.clone(), false));
+                }
                 slot.take();
             }
+            let _running = OwnedCleanupRunning {
+                supervisor: Arc::clone(&supervisor),
+                resident: Arc::clone(&timer_resident),
+                identity: cleanup_identity.clone(),
+            };
             if supervisor.shutting_down.load(Ordering::SeqCst) {
                 return;
             }
@@ -441,11 +479,30 @@ impl Supervisor {
             if supervisor.client_connected(&owner) {
                 return;
             }
+            // A relaunch can reuse the resident Arc: the captured incarnation
+            // must still match before an old disconnect may claim its stop.
+            if supervisor
+                .owned_worker_cleanup_identity(&timer_resident)
+                .await
+                != cleanup_identity
+            {
+                return;
+            }
+            if supervisor.client_connected(&owner) {
+                return;
+            }
             match supervisor.stop_worker(&timer_resident).await {
-                Ok(()) => supervisor.log_line(&format!(
-                    "stopped client-owned worker {} after its owner {owner} disconnected",
-                    timer_resident.worker_id
-                )),
+                Ok(()) => {
+                    // Only stop_worker success proves the durable tombstone and
+                    // PID/start-identity exit checks completed. Never infer from absence.
+                    if let Some(identity) = cleanup_identity {
+                        supervisor.record_owned_worker_cleanup(identity);
+                    }
+                    supervisor.log_line(&format!(
+                        "stopped client-owned worker {} after its owner {owner} disconnected",
+                        timer_resident.worker_id
+                    ));
+                }
                 Err(error) => supervisor.log_line(&format!(
                     "could not clean up client-owned worker {}: {error:#}",
                     timer_resident.worker_id
@@ -851,6 +908,10 @@ impl Supervisor {
             DaemonCommand::CancelPromptAdmission { .. } => {
                 // The supervisor's status ladder over the admission registry.
                 self.handle_cancel_prompt_admission(connection, command, &command_id, &type_name)
+                    .await
+            }
+            DaemonCommand::GetOwnedWorkerCleanup { .. } => {
+                self.handle_get_owned_worker_cleanup(command, &command_id, &type_name)
                     .await
             }
             DaemonCommand::CompleteOwnedSession { .. } => {
@@ -1529,5 +1590,89 @@ mod tests {
         })
         .await;
         assert!(stopped.is_ok(), "the owned worker was never stopped");
+    }
+}
+
+#[cfg(test)]
+mod owned_cleanup_tests {
+    use super::*;
+
+    async fn fixture() -> (tempfile::TempDir, Arc<Supervisor>, Arc<ResidentWorker>) {
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = Arc::new(
+            Supervisor::new(super::super::SupervisorOptions {
+                socket_path: dir.path().join("daemon.sock"),
+                agent_dir: dir.path().join("agent"),
+            })
+            .unwrap(),
+        );
+        let descriptor = serde_json::from_value(json!({
+            "version":2,"workerId":"w-a","workerInstanceId":"i-a","pid":0,
+            "socketPath":dir.path().join("missing.sock"), "recoveryJournalPath":dir.path().join("recovery"),
+            "supervisorSocketPath":dir.path().join("daemon.sock"),"authenticationToken":"test",
+            "rootActiveSessionId":"w-a","ownerClientId":"old-owner",
+            "createdAt":"2026-10-17T00:00:00Z","updatedAt":"2026-10-17T00:00:00Z",
+            "lifecycle":"ready","createCommand":{},"consecutiveFailures":0
+        })).unwrap();
+        let resident = ResidentWorker::new("w-a".into(), descriptor, dir.path().join("w-a.json"));
+        supervisor.registry.insert(Arc::clone(&resident)).await;
+        (dir, supervisor, resident)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_disconnect_cannot_stop_reowned_or_relaunched_resident() {
+        for replace_instance in [false, true] {
+            let (_dir, supervisor, resident) = fixture().await;
+            supervisor.schedule_owned_worker_cleanup(&resident).await;
+            {
+                let mut descriptor = resident.descriptor.lock().await;
+                if replace_instance {
+                    descriptor.worker_instance_id = Some("i-new".into());
+                } else {
+                    descriptor.owner_client_id = Some("new-owner".into());
+                }
+            }
+            tokio::task::yield_now().await;
+            tokio::time::advance(OWNED_WORKER_DISCONNECT_GRACE).await;
+            tokio::task::yield_now().await;
+            assert!(resident.descriptor.lock().await.stop_requested_at.is_none());
+            assert!(supervisor.owner_cleanup_receipts.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn owner_reconnect_cancels_cleanup_without_a_receipt() {
+        let (_dir, supervisor, resident) = fixture().await;
+        supervisor.schedule_owned_worker_cleanup(&resident).await;
+        supervisor.client_connections.lock().unwrap().insert(
+            "reconnected".into(),
+            Arc::new(std::sync::Mutex::new("old-owner".into())),
+        );
+        tokio::task::yield_now().await;
+        tokio::time::advance(OWNED_WORKER_DISCONNECT_GRACE).await;
+        tokio::task::yield_now().await;
+        assert!(resident.descriptor.lock().await.stop_requested_at.is_none());
+        assert!(supervisor.owner_cleanup_receipts.lock().unwrap().is_empty());
+        assert!(!resident.owner_cleanup_running.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disconnect_stop_publishes_only_after_tombstone_and_verified_exit() {
+        let (_dir, supervisor, resident) = fixture().await;
+        supervisor.schedule_owned_worker_cleanup(&resident).await;
+        assert!(supervisor.owner_cleanup_receipts.lock().unwrap().is_empty());
+        tokio::task::yield_now().await;
+        tokio::time::advance(OWNED_WORKER_DISCONNECT_GRACE).await;
+        let notified = supervisor.owner_cleanup_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if supervisor.owner_cleanup_receipts.lock().unwrap().is_empty() {
+            tokio::time::timeout(Duration::from_secs(60), notified)
+                .await
+                .unwrap();
+        }
+        assert!(resident.descriptor.lock().await.stop_requested_at.is_some());
+        assert!(supervisor.registry.get("w-a").await.is_none());
+        assert_eq!(supervisor.owner_cleanup_receipts.lock().unwrap().len(), 1);
     }
 }

@@ -72,6 +72,7 @@ pub const KNOWN_COMMAND_TYPES: &[&str] = &[
     "roster_subscribe",
     "roster_unsubscribe",
     "list_saved_sessions",
+    "get_owned_worker_cleanup",
     "create",
     "attach",
     "reattach",
@@ -630,6 +631,9 @@ pub fn command_active_session_id(command: &DaemonCommand) -> Option<&str> {
         | DaemonCommand::Reattach {
             active_session_id, ..
         }
+        | DaemonCommand::GetOwnedWorkerCleanup {
+            active_session_id, ..
+        }
         | DaemonCommand::CompleteOwnedSession {
             active_session_id, ..
         }
@@ -983,6 +987,7 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
         DaemonCommand::Attach { .. } => "attach",
         DaemonCommand::Reattach { .. } => "reattach",
         DaemonCommand::Detach { .. } => "detach",
+        DaemonCommand::GetOwnedWorkerCleanup { .. } => "get_owned_worker_cleanup",
         DaemonCommand::CompleteOwnedSession { .. } => "complete_owned_session",
         DaemonCommand::PromoteOwnedSession { .. } => "promote_owned_session",
         DaemonCommand::Kill { .. } => "kill",

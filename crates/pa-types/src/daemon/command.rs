@@ -272,6 +272,19 @@ pub enum DaemonCommand {
         #[serde(flatten)]
         rest: JsonMap,
     },
+    GetOwnedWorkerCleanup {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        worker_id: String,
+        worker_instance_id: String,
+        owner_client_id: String,
+        supervisor_generation: String,
+        #[serde(default)]
+        wait_timeout_ms: u64,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
     CompleteOwnedSession {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,

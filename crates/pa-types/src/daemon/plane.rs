@@ -130,6 +130,7 @@ const READ_ONLY_DAEMON_COMMANDS: &[&str] = &[
     "get_session_header",
     "get_state",
     "get_connection_state",
+    "get_owned_worker_cleanup",
     "get_messages",
     "get_rlm_children",
     "get_orchestration_gate",

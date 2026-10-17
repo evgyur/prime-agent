@@ -145,6 +145,11 @@ pub struct Supervisor {
     /// one `daemon event` summary per window instead of one event each.
     daemon_event_counts: std::sync::Mutex<notes::DaemonEventCounts>,
     pub(crate) registry: SessionRegistry,
+    pub(crate) owner_cleanup_generation: String,
+    pub(crate) owner_cleanup_receipts: std::sync::Mutex<
+        std::collections::VecDeque<(crate::ownership::OwnedWorkerCleanupIdentity, bool)>,
+    >,
+    pub(crate) owner_cleanup_notify: tokio::sync::Notify,
     /// Worker outbound frames, with their client routing. The payload is shared (`Arc`):
     /// a per-receiver deep `Value` clone would multiply the heap by the connection
     /// count on every event.
@@ -260,6 +265,9 @@ impl Supervisor {
             telemetry: std::sync::Mutex::new(None),
             daemon_event_counts: std::sync::Mutex::default(),
             registry: SessionRegistry::new(),
+            owner_cleanup_generation: uuid::Uuid::new_v4().to_string(),
+            owner_cleanup_receipts: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            owner_cleanup_notify: tokio::sync::Notify::new(),
             events,
             session_subscribers: subscribers::SessionSubscribers::new(),
             client_connections: std::sync::Mutex::new(std::collections::HashMap::new()),

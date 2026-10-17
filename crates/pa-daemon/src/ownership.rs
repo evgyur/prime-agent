@@ -15,7 +15,142 @@ use crate::protocol::{response_failure, response_line, response_success};
 use crate::registry::ResidentWorker;
 use crate::supervisor::{Supervisor, ROUTE_TIMEOUT_MS};
 
+/// Exact create-time identity. Not a stop permit; readers never mutate a worker.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OwnedWorkerCleanupIdentity {
+    pub active_session_id: String,
+    pub worker_id: String,
+    pub worker_instance_id: String,
+    pub owner_client_id: String,
+    pub supervisor_generation: String,
+}
+
 impl Supervisor {
+    pub(crate) async fn owned_worker_cleanup_identity(
+        &self,
+        resident: &Arc<ResidentWorker>,
+    ) -> Option<OwnedWorkerCleanupIdentity> {
+        let descriptor = resident.descriptor.lock().await;
+        Some(OwnedWorkerCleanupIdentity {
+            active_session_id: descriptor.root_active_session_id.clone(),
+            worker_id: resident.worker_id.clone(),
+            worker_instance_id: descriptor.worker_instance_id.clone()?,
+            owner_client_id: descriptor.owner_client_id.clone()?,
+            supervisor_generation: self.owner_cleanup_generation.clone(),
+        })
+    }
+
+    pub(crate) fn record_owned_worker_cleanup(&self, identity: OwnedWorkerCleanupIdentity) {
+        let mut receipts = self.owner_cleanup_receipts.lock().unwrap();
+        // Bounded process-local acknowledgements, never a durable lifecycle database.
+        if receipts.len() == 1024 {
+            receipts.pop_front();
+        }
+        receipts.retain(|(existing, _)| existing != &identity);
+        receipts.push_back((identity, true));
+        drop(receipts);
+        self.owner_cleanup_notify.notify_waiters();
+    }
+
+    async fn owned_worker_cleanup_status(
+        &self,
+        identity: &OwnedWorkerCleanupIdentity,
+    ) -> &'static str {
+        if identity.supervisor_generation != self.owner_cleanup_generation {
+            return "unverified";
+        }
+        if let Some((_, verified)) = self
+            .owner_cleanup_receipts
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(existing, _)| existing == identity)
+        {
+            return if *verified {
+                "verified_stopped"
+            } else {
+                "pending"
+            };
+        }
+        let Some(resident) = self.registry.get(&identity.worker_id).await else {
+            return "unverified";
+        };
+        if self.owned_worker_cleanup_identity(&resident).await.as_ref() != Some(identity) {
+            return "unverified";
+        }
+        if resident.owner_cleanup.lock().unwrap().is_some()
+            || resident
+                .owner_cleanup_running
+                .load(std::sync::atomic::Ordering::SeqCst)
+            || resident
+                .intentional_stop
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            "pending"
+        } else {
+            "unverified"
+        }
+    }
+
+    /// Read-only observation of the existing disconnect cleanup. In particular,
+    /// absence is not proof and selectors never follow durable-session rebindings.
+    pub(crate) async fn handle_get_owned_worker_cleanup(
+        &self,
+        command: &DaemonCommand,
+        command_id: &str,
+        type_name: &str,
+    ) -> (Vec<Value>, bool) {
+        let DaemonCommand::GetOwnedWorkerCleanup {
+            active_session_id,
+            worker_id,
+            worker_instance_id,
+            owner_client_id,
+            supervisor_generation,
+            wait_timeout_ms,
+            ..
+        } = command
+        else {
+            return Self::owned_failure(command_id, type_name, "invalid command");
+        };
+        if *wait_timeout_ms > 30_000 {
+            return Self::owned_failure(
+                command_id,
+                type_name,
+                "waitTimeoutMs must be at most 30000",
+            );
+        }
+        let identity = OwnedWorkerCleanupIdentity {
+            active_session_id: active_session_id.clone(),
+            worker_id: worker_id.clone(),
+            worker_instance_id: worker_instance_id.clone(),
+            owner_client_id: owner_client_id.clone(),
+            supervisor_generation: supervisor_generation.clone(),
+        };
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(*wait_timeout_ms);
+        let status = loop {
+            let notified = self.owner_cleanup_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let status = self.owned_worker_cleanup_status(&identity).await;
+            if status != "pending" || *wait_timeout_ms == 0 {
+                break status;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                break self.owned_worker_cleanup_status(&identity).await;
+            }
+        };
+        (
+            vec![response_line(&response_success(
+                Some(command_id),
+                type_name,
+                Some(json!({ "status": status })),
+            ))],
+            false,
+        )
+    }
+
     /// Resolve the resident a `retry_worker` targets: the direct match on
     /// the root active session id or the root persisted session id, then
     /// the generic selector resolution. This is the ONE descriptor-scan
@@ -294,6 +429,138 @@ mod tests {
     use crate::supervisor::Supervisor;
     use crate::supervisor_roster::WorkerRosterDelta;
 
+    #[tokio::test]
+    async fn cleanup_receipts_require_exact_identity_and_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = supervisor_with_stale_identity(dir.path()).await;
+        let resident = supervisor.registry.get("w-a").await.unwrap();
+        {
+            let mut descriptor = resident.descriptor.lock().await;
+            descriptor.owner_client_id = Some("old-owner".into());
+            descriptor.worker_instance_id = Some("instance-a".into());
+        }
+        let identity = supervisor
+            .owned_worker_cleanup_identity(&resident)
+            .await
+            .unwrap();
+        assert_eq!(
+            supervisor.owned_worker_cleanup_status(&identity).await,
+            "unverified"
+        );
+        // Timer already claimed (slot empty), before any awaited owner checks or tombstone.
+        resident
+            .owner_cleanup_running
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            supervisor.owned_worker_cleanup_status(&identity).await,
+            "pending"
+        );
+        resident
+            .owner_cleanup_running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        resident
+            .intentional_stop
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            supervisor.owned_worker_cleanup_status(&identity).await,
+            "pending"
+        );
+        let mut other = identity.clone();
+        other.owner_client_id = "new-owner".into();
+        assert_eq!(
+            supervisor.owned_worker_cleanup_status(&other).await,
+            "unverified"
+        );
+        other = identity.clone();
+        other.worker_instance_id = "replacement-instance".into();
+        assert_eq!(
+            supervisor.owned_worker_cleanup_status(&other).await,
+            "unverified"
+        );
+        supervisor
+            .owner_cleanup_receipts
+            .lock()
+            .unwrap()
+            .push_back((identity.clone(), false));
+        supervisor.registry.remove("w-a").await;
+        assert_eq!(
+            supervisor.owned_worker_cleanup_status(&identity).await,
+            "pending",
+            "registry retirement before stop returns is still pending, never absence proof"
+        );
+        supervisor.owner_cleanup_receipts.lock().unwrap().clear();
+        assert_eq!(
+            supervisor.owned_worker_cleanup_status(&identity).await,
+            "unverified"
+        );
+        // Only the existing stop-success caller may publish its proof.
+        supervisor.record_owned_worker_cleanup(identity.clone());
+        assert_eq!(
+            supervisor.owned_worker_cleanup_status(&identity).await,
+            "verified_stopped"
+        );
+        let restarted = supervisor_with_stale_identity(dir.path()).await;
+        assert_eq!(
+            restarted.owned_worker_cleanup_status(&identity).await,
+            "unverified"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_wait_is_read_only_bounded_and_cancellation_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = supervisor_with_stale_identity(dir.path()).await;
+        let resident = supervisor.registry.get("w-a").await.unwrap();
+        {
+            let mut descriptor = resident.descriptor.lock().await;
+            descriptor.owner_client_id = Some("old-owner".into());
+            descriptor.worker_instance_id = Some("instance-a".into());
+        }
+        let identity = supervisor
+            .owned_worker_cleanup_identity(&resident)
+            .await
+            .unwrap();
+        resident
+            .intentional_stop
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut value = serde_json::to_value(&identity).unwrap();
+        value["type"] = json!("get_owned_worker_cleanup");
+        value["waitTimeoutMs"] = json!(30_000);
+        let command: DaemonCommand = serde_json::from_value(value.clone()).unwrap();
+        let waiting_supervisor = Arc::clone(&supervisor);
+        let waiting_command = command.clone();
+        let wait = tokio::spawn(async move {
+            waiting_supervisor
+                .handle_get_owned_worker_cleanup(
+                    &waiting_command,
+                    "read",
+                    "get_owned_worker_cleanup",
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!wait.is_finished());
+        wait.abort();
+        let _ = wait.await;
+        assert!(resident.descriptor.lock().await.stop_requested_at.is_none());
+        let waiting_supervisor = Arc::clone(&supervisor);
+        let wait = tokio::spawn(async move {
+            waiting_supervisor
+                .handle_get_owned_worker_cleanup(&command, "read", "get_owned_worker_cleanup")
+                .await
+        });
+        tokio::task::yield_now().await;
+        supervisor.record_owned_worker_cleanup(identity);
+        let (reply, _) = wait.await.unwrap();
+        assert_eq!(reply[0]["data"]["status"], "verified_stopped");
+        value["waitTimeoutMs"] = json!(30_001);
+        let command: DaemonCommand = serde_json::from_value(value).unwrap();
+        let (reply, _) = supervisor
+            .handle_get_owned_worker_cleanup(&command, "read", "get_owned_worker_cleanup")
+            .await;
+        assert_eq!(reply[0]["success"], false);
+    }
+
     /// One supervisor with one registered resident whose persisted identity
     /// (`s0` / `s0.jsonl`) the quarantine fence must never serve.
     async fn supervisor_with_stale_identity(dir: &std::path::Path) -> Arc<Supervisor> {
@@ -465,5 +732,9 @@ mod tests {
         assert!(descriptor_path.exists(), "durable tombstone remains");
         assert!(resident.descriptor.lock().await.stop_requested_at.is_some());
         assert!(supervisor.registry.get("w-live").await.is_some());
+        assert!(
+            supervisor.owner_cleanup_receipts.lock().unwrap().is_empty(),
+            "failed exit verification must never publish a cleanup receipt"
+        );
     }
 }
