@@ -18,6 +18,8 @@ pub(crate) struct Policy {
     root_writes_code: bool,
     #[serde(default = "default_budget")]
     corrective_budget: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) managed_pass_policy: Option<String>,
 }
 fn default_budget() -> u32 {
     DEFAULT_CORRECTIVE_BUDGET
@@ -28,8 +30,8 @@ pub(crate) struct Task {
     project_id: String,
     plan_id: String,
     step_id: String,
-    task_generation: u64,
-    policy_revision: u64,
+    pub(super) task_generation: u64,
+    pub(super) policy_revision: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -88,6 +90,8 @@ pub(crate) struct Gate {
     pub(super) work_bindings: Vec<super::next_work::Binding>,
     #[serde(default)]
     management_obligation: Option<ManagementObligation>,
+    #[serde(default)]
+    pub(super) management_scope: Option<Value>,
 }
 impl Gate {
     pub(super) fn enabled(&self) -> bool {
@@ -249,24 +253,43 @@ impl SupervisorChildSessions {
         }
     }
     pub(crate) async fn configure_gate(&self, payload: &Value) -> Result<Value> {
+        self.configure_gate_scoped(payload, None, None).await
+    }
+
+    pub(crate) async fn configure_gate_scoped(
+        &self,
+        payload: &Value,
+        scope: Option<Value>,
+        source: Option<super::next_work::Source>,
+    ) -> Result<Value> {
         anyhow::ensure!(
             self.inner.identity.lock().expect("identity lock").rlm_depth == 0,
             "Only a root session may configure its orchestration gate"
         );
         anyhow::ensure!(
-            payload.get("nextWorkSource").is_none()
+            payload.get("rebindNextWorkSource").is_none()
+                && payload.get("managementScope").is_none()
+                && payload.get("nextWorkSource").is_none()
                 && payload.get("nextWork").is_none()
                 && payload.get("invalidateNextWork").is_none()
                 && payload.get("beginWorkStart").is_none(),
             "next_work source is installed only by the Studio owner"
         );
         let policy: Policy = serde_json::from_value(payload["policy"].clone())?;
+        anyhow::ensure!(
+            scope.is_some() || policy.managed_pass_policy.is_none(),
+            "Managed policy is installed only by the Studio owner"
+        );
         let task: Task = serde_json::from_value(payload["task"].clone())?;
         anyhow::ensure!(
             policy.version == 1
                 && (1..=MAX_ACTIVE).contains(&policy.min_active)
                 && (policy.min_active..=MAX_ACTIVE).contains(&policy.max_active)
-                && policy.corrective_budget <= MAX_CORRECTIVE_BUDGET,
+                && policy.corrective_budget <= MAX_CORRECTIVE_BUDGET
+                && policy
+                    .managed_pass_policy
+                    .as_deref()
+                    .is_none_or(|mode| mode == "causal_results_v1"),
             "Invalid orchestration v1 policy"
         );
         anyhow::ensure!(
@@ -346,6 +369,40 @@ impl SupervisorChildSessions {
             if !next.same_task(&task) {
                 next.attempts = 0;
                 next.management_obligation = None;
+            }
+            if let Some(mut scope) = scope {
+                let identity = self.inner.identity.lock().expect("identity lock");
+                anyhow::ensure!(
+                    scope["rootSessionId"].as_str() == identity.session_id.as_deref()
+                        && scope["taskGeneration"] == task.task_generation
+                        && scope["policyRevision"] == task.policy_revision
+                        && scope["envelope"]["planIds"]
+                            .as_array()
+                            .is_some_and(|ids| !ids.is_empty())
+                        && scope["envelope"]["requiredLeaves"].is_array(),
+                    "Invalid management scope"
+                );
+                match next.management_scope.as_ref() {
+                    Some(old) => {
+                        if scope.get("ownerBindingId").is_none() {
+                            scope["ownerBindingId"] = old["ownerBindingId"].clone();
+                        }
+                        anyhow::ensure!(old == &scope, "Management scope replacement denied");
+                    }
+                    None => {
+                        anyhow::ensure!(
+                            scope.get("ownerBindingId").is_none(),
+                            "Management owner identity is Native-issued"
+                        );
+                        scope["ownerBindingId"] = json!(uuid::Uuid::new_v4().to_string());
+                    }
+                }
+                next.management_scope = Some(scope);
+            }
+            if let Some(source) = source {
+                next.next_work_source = Some(source);
+                next.next_work_enabled = true;
+                next.next_work = None;
             }
             next.revision += 1;
             next.policy = Some(policy);
@@ -438,6 +495,8 @@ impl SupervisorChildSessions {
             "decision":decision,"knownActive":active,"unknown":unknown,"observedAt":now_ms(),
             "complete":unknown==0 && !gate.suspended && !revision_changed,"exception":gate.exception,
             "correctiveAttempts":gate.attempts,"assignments":rows,
+            "managedContract":{"version":1,"sourceOnlyRebind":true,"causalResults":false},
+            "managementScope":gate.management_scope,
             "managementObligation":gate.management_obligation.as_ref().map(|obligation| json!({
                 "sessionId":obligation.session_id,"goalId":obligation.goal_id,
                 "taskGeneration":obligation.task_generation,"state":if gate.correction_pending {"pending"} else {"owed"},

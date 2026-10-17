@@ -9,7 +9,7 @@ pub(super) struct CreateNotSent(pub(super) String);
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(super) struct Source {
+pub(crate) struct Source {
     socket_path: PathBuf,
     token: String,
     pub(super) instance_id: String,
@@ -36,6 +36,19 @@ pub(super) struct Binding {
     #[serde(skip)]
     pub(super) start_token: Option<String>,
 }
+impl Source {
+    pub(crate) fn parse(value: &Value) -> Result<Self> {
+        let source: Self = serde_json::from_value(value.clone())?;
+        anyhow::ensure!(
+            !source.token.is_empty()
+                && !source.instance_id.is_empty()
+                && source.socket_path.is_absolute(),
+            "Invalid next_work source"
+        );
+        Ok(source)
+    }
+}
+
 impl SupervisorChildSessions {
     pub(super) fn release_unsent_work(&self, child_id: &str) -> Result<()> {
         let mut gate = self.inner.gate.lock().expect("gate lock");
@@ -46,22 +59,49 @@ impl SupervisorChildSessions {
     }
     pub(crate) async fn begin_work_start(&self, permit: &Value) -> Result<Value> {
         self.refresh_next_work().await;
-        let child_id = permit["childId"].as_str().ok_or_else(|| anyhow!("Missing start child identity"))?;
-        let record = self.inner.find_record(child_id).await.ok_or_else(|| anyhow!("Current start child missing"))?;
-        let state = self.inner.command(&DaemonCommand::GetState {
-            id: None,
-            active_session_id: permit["childActiveSessionId"].as_str().ok_or_else(|| anyhow!("Missing start session identity"))?.into(),
-            rest: Map::default(),
-        }, 2_000).await?;
+        let child_id = permit["childId"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing start child identity"))?;
+        let record = self
+            .inner
+            .find_record(child_id)
+            .await
+            .ok_or_else(|| anyhow!("Current start child missing"))?;
+        let state = self
+            .inner
+            .command(
+                &DaemonCommand::GetState {
+                    id: None,
+                    active_session_id: permit["childActiveSessionId"]
+                        .as_str()
+                        .ok_or_else(|| anyhow!("Missing start session identity"))?
+                        .into(),
+                    rest: Map::default(),
+                },
+                2_000,
+            )
+            .await?;
         let _admissions = self.inner.spawn_gate.lock().await;
         let row = record.lock().await;
         anyhow::ensure!(
-            row.rlm_child_id == child_id && !row.closed_by_parent && !row.settled && !row.admission_blocked && row.prompt_admitted
-                && row.admission_generation.as_deref().is_some_and(|generation| permit["admissionGeneration"] == generation)
-                && row.expected_message_id.as_deref().is_some_and(|message| permit["expectedMessageId"] == message)
+            row.rlm_child_id == child_id
+                && !row.closed_by_parent
+                && !row.settled
+                && !row.admission_blocked
+                && row.prompt_admitted
+                && row
+                    .admission_generation
+                    .as_deref()
+                    .is_some_and(|generation| permit["admissionGeneration"] == generation)
+                && row
+                    .expected_message_id
+                    .as_deref()
+                    .is_some_and(|message| permit["expectedMessageId"] == message)
                 && permit["childActiveSessionId"] == row.active_session_id
                 && permit["childSessionId"].as_str() == row.session_id.as_deref()
-                && permit["incarnation"].as_str().is_some_and(|instance| !instance.is_empty() && state["workerInstanceId"] == instance),
+                && permit["incarnation"].as_str().is_some_and(
+                    |instance| !instance.is_empty() && state["workerInstanceId"] == instance
+                ),
             "Work start admission identity changed"
         );
         let mut gate = self.inner.gate.lock().expect("gate lock");
@@ -101,10 +141,17 @@ impl SupervisorChildSessions {
                     && permit["stepId"] == binding.step_id
             })
             .ok_or_else(|| anyhow!("Work start binding missing"))?;
-        anyhow::ensure!(binding.task.is_some() && binding.task == task && binding.policy == policy,
-            "Work start task or policy changed");
-        anyhow::ensure!(binding.start_token.as_deref().is_some_and(|token| permit["startToken"] == token),
-            "Work start private identity changed");
+        anyhow::ensure!(
+            binding.task.is_some() && binding.task == task && binding.policy == policy,
+            "Work start task or policy changed"
+        );
+        anyhow::ensure!(
+            binding
+                .start_token
+                .as_deref()
+                .is_some_and(|token| permit["startToken"] == token),
+            "Work start private identity changed"
+        );
         anyhow::ensure!(
             !binding.start_permitted,
             "Work start already admitted; reconcile without replay"
@@ -123,6 +170,52 @@ impl SupervisorChildSessions {
         self.persist_gate(&gate)?;
         Ok(json!({"revision":gate.revision,"nextWorkInvalidated":true}))
     }
+    pub(crate) async fn rebind_next_work_source(
+        &self,
+        value: &Value,
+        goal_id: Option<&str>,
+    ) -> Result<Value> {
+        let source: Source = serde_json::from_value(value["nextWorkSource"].clone())?;
+        anyhow::ensure!(
+            !source.token.is_empty()
+                && !source.instance_id.is_empty()
+                && source.socket_path.is_absolute(),
+            "Invalid next_work source"
+        );
+        let _admissions = self.inner.spawn_gate.lock().await;
+        let identity = self.inner.identity.lock().expect("identity lock").clone();
+        let mut gate = self.inner.gate.lock().expect("gate lock");
+        anyhow::ensure!(
+            identity.rlm_depth == 0
+                && value["version"] == 1
+                && value["expectedSessionId"].as_str() == identity.session_id.as_deref()
+                && value["expectedGoalId"].as_str() == goal_id
+                && goal_id.is_some()
+                && value["expectedGateRevision"].as_u64() == Some(gate.revision)
+                && value["expectedTask"] == serde_json::to_value(&gate.task)?
+                && value["expectedPolicy"] == serde_json::to_value(&gate.policy)?
+                && gate.management_scope.as_ref().is_some_and(|scope| {
+                    scope["ownerBindingId"] == value["expectedManagementOwner"]
+                        && scope["goalId"] == value["expectedGoalId"]
+                        && scope["rootSessionId"] == value["expectedSessionId"]
+                        && scope["envelope"] == value["envelope"]
+                }),
+            "managed_rebind_mismatch"
+        );
+        let mut next = gate.clone();
+        next.next_work_source = Some(source);
+        next.next_work = None;
+        next.revision += 1;
+        self.persist_gate(&next)?;
+        *gate = next;
+        Ok(
+            json!({"sourceRebound":true,"sessionId":identity.session_id,"revision":gate.revision,
+            "task":gate.task,"policy":gate.policy,"correctiveAttempts":gate.attempts,
+            "suspended":gate.suspended,"managementScope":gate.management_scope,
+            "managedContract":{"version":1,"sourceOnlyRebind":true,"causalResults":false}}),
+        )
+    }
+
     pub(crate) fn install_next_work_source(&self, value: &Value) -> Result<()> {
         let source: Source = serde_json::from_value(value.clone())?;
         anyhow::ensure!(
@@ -257,7 +350,12 @@ impl SupervisorChildSessions {
                                 })
                     })
                 });
-            if accepted_progress {
+            if accepted_progress
+                && gate
+                    .policy
+                    .as_ref()
+                    .is_none_or(|policy| policy.managed_pass_policy.is_none())
+            {
                 gate.attempts = 0;
             }
             if gate.next_work.is_some() {
@@ -371,7 +469,13 @@ impl SupervisorChildSessions {
             start_token: Some(uuid::Uuid::new_v4().to_string()),
         };
         gate.work_bindings.push(binding);
-        gate.attempts = 0;
+        if gate
+            .policy
+            .as_ref()
+            .is_none_or(|policy| policy.managed_pass_policy.is_none())
+        {
+            gate.attempts = 0;
+        }
         gate.revision += 1;
         self.persist_gate(&gate)
     }
@@ -398,6 +502,51 @@ mod tests {
         });
         sessions
     }
+    #[tokio::test]
+    async fn source_rebind_preserves_fences_and_rejects_scope_mismatch() {
+        let sessions = sessions();
+        let scope = json!({"rootSessionId":"root","goalId":"goal","taskGeneration":1,"policyRevision":1,
+            "envelope":{"planIds":["p"],"requiredLeaves":[{"planId":"p","stepId":"leaf"}]}});
+        let config = json!({"expectedRevision":0,"policy":{"version":1,"enabled":true,"minActive":1,"maxActive":2,
+            "rootWritesCode":false,"correctiveBudget":2,"managedPassPolicy":"causal_results_v1"},
+            "task":{"projectId":"project","planId":"p","stepId":"root","taskGeneration":1,"policyRevision":1},"assignments":[]});
+        assert!(sessions.configure_gate(&config).await.is_err());
+        sessions
+            .configure_gate_scoped(&config, Some(scope), None)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            sessions.gate_correction().await.unwrap();
+            sessions.consume_gate_correction();
+        }
+        let mut gate = sessions.inner.gate.lock().unwrap();
+        gate.suspended = true;
+        let original_scope = gate.management_scope.clone().unwrap();
+        let mut request = json!({"version":1,"expectedSessionId":"root","expectedGoalId":"goal",
+            "expectedManagementOwner":original_scope["ownerBindingId"],"expectedGateRevision":gate.revision,
+            "expectedTask":gate.task,"expectedPolicy":gate.policy,"envelope":original_scope["envelope"],
+            "nextWorkSource":{"socketPath":"/tmp/source.sock","token":"fixture","instanceId":"new"}});
+        drop(gate);
+        request["expectedManagementOwner"] = json!("wrong");
+        assert!(sessions
+            .rebind_next_work_source(&request, Some("goal"))
+            .await
+            .is_err());
+        request["expectedManagementOwner"] = original_scope["ownerBindingId"].clone();
+        let result = sessions
+            .rebind_next_work_source(&request, Some("goal"))
+            .await
+            .unwrap();
+        assert_eq!(result["correctiveAttempts"], 2);
+        assert_eq!(result["suspended"], true);
+        assert_eq!(result["managementScope"], original_scope);
+        assert!(sessions.gate_correction().await.is_none());
+        assert!(sessions
+            .rebind_next_work_source(&request, Some("goal"))
+            .await
+            .is_err());
+    }
+
     async fn source(sessions: &SupervisorChildSessions, value: Value) -> tempfile::TempDir {
         let dir = tempfile::TempDir::new().unwrap();
         let socket = dir.path().join("roadmap.sock");
@@ -554,7 +703,12 @@ mod tests {
     #[tokio::test]
     async fn model_cannot_install_or_invalidate_owner_source() {
         let sessions = sessions();
-        for field in ["nextWorkSource", "nextWork", "invalidateNextWork", "beginWorkStart"] {
+        for field in [
+            "nextWorkSource",
+            "nextWork",
+            "invalidateNextWork",
+            "beginWorkStart",
+        ] {
             let mut payload = json!({"expectedRevision":0,"policy":{},"task":{},"assignments":[]});
             payload[field] = json!(true);
             let error = sessions.configure_gate(&payload).await.unwrap_err();
@@ -562,13 +716,21 @@ mod tests {
         }
     }
 
-    async fn start_fixture() -> (SupervisorChildSessions, tempfile::TempDir, Value, Arc<tokio::sync::Notify>) {
+    async fn start_fixture() -> (
+        SupervisorChildSessions,
+        tempfile::TempDir,
+        Value,
+        Arc<tokio::sync::Notify>,
+    ) {
         use tokio::io::{AsyncBufReadExt, BufReader};
         let mut sessions = sessions();
         let source = source(&sessions, projection()).await;
         let socket = source.path().join("supervisor.sock");
-        let listener = pa_types::platform::transport::bind_transport(&socket).await.unwrap();
-        Arc::get_mut(&mut sessions.inner).unwrap().link = Arc::new(crate::supervisor_link::SupervisorLink::new(socket));
+        let listener = pa_types::platform::transport::bind_transport(&socket)
+            .await
+            .unwrap();
+        Arc::get_mut(&mut sessions.inner).unwrap().link =
+            Arc::new(crate::supervisor_link::SupervisorLink::new(socket));
         let state_read = Arc::new(tokio::sync::Notify::new());
         let server_read = state_read.clone();
         tokio::spawn(async move {
@@ -582,21 +744,45 @@ mod tests {
                     let mut line = String::new();
                     reader.read_line(&mut line).await.unwrap();
                     let request: Value = serde_json::from_str(&line).unwrap();
-                    let response = crate::protocol::response_success(request["id"].as_str(), "get_state", Some(json!({"workerInstanceId":"worker"})));
-                    writer.write_all(format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes()).await.unwrap();
+                    let response = crate::protocol::response_success(
+                        request["id"].as_str(),
+                        "get_state",
+                        Some(json!({"workerInstanceId":"worker"})),
+                    );
+                    writer
+                        .write_all(
+                            format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes(),
+                        )
+                        .await
+                        .unwrap();
                     state_read.notify_one();
                 });
             }
         });
-        sessions.reserve_work("B", Some(&json!({"planId":"p","stepId":"B","snapshotRevision":7}))).await.unwrap();
-        sessions.push_test_child(RlmChildIdentity { rlm_child_id:"B".into(), active_session_id:"active".into(), session_id:Some("durable".into()), session_name:"B".into() }).await;
+        sessions
+            .reserve_work(
+                "B",
+                Some(&json!({"planId":"p","stepId":"B","snapshotRevision":7})),
+            )
+            .await
+            .unwrap();
+        sessions
+            .push_test_child(RlmChildIdentity {
+                rlm_child_id: "B".into(),
+                active_session_id: "active".into(),
+                session_id: Some("durable".into()),
+                session_name: "B".into(),
+            })
+            .await;
         let record = sessions.inner.find_record("B").await.unwrap();
         {
             let mut row = record.lock().await;
             row.admission_generation = Some("generation".into());
             row.expected_message_id = Some("message".into());
         }
-        let token = sessions.inner.gate.lock().unwrap().work_bindings[0].start_token.clone();
+        let token = sessions.inner.gate.lock().unwrap().work_bindings[0]
+            .start_token
+            .clone();
         let permit = json!({"childId":"B","childActiveSessionId":"active","childSessionId":"durable","planId":"p","stepId":"B","sourceInstanceId":"instance","admissionGeneration":"generation","expectedMessageId":"message","incarnation":"worker","startToken":token});
         (sessions, source, permit, state_read)
     }
@@ -604,7 +790,10 @@ mod tests {
     #[tokio::test]
     async fn start_permit_linearizes_before_invalidation_and_never_replays() {
         let (sessions, _source, permit, _state_read) = start_fixture().await;
-        assert_eq!(sessions.begin_work_start(&permit).await.unwrap()["workStartPermitted"], true);
+        assert_eq!(
+            sessions.begin_work_start(&permit).await.unwrap()["workStartPermitted"],
+            true
+        );
         assert!(sessions.begin_work_start(&permit).await.is_err());
         sessions.invalidate_next_work().await.unwrap();
         assert!(sessions.inner.gate.lock().unwrap().work_bindings[0].start_permitted);
@@ -613,7 +802,14 @@ mod tests {
     #[tokio::test]
     async fn start_permit_rejects_stale_or_forged_identity_without_consuming_current() {
         let (sessions, _source, permit, _state_read) = start_fixture().await;
-        for field in ["admissionGeneration", "expectedMessageId", "childActiveSessionId", "childSessionId", "incarnation", "startToken"] {
+        for field in [
+            "admissionGeneration",
+            "expectedMessageId",
+            "childActiveSessionId",
+            "childSessionId",
+            "incarnation",
+            "startToken",
+        ] {
             let mut stale = permit.clone();
             stale[field] = json!("stale");
             assert!(sessions.begin_work_start(&stale).await.is_err(), "{field}");
@@ -624,16 +820,27 @@ mod tests {
         assert!(sessions.begin_work_start(&missing).await.is_err());
         let serialized = serde_json::to_value(&*sessions.inner.gate.lock().unwrap()).unwrap();
         assert!(serialized["workBindings"][0].get("startToken").is_none());
-        assert_eq!(sessions.begin_work_start(&permit).await.unwrap()["workStartPermitted"], true);
+        assert_eq!(
+            sessions.begin_work_start(&permit).await.unwrap()["workStartPermitted"],
+            true
+        );
     }
 
     #[tokio::test]
     async fn start_permit_rechecks_record_and_task_after_waiting_for_admission_lock() {
-        for change in ["generation", "closed", "settled", "blocked", "task", "policy"] {
+        for change in [
+            "generation",
+            "closed",
+            "settled",
+            "blocked",
+            "task",
+            "policy",
+        ] {
             let (sessions, _source, permit, state_read) = start_fixture().await;
             let admission = sessions.inner.spawn_gate.lock().await;
             let starting_sessions = sessions.clone();
-            let starting = tokio::spawn(async move { starting_sessions.begin_work_start(&permit).await });
+            let starting =
+                tokio::spawn(async move { starting_sessions.begin_work_start(&permit).await });
             state_read.notified().await;
             assert!(!starting.is_finished());
             let record = sessions.inner.find_record("B").await.unwrap();
@@ -650,7 +857,11 @@ mod tests {
             if change == "task" || change == "policy" {
                 let mut gate = sessions.inner.gate.lock().unwrap();
                 let mut task = serde_json::to_value(gate.task.as_ref().unwrap()).unwrap();
-                task[if change == "task" { "taskGeneration" } else { "policyRevision" }] = json!(2);
+                task[if change == "task" {
+                    "taskGeneration"
+                } else {
+                    "policyRevision"
+                }] = json!(2);
                 gate.task = Some(serde_json::from_value(task).unwrap());
             }
             drop(admission);

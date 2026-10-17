@@ -32,20 +32,43 @@ impl SessionEngine for AgentSessionEngine {
                 .ok_or_else(|| anyhow::anyhow!("Orchestration children unavailable"))?;
             match configure {
                 Some(mut payload) => {
+                    if let Some(rebind) = payload.get("rebindNextWorkSource") {
+                        let goal = self.current_goal_state();
+                        return children
+                            .rebind_next_work_source(
+                                rebind,
+                                goal.as_ref().and_then(|goal| goal.goal_id.as_deref()),
+                            )
+                            .await;
+                    }
                     if let Some(permit) = payload.get("beginWorkStart") {
                         return children.begin_work_start(permit).await;
                     }
                     if payload["invalidateNextWork"] == true {
                         return children.invalidate_next_work().await;
                     }
+                    let management_scope = payload
+                        .as_object_mut()
+                        .and_then(|object| object.remove("managementScope"));
                     let source = payload
                         .as_object_mut()
                         .and_then(|object| object.remove("nextWorkSource"));
-                    let mut status = children.configure_gate(&payload).await?;
-                    if let Some(source) = source {
-                        children.install_next_work_source(&source)?;
-                        status = children.gate_status().await;
+                    if let Some(scope) = management_scope.as_ref() {
+                        let goal = self.current_goal_state();
+                        anyhow::ensure!(
+                            scope["goalId"].as_str()
+                                == goal.as_ref().and_then(|goal| goal.goal_id.as_deref())
+                                && scope["goalId"].as_str().is_some(),
+                            "Invalid management goal"
+                        );
                     }
+                    let source = source
+                        .as_ref()
+                        .map(crate::rlm_children::next_work::Source::parse)
+                        .transpose()?;
+                    let status = children
+                        .configure_gate_scoped(&payload, management_scope, source)
+                        .await?;
                     let engine = self
                         .self_weak
                         .lock()

@@ -3,7 +3,7 @@
 //! keep the parent-side roster the kernel reads. Unlike TS, each child runs
 //! in its own supervised worker process; the kernel surface stays TS parity.
 
-mod next_work;
+pub(crate) mod next_work;
 mod orchestration;
 use orchestration::Gate;
 use serde_json::Map;
