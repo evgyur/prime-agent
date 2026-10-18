@@ -329,7 +329,7 @@ impl Supervisor {
         ));
         if let Some(parent_file) = session_path.as_deref() {
             crate::journal::WorkerRecoveryJournal::restore_parent_owner_cancellations(
-                &self.descriptor_dir,
+                &self.options.agent_dir.join("daemon-workers"),
                 &recovery_journal_path,
                 Path::new(parent_file),
             )?;

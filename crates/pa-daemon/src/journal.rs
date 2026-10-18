@@ -353,21 +353,42 @@ impl WorkerRecoveryJournal {
     ) -> Result<()> {
         let parent = crate::lease::canonical_session_path(parent);
         let mut facts = Vec::new();
-        for entry in fs::read_dir(directory)? {
-            let path = entry?.path();
-            if path == destination
-                || !path
-                    .file_name()
-                    .is_some_and(|name| name.to_string_lossy().ends_with(RECOVERY_JOURNAL_SUFFIX))
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut directories = vec![directory.to_path_buf()];
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.len() == 12
+                && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && entry.file_type()?.is_dir()
             {
-                continue;
+                directories.push(entry.path());
             }
-            for fact in Self::read_owner_cancel_facts(&path)? {
-                if crate::lease::canonical_session_path(Path::new(&fact.parent_session_file))
-                    == parent
-                    && !facts.contains(&fact)
+        }
+        for directory in directories {
+            for entry in fs::read_dir(directory)? {
+                let entry = entry?;
+                let path = entry.path();
+                if !entry.file_type()?.is_file()
+                    || path == destination
+                    || !path.file_name().is_some_and(|name| {
+                        name.to_string_lossy().ends_with(RECOVERY_JOURNAL_SUFFIX)
+                    })
                 {
-                    facts.push(fact);
+                    continue;
+                }
+                for fact in Self::read_owner_cancel_facts(&path)? {
+                    if crate::lease::canonical_session_path(Path::new(&fact.parent_session_file))
+                        == parent
+                        && !facts.contains(&fact)
+                    {
+                        facts.push(fact);
+                    }
                 }
             }
         }
@@ -834,6 +855,104 @@ mod tests {
             .is_empty());
         std::fs::write(&path, b"{\"type\":\n{}\n").unwrap();
         assert!(super::WorkerRecoveryJournal::read_owner_cancel_facts(&path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_cancel_restore_does_not_follow_namespace_or_journal_symlinks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("daemon-workers");
+        std::fs::create_dir(&root).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let corrupt = outside.join("corrupt.recovery.jsonl");
+        std::fs::write(&corrupt, "broken\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("aaaaaaaaaaaa")).unwrap();
+        std::os::unix::fs::symlink(&corrupt, root.join("linked.recovery.jsonl")).unwrap();
+        let destination = root.join("new.recovery.jsonl");
+        super::WorkerRecoveryJournal::restore_parent_owner_cancellations(
+            &root,
+            &destination,
+            &dir.path().join("parent"),
+        )
+        .unwrap();
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn owner_cancel_restore_allows_first_supervisor_namespace() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("daemon-workers");
+        let destination = root.join("aaaaaaaaaaaa/new.recovery.jsonl");
+        super::WorkerRecoveryJournal::restore_parent_owner_cancellations(
+            &root,
+            &destination,
+            &dir.path().join("parent"),
+        )
+        .unwrap();
+        assert!(!destination.exists());
+        std::fs::create_dir(&root).unwrap();
+        super::WorkerRecoveryJournal::restore_parent_owner_cancellations(
+            &root,
+            &destination,
+            &dir.path().join("parent"),
+        )
+        .unwrap();
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn owner_cancel_restore_crosses_supervisor_socket_namespaces_only() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("daemon-workers");
+        let old = root.join("f0084df628f2");
+        let new = root.join("e201e7fbfb1f");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        let parent = dir.path().join("parent.jsonl");
+        std::fs::write(&parent, "parent").unwrap();
+        let fact = super::OwnerCancelFact {
+            parent_session_file: parent.to_string_lossy().into_owned(),
+            child_id: "child".into(),
+            child_session_file: "child-file".into(),
+            admission_generation: None,
+            expected_message_id: None,
+        };
+        {
+            let mut journal =
+                super::WorkerRecoveryJournal::open(&old.join("old.recovery.jsonl")).unwrap();
+            journal.record_owner_cancel(fact.clone()).unwrap();
+        }
+        let destination = new.join("new.recovery.jsonl");
+        super::WorkerRecoveryJournal::restore_parent_owner_cancellations(
+            &root,
+            &destination,
+            &parent,
+        )
+        .unwrap();
+        assert_eq!(
+            super::WorkerRecoveryJournal::open(&destination)
+                .unwrap()
+                .owner_cancel_facts(),
+            &[fact]
+        );
+        let unrelated = new.join("unrelated.recovery.jsonl");
+        super::WorkerRecoveryJournal::restore_parent_owner_cancellations(
+            &root,
+            &unrelated,
+            &dir.path().join("other-parent"),
+        )
+        .unwrap();
+        assert!(!unrelated.exists());
+        std::fs::write(old.join("corrupt.recovery.jsonl"), "broken\n").unwrap();
+        let denied = new.join("denied.recovery.jsonl");
+        assert!(
+            super::WorkerRecoveryJournal::restore_parent_owner_cancellations(
+                &root, &denied, &parent
+            )
+            .is_err()
+        );
+        assert!(!denied.exists());
     }
 
     #[test]
