@@ -135,6 +135,50 @@ impl Worker {
                 }
             }
             "get_state" => self.handle_get_state(),
+            "get_orchestration_gate" if payload.get("historicalOwnerCancellation").is_some() => {
+                let result = async {
+                    anyhow::ensure!(
+                        payload.as_object().is_some_and(|object| object.keys().all(
+                            |key| matches!(
+                                key.as_str(),
+                                "historicalOwnerCancellation"
+                                    | "id"
+                                    | "type"
+                                    | "activeSessionId"
+                                    | "clientId"
+                            )
+                        )),
+                        "Unexpected historical lookup fields"
+                    );
+                    if let Err(response) = self.require_created(command_type) {
+                        anyhow::bail!("{}", response.error.unwrap_or_default());
+                    }
+                    let children = self
+                        .agent_engine
+                        .as_ref()
+                        .and_then(|engine| engine.children.as_ref())
+                        .ok_or_else(|| anyhow::anyhow!("Orchestration children unavailable"))?;
+                    let facts = self
+                        .recovery
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("Parent recovery journal unavailable"))?
+                        .owner_cancel_facts()
+                        .to_vec();
+                    children
+                        .historical_owner_cancellation(
+                            &payload["historicalOwnerCancellation"],
+                            &facts,
+                        )
+                        .await
+                }
+                .await;
+                match result {
+                    Ok(value) => response_success(None, command_type, Some(value)),
+                    Err(error) => response_failure(None, command_type, &format!("{error:#}"), None),
+                }
+            }
             "configure_orchestration_gate" | "get_orchestration_gate" => {
                 let facts = self
                     .recovery
@@ -1314,7 +1358,7 @@ mod bounce_text_tests {
 mod owner_cancel_wire_tests {
     use super::*;
     #[tokio::test]
-    async fn owner_cancel_wire_normalizes_only_transport_fields() {
+    async fn historical_owner_cancellation_and_owner_cancel_wire_normalize_only_transport_fields() {
         let dir = tempfile::TempDir::new().unwrap();
         let config = crate::worker::WorkerConfig {
             socket_path: dir.path().join("w.sock"),
@@ -1334,6 +1378,25 @@ mod owner_cancel_wire_tests {
                 .await
                 .success
         );
+        let readonly = json!({"type":"get_orchestration_gate","id":"request","activeSessionId":"parent","clientId":"owner-client","historicalOwnerCancellation":{}});
+        let mut injected = readonly.clone();
+        injected["fact"] = json!({"forged":"evidence"});
+        let rejected = worker.dispatch("get_orchestration_gate", &injected).await;
+        assert_eq!(
+            rejected.error.as_deref(),
+            Some("Unexpected historical lookup fields")
+        );
+        let rejected = worker.dispatch("get_orchestration_gate", &readonly).await;
+        assert_eq!(
+            rejected.error.as_deref(),
+            Some("Parent recovery journal unavailable")
+        );
+        *worker.recovery.lock().unwrap() = Some(
+            crate::journal::WorkerRecoveryJournal::open(&dir.path().join("fixture-recovery.jsonl"))
+                .unwrap(),
+        );
+        let rejected = worker.dispatch("get_orchestration_gate", &readonly).await;
+        assert!(rejected.error.as_deref().unwrap().contains("missing field"));
         let wire = json!({"type":"configure_orchestration_gate","id":"request","activeSessionId":"parent","clientId":"owner-client","ownerCancelChild":{"childId":"absent"}});
         let response = worker.dispatch("configure_orchestration_gate", &wire).await;
         assert!(!response.success);

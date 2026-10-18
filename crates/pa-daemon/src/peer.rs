@@ -251,8 +251,45 @@ pub(crate) fn peer_command_allowed(
     grant: &DaemonWorkerPeerGrant,
 ) -> bool {
     is_session_plane_daemon_command(command_type)
+        && !(command_type == "get_orchestration_gate"
+            && payload.get("historicalOwnerCancellation").is_some())
         && payload.get("activeSessionId").and_then(Value::as_str)
             == Some(grant.active_session_id.as_str())
+}
+
+#[cfg(test)]
+mod historical_lookup_tests {
+    use super::*;
+    #[test]
+    fn historical_owner_cancellation_is_not_a_peer_client_or_worker_read() {
+        let grant = DaemonWorkerPeerGrant {
+            grant_id: "g".into(),
+            token: "t".into(),
+            expires_at: "future".into(),
+            purpose: "session_client".into(),
+            worker_instance_id: "i".into(),
+            active_session_id: "parent".into(),
+            issuer_generation: "epoch".into(),
+        };
+        let plain = serde_json::json!({"activeSessionId":"parent"});
+        let historical =
+            serde_json::json!({"activeSessionId":"parent","historicalOwnerCancellation":{}});
+        assert!(peer_command_allowed(
+            "get_orchestration_gate",
+            &plain,
+            &grant
+        ));
+        assert!(!peer_command_allowed(
+            "get_orchestration_gate",
+            &historical,
+            &grant
+        ));
+        assert!(!worker_peer_command_allowed(
+            "get_orchestration_gate",
+            &historical,
+            &grant
+        ));
+    }
 }
 
 /// The grant fields a peer-auth success response echoes (TS `peer_auth`

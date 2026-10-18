@@ -11,6 +11,15 @@ rlm_module = importlib.import_module("rlm")
 
 
 class RlmSubagentRegistryTest(unittest.TestCase):
+    def test_historical_owner_cancellation_uses_public_readonly_host_api(self) -> None:
+        query = {"expectedRevision": 9, "task": {"taskGeneration": 3}, "assignment": {"childId": "old"}}
+        evidence = {"status": "not_found_in_parent_fact_set", "sufficientForSettlement": False}
+        host_request = AsyncMock(return_value=evidence)
+        with patch.object(rlm_module, "host_request", host_request):
+            result = asyncio.run(rlm_module.rlm.historical_owner_cancellation(query))
+        self.assertEqual(result, evidence)
+        host_request.assert_awaited_once_with("rlm.historical_owner_cancellation", query)
+
     def test_lists_parent_scoped_subagents_from_host(self) -> None:
         host_request = AsyncMock(
             return_value={

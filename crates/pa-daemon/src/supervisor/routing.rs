@@ -322,6 +322,50 @@ impl Supervisor {
         // itself; `None` (supervisor-internal callers) forces the typed path.
         raw_out: Option<&tokio::sync::mpsc::Sender<(Vec<Outbound>, bool)>>,
     ) -> (Vec<Value>, bool) {
+        if let DaemonCommand::GetOrchestrationGate {
+            active_session_id,
+            rest,
+            ..
+        } = command
+        {
+            if rest.contains_key("historicalOwnerCancellation") {
+                let result = async {
+                    anyhow::ensure!(rest.len() == 2, "Unexpected historical lookup fields");
+                    let token = rest
+                        .get("workerToken")
+                        .and_then(Value::as_str)
+                        .filter(|token| !token.is_empty())
+                        .ok_or_else(|| anyhow!("Owner authentication missing"))?;
+                    let owner = self
+                        .registry
+                        .find_by_token(token)
+                        .await
+                        .ok_or_else(|| anyhow!("Owner authentication failed"))?;
+                    let target = self.registry.resolve(active_session_id).await?;
+                    anyhow::ensure!(Arc::ptr_eq(&owner, &target), "Owner target mismatch");
+                    let response = self.route_command_typed(&owner, "get_orchestration_gate",
+                        json!({"historicalOwnerCancellation":rest["historicalOwnerCancellation"]}),
+                        ROUTE_TIMEOUT_MS, RouteAdmission::SupervisorInternal).await?;
+                    anyhow::ensure!(
+                        self.registry
+                            .find_by_token(token)
+                            .await
+                            .is_some_and(|current| Arc::ptr_eq(&owner, &current)),
+                        "Owner changed during lookup"
+                    );
+                    Ok::<_, anyhow::Error>(response)
+                }
+                .await;
+                let mut response = match result {
+                    Ok(response) => response,
+                    Err(error) => {
+                        response_failure(Some(&command_id), &type_name, &format!("{error:#}"), None)
+                    }
+                };
+                response.id = Some(command_id);
+                return (vec![response_line(&response)], false);
+            }
+        }
         if let DaemonCommand::Kill { rest, .. } = command {
             if let Some(request) = rest.get("ownerCancel") {
                 let result = self.reconcile_owner_cancel(request).await;
@@ -1206,6 +1250,110 @@ mod saved_delete_tests {
             );
         }
     }
+    #[tokio::test]
+    async fn historical_owner_cancellation_rejects_unauthenticated_lookup_without_wake() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let supervisor = Arc::new(
+            Supervisor::new(super::super::SupervisorOptions {
+                socket_path: dir.path().join("daemon.sock"),
+                agent_dir: dir.path().join("agent"),
+            })
+            .unwrap(),
+        );
+        let (queue, _received) = mpsc::channel(4);
+        let attached =
+            crate::supervisor::subscribers::ClientSubscriptions::new("lookup-client".into(), queue);
+        for rest in [
+            json!({"historicalOwnerCancellation":{}}),
+            json!({"historicalOwnerCancellation":{},"workerToken":"forged"}),
+        ] {
+            let mut payload = rest;
+            payload["type"] = json!("get_orchestration_gate");
+            payload["activeSessionId"] = json!("saved-parent");
+            let command: DaemonCommand = serde_json::from_value(payload).unwrap();
+            let (lines, _) = supervisor
+                .route_client_command(
+                    &command,
+                    "client",
+                    &attached,
+                    "lookup".into(),
+                    "get_orchestration_gate".into(),
+                    None,
+                )
+                .await;
+            assert_eq!(lines.len(), 1);
+            assert_eq!(lines[0]["success"], false);
+        }
+        let descriptor: pa_types::daemon::DaemonWorkerDescriptor = serde_json::from_value(json!({
+            "version":1,"workerId":"owner","pid":std::process::id(),"socketPath":"unused",
+            "recoveryJournalPath":"unused","supervisorSocketPath":"unused","authenticationToken":"fixture-owner-token",
+            "rootActiveSessionId":"owner","sessionFile":"/fixture/parent.jsonl","createdAt":"t","updatedAt":"t",
+            "lifecycle":"ready","createCommand":{},"consecutiveFailures":0
+        })).unwrap();
+        let owner = ResidentWorker::new("owner".into(), descriptor, dir.path().join("worker"));
+        supervisor.registry.insert(owner).await;
+        let owner = supervisor.registry.resolve("owner").await.unwrap();
+        let wrong: DaemonCommand = serde_json::from_value(
+            json!({"type":"get_orchestration_gate","activeSessionId":"absent",
+            "workerToken":"fixture-owner-token","historicalOwnerCancellation":{}}),
+        )
+        .unwrap();
+        let (lines, _) = supervisor
+            .route_client_command(
+                &wrong,
+                "client",
+                &attached,
+                "wrong".into(),
+                "get_orchestration_gate".into(),
+                None,
+            )
+            .await;
+        assert_eq!(lines[0]["success"], false);
+        let (commands, mut received) = mpsc::channel::<WorkerRequest>(1);
+        *owner.cmd_tx.lock().await = Some(commands);
+        let reply_owner = owner.clone();
+        let reply = tokio::spawn(async move {
+            let request = received.recv().await.unwrap();
+            assert_eq!(request.command_type, "get_orchestration_gate");
+            assert_eq!(
+                request.payload,
+                json!({"historicalOwnerCancellation":{"fixture":"query"}})
+            );
+            let pending = reply_owner
+                .pending
+                .lock()
+                .await
+                .remove(&request.request_id)
+                .unwrap();
+            assert!(pending
+                .send(WorkerReply::Typed(response_success(
+                    None,
+                    "get_orchestration_gate",
+                    Some(json!({"status":"fixture"}))
+                )))
+                .is_ok());
+        });
+        let command: DaemonCommand = serde_json::from_value(
+            json!({"type":"get_orchestration_gate","activeSessionId":"owner",
+            "workerToken":"fixture-owner-token","historicalOwnerCancellation":{"fixture":"query"}}),
+        )
+        .unwrap();
+        let (lines, _) = supervisor
+            .route_client_command(
+                &command,
+                "client",
+                &attached,
+                "found".into(),
+                "get_orchestration_gate".into(),
+                None,
+            )
+            .await;
+        reply.await.unwrap();
+        assert_eq!(lines[0]["success"], true);
+        assert_eq!(lines[0]["data"]["status"], "fixture");
+        assert!(!dir.path().join("agent/session-leases").exists());
+    }
+
     #[tokio::test]
     async fn owner_cancel_requires_authenticated_parent_before_any_effect() {
         let dir = tempfile::TempDir::new().unwrap();

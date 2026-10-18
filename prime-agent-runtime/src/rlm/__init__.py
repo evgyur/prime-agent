@@ -344,6 +344,15 @@ async def orchestration_status() -> dict[str, Any]:
     return await host_request("rlm.orchestration_status")
 
 
+async def historical_owner_cancellation(payload: dict[str, Any]) -> dict[str, Any]:
+    """Read retained parent cancellation facts for exact revision/task/full assignment.
+
+    Does not cancel, reconcile, wake children or prove historic incarnation settlement.
+    A miss covers only this parent's held fact set, not all durable history.
+    """
+    return await host_request("rlm.historical_owner_cancellation", payload)
+
+
 async def configure_orchestration_gate(payload: dict[str, Any]) -> dict[str, Any]:
     """CAS policy/bindings/exception update. Get revision and admissionGeneration from status first."""
     return await host_request("rlm.configure_orchestration_gate", payload)
@@ -643,6 +652,7 @@ class _RLMFactoryNamespace:
 
 class _RLMNamespace:
     orchestration_status = staticmethod(orchestration_status)
+    historical_owner_cancellation = staticmethod(historical_owner_cancellation)
     configure_orchestration_gate = staticmethod(configure_orchestration_gate)
     harness = _harness_state
     get_harness_state = staticmethod(get_harness_state)

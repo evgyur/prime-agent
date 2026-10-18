@@ -172,6 +172,63 @@ impl Gate {
         })
     }
 
+    fn historical_owner_cancellation(
+        &self,
+        request: &ReconcileOwnerCancellation,
+        parent: &str,
+        child: &str,
+        facts: &[crate::journal::OwnerCancelFact],
+    ) -> Result<Value> {
+        anyhow::ensure!(
+            self.revision == request.expected_revision,
+            "Orchestration revision conflict"
+        );
+        anyhow::ensure!(
+            self.task.as_ref() == Some(&request.task)
+                && self
+                    .assignments
+                    .iter()
+                    .filter(|a| *a == &request.assignment)
+                    .count()
+                    == 1,
+            "Exact persisted task and assignment required"
+        );
+        let mut matching = Vec::new();
+        for fact in facts.iter().filter(|fact| {
+            fact.child_id == request.assignment.child_id
+                && fact.admission_generation.as_deref()
+                    == Some(&request.assignment.admission_generation)
+        }) {
+            anyhow::ensure!(
+                fact.parent_session_file == parent && fact.child_session_file == child,
+                "Retained cancellation session identity mismatch"
+            );
+            if !matching.contains(fact) {
+                matching.push(fact.clone());
+            }
+        }
+        anyhow::ensure!(matching.len() <= 1, "Ambiguous retained cancellation facts");
+        let fact = matching.pop();
+        let status = if fact.is_some() {
+            "found"
+        } else {
+            "not_found_in_parent_fact_set"
+        };
+        let message_identity_recorded = fact
+            .as_ref()
+            .and_then(|fact| fact.expected_message_id.as_deref())
+            .is_some_and(|id| !id.is_empty());
+        Ok(
+            json!({"version":1,"revision":self.revision,"task":request.task,"assignment":request.assignment,
+            "status":status,"source":"authenticated_parent_worker_retained_owner_cancel_facts",
+            "coverage":"parent worker held fact set only; not a global history search",
+            "ownerCancellation":fact,"messageIdentityRecorded":message_identity_recorded,
+            "incarnationAuthenticated":false,"lifecycleFactsAvailable":false,
+            "historicalSettlementProven":false,"exclusionApplicabilityProven":false,
+            "processExitObserved":false,"sufficientForSettlement":false}),
+        )
+    }
+
     fn same_task(&self, task: &Task) -> bool {
         self.task.as_ref().is_some_and(|t| {
             t.project_id == task.project_id
@@ -335,6 +392,114 @@ impl SupervisorChildSessions {
             }
         }
     }
+    pub(crate) async fn request_historical_owner_cancellation(
+        &self,
+        request: Value,
+    ) -> Result<Value> {
+        let token = std::env::var("PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN")
+            .map_err(|_| anyhow!("Native owner authentication unavailable"))?;
+        self.inner
+            .command(
+                &DaemonCommand::GetOrchestrationGate {
+                    id: None,
+                    active_session_id: self.inner.parent_active_session_id.clone(),
+                    rest: Map::from_iter([
+                        ("workerToken".into(), json!(token)),
+                        ("historicalOwnerCancellation".into(), request),
+                    ]),
+                },
+                STATE_TIMEOUT_MS,
+            )
+            .await
+    }
+
+    /// Inspect only the authenticated parent worker's retained cancellation facts.
+    /// This does not restore/apply cancellations or establish historic incarnation settlement.
+    pub(crate) async fn historical_owner_cancellation(
+        &self,
+        request: &Value,
+        facts: &[crate::journal::OwnerCancelFact],
+    ) -> Result<Value> {
+        let request: ReconcileOwnerCancellation = serde_json::from_value(request.clone())?;
+        let identity = self.inner.identity.lock().expect("identity lock").clone();
+        anyhow::ensure!(
+            identity.rlm_depth == 0,
+            "Only a root owner may inspect retained cancellation facts"
+        );
+        let parent = identity
+            .session_file
+            .ok_or_else(|| anyhow!("Parent identity unavailable"))?;
+        let records = self.inner.children.lock().await.clone();
+        let registry_snapshot = records.clone();
+        let mut matches = Vec::new();
+        for record in records {
+            if record.lock().await.rlm_child_id == request.assignment.child_id {
+                matches.push(record);
+            }
+        }
+        anyhow::ensure!(matches.len() == 1, "Unique direct child identity required");
+        let record = matches.pop().expect("one direct child");
+        let row = record.lock().await;
+        let child = row
+            .session_file
+            .clone()
+            .ok_or_else(|| anyhow!("Child session identity unavailable"))?;
+        // A substituted symlink must not rebind an authenticated fact to another session.
+        for file in [&parent, &child] {
+            let path = Path::new(file);
+            anyhow::ensure!(path.is_absolute(), "Canonical session identity required");
+            let mut current = PathBuf::new();
+            for component in path.components() {
+                anyhow::ensure!(
+                    !matches!(
+                        component,
+                        std::path::Component::ParentDir | std::path::Component::CurDir
+                    ),
+                    "Canonical session identity required"
+                );
+                current.push(component);
+                let metadata = std::fs::symlink_metadata(&current)?;
+                anyhow::ensure!(
+                    !metadata.file_type().is_symlink(),
+                    "Symlink session identity refused"
+                );
+            }
+            anyhow::ensure!(
+                std::fs::metadata(path)?.is_file(),
+                "Session identity is not a file"
+            );
+        }
+        // Linearize direct-child ownership after the awaited row lock, not its earlier clone.
+        let current_records = self
+            .inner
+            .children
+            .try_lock()
+            .map_err(|_| anyhow!("Child registry busy during lookup"))?;
+        anyhow::ensure!(
+            current_records
+                .iter()
+                .filter(|candidate| Arc::ptr_eq(candidate, &record))
+                .count()
+                == 1,
+            "Direct child ownership changed during lookup"
+        );
+        anyhow::ensure!(
+            current_records.len() == registry_snapshot.len()
+                && current_records
+                    .iter()
+                    .zip(&registry_snapshot)
+                    .all(|(current, old)| Arc::ptr_eq(current, old)),
+            "Child registry changed during lookup"
+        );
+        let current = self.inner.identity.lock().expect("identity lock");
+        anyhow::ensure!(
+            current.rlm_depth == 0 && current.session_file.as_deref() == Some(&parent),
+            "Parent owner changed during lookup"
+        );
+        let gate = self.inner.gate.lock().expect("gate lock");
+        gate.historical_owner_cancellation(&request, &parent, &child, facts)
+    }
+
     /// Bind already authenticated owner exclusion to one retained obligation. No kill or unsuspend.
     pub(crate) async fn reconcile_owner_cancellation(&self, request: &Value) -> Result<Value> {
         let request: ReconcileOwnerCancellation = serde_json::from_value(request.clone())?;
@@ -920,6 +1085,222 @@ mod tests {
         gate.task.as_mut().unwrap().task_generation += 1;
         assert!(!gate.cancellation_settles(&assignment, &[old]));
     }
+    #[tokio::test]
+    async fn historical_owner_cancellation_keeps_newer_child_unchanged_and_rejects_links() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let parent = dir.path().join("parent.jsonl");
+        let child = dir.path().join("child.jsonl");
+        std::fs::write(&parent, "fixture parent").unwrap();
+        std::fs::write(&child, "fixture child").unwrap();
+        let sessions = sessions();
+        sessions.set_identity(ParentIdentity {
+            session_file: Some(parent.to_string_lossy().into()),
+            ..ParentIdentity::with_default_depth()
+        });
+        sessions
+            .push_test_child(super::super::RlmChildIdentity {
+                rlm_child_id: "old".into(),
+                active_session_id: "new-worker".into(),
+                session_id: Some("child".into()),
+                session_name: "child".into(),
+            })
+            .await;
+        let record = sessions.inner.children.lock().await[0].clone();
+        {
+            let mut row = record.lock().await;
+            row.session_file = Some(child.to_string_lossy().into());
+            row.admission_generation = Some("newer-generation".into());
+            row.expected_message_id = Some("newer-message".into());
+            row.admission_blocked = true;
+            row.settled = false;
+        }
+        let request = json!({"expectedRevision":0,"task":configure(2)["task"],"assignment":{"childId":"old","admissionGeneration":"old-g","incarnation":"old-worker","assignmentId":"a","taskGeneration":1,"ownership":"lane","acceptanceRef":"accept","artifactRef":"artifact","dependenciesSatisfied":true}});
+        {
+            let mut gate = sessions.inner.gate.lock().unwrap();
+            gate.task = Some(serde_json::from_value(request["task"].clone()).unwrap());
+            gate.assignments = vec![serde_json::from_value(request["assignment"].clone()).unwrap()];
+        }
+        let fact = crate::journal::OwnerCancelFact {
+            parent_session_file: parent.to_string_lossy().into(),
+            child_session_file: child.to_string_lossy().into(),
+            child_id: "old".into(),
+            admission_generation: Some("old-g".into()),
+            expected_message_id: Some("old-message".into()),
+        };
+        let before = serde_json::to_value(&*sessions.inner.gate.lock().unwrap()).unwrap();
+        assert_eq!(
+            sessions
+                .historical_owner_cancellation(&request, &[fact.clone()])
+                .await
+                .unwrap()["status"],
+            "found"
+        );
+        assert_eq!(
+            serde_json::to_value(&*sessions.inner.gate.lock().unwrap()).unwrap(),
+            before
+        );
+        {
+            let row = record.lock().await;
+            assert_eq!(
+                row.admission_generation.as_deref(),
+                Some("newer-generation")
+            );
+            assert_eq!(row.expected_message_id.as_deref(), Some("newer-message"));
+            assert!(row.admission_blocked && !row.settled && !row.owner_cancelled);
+        }
+        let mut forged = request.clone();
+        forged["fact"] = json!(fact);
+        assert!(sessions
+            .historical_owner_cancellation(&forged, &[])
+            .await
+            .is_err());
+        sessions.set_identity(ParentIdentity {
+            rlm_depth: 1,
+            session_file: Some(parent.to_string_lossy().into()),
+            ..ParentIdentity::with_default_depth()
+        });
+        assert!(sessions
+            .historical_owner_cancellation(&request, &[])
+            .await
+            .is_err());
+        sessions.set_identity(ParentIdentity {
+            session_file: Some(parent.to_string_lossy().into()),
+            ..ParentIdentity::with_default_depth()
+        });
+        {
+            let held_row = record.lock().await;
+            let lookup =
+                sessions.historical_owner_cancellation(&request, std::slice::from_ref(&fact));
+            tokio::pin!(lookup);
+            assert!(futures::poll!(&mut lookup).is_pending());
+            sessions.inner.children.lock().await.clear();
+            drop(held_row);
+            assert!(lookup.await.is_err());
+            sessions.inner.children.lock().await.push(record.clone());
+        }
+        {
+            let held_row = record.lock().await;
+            let lookup =
+                sessions.historical_owner_cancellation(&request, std::slice::from_ref(&fact));
+            tokio::pin!(lookup);
+            assert!(futures::poll!(&mut lookup).is_pending());
+            let held_registry = sessions.inner.children.lock().await;
+            drop(held_row);
+            assert!(lookup
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("Child registry busy"));
+            drop(held_registry);
+        }
+        #[cfg(unix)]
+        {
+            let original = dir.path().join("original.jsonl");
+            std::fs::rename(&child, &original).unwrap();
+            std::os::unix::fs::symlink(&original, &child).unwrap();
+            assert!(sessions
+                .historical_owner_cancellation(&request, &[fact])
+                .await
+                .is_err());
+        }
+        sessions.inner.children.lock().await.push(record.clone());
+        assert!(sessions
+            .historical_owner_cancellation(&request, &[])
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn historical_owner_cancellation_is_exact_readonly_and_coverage_limited() {
+        let task: Task = serde_json::from_value(configure(2)["task"].clone()).unwrap();
+        let assignment: Assignment = serde_json::from_value(json!({"childId":"old","admissionGeneration":"old-g","incarnation":"old-worker",
+            "assignmentId":"a","taskGeneration":1,"ownership":"lane","acceptanceRef":"accept","artifactRef":"artifact","dependenciesSatisfied":true})).unwrap();
+        let gate = Gate {
+            revision: 4,
+            task: Some(task.clone()),
+            assignments: vec![assignment.clone()],
+            ..Gate::default()
+        };
+        let before = serde_json::to_value(&gate).unwrap();
+        let request = ReconcileOwnerCancellation {
+            expected_revision: 4,
+            task,
+            assignment,
+        };
+        let fact = crate::journal::OwnerCancelFact {
+            parent_session_file: "parent".into(),
+            child_session_file: "child".into(),
+            child_id: "old".into(),
+            admission_generation: Some("old-g".into()),
+            expected_message_id: Some("old-message".into()),
+        };
+        let found = gate
+            .historical_owner_cancellation(&request, "parent", "child", &[fact.clone()])
+            .unwrap();
+        assert_eq!(found["ownerCancellation"], json!(fact));
+        assert_eq!(found["status"], "found");
+        assert_eq!(found["historicalSettlementProven"], false);
+        assert_eq!(found["incarnationAuthenticated"], false);
+        assert_eq!(found["exclusionApplicabilityProven"], false);
+        assert_eq!(found["sufficientForSettlement"], false);
+        assert_eq!(
+            gate.historical_owner_cancellation(&request, "parent", "child", &[])
+                .unwrap()["status"],
+            "not_found_in_parent_fact_set"
+        );
+        let mut newer = fact.clone();
+        newer.admission_generation = Some("newer-g".into());
+        assert_eq!(
+            gate.historical_owner_cancellation(&request, "parent", "child", &[newer])
+                .unwrap()["ownerCancellation"],
+            Value::Null
+        );
+        let mut missing_message = fact.clone();
+        missing_message.expected_message_id = None;
+        assert_eq!(
+            gate.historical_owner_cancellation(
+                &request,
+                "parent",
+                "child",
+                &[missing_message.clone()]
+            )
+            .unwrap()["messageIdentityRecorded"],
+            false
+        );
+        assert!(gate
+            .historical_owner_cancellation(
+                &request,
+                "parent",
+                "child",
+                &[fact.clone(), missing_message]
+            )
+            .is_err());
+        for (parent, child) in [("foreign", "child"), ("parent", "foreign")] {
+            assert!(gate
+                .historical_owner_cancellation(&request, parent, child, &[fact.clone()])
+                .is_err());
+        }
+        let mut bad = ReconcileOwnerCancellation {
+            expected_revision: 3,
+            task: request.task.clone(),
+            assignment: request.assignment.clone(),
+        };
+        assert!(gate
+            .historical_owner_cancellation(&bad, "parent", "child", &[fact.clone()])
+            .is_err());
+        bad.expected_revision = 4;
+        bad.task.policy_revision += 1;
+        assert!(gate
+            .historical_owner_cancellation(&bad, "parent", "child", &[fact.clone()])
+            .is_err());
+        bad.task = request.task.clone();
+        bad.assignment.artifact_ref = "different".into();
+        assert!(gate
+            .historical_owner_cancellation(&bad, "parent", "child", &[fact])
+            .is_err());
+        assert_eq!(serde_json::to_value(&gate).unwrap(), before);
+    }
+
     #[test]
     fn retask_requires_current_message_start_not_old_busy_or_queue() {
         let mut state = json!({"workerInstanceId":"new-worker","isStreaming":true,

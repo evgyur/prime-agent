@@ -1005,6 +1005,18 @@ impl AgentSessionEngine {
                     Box::pin(async move { Ok(children.gate_status().await) })
                 }),
             );
+            let historical_children = children.clone();
+            handlers.register(
+                "rlm.historical_owner_cancellation",
+                pa_core::kernel::shared::host_handler(move |payload| {
+                    let children = historical_children.clone();
+                    Box::pin(async move {
+                        children
+                            .request_historical_owner_cancellation(payload.data)
+                            .await
+                    })
+                }),
+            );
             let configure_children = children.clone();
             let configure_engine = self
                 .self_weak
