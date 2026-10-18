@@ -1050,6 +1050,25 @@ impl AgentSessionEngine {
                     Box::pin(async move { Ok(children.gate_status().await) })
                 }),
             );
+            let quarantine_children = children.clone();
+            handlers.register(
+                "rlm.quarantine_sessions",
+                pa_core::kernel::shared::host_handler(move |payload| {
+                    let children = quarantine_children.clone();
+                    Box::pin(async move {
+                        let mut request = payload.data;
+                        let object = request
+                            .as_object_mut()
+                            .ok_or_else(|| anyhow::anyhow!("Invalid quarantine payload"))?;
+                        anyhow::ensure!(
+                            object.remove("type").as_ref().and_then(Value::as_str)
+                                == Some("rlm.quarantine_sessions"),
+                            "Quarantine transport type mismatch"
+                        );
+                        children.request_quarantine_sessions(request).await
+                    })
+                }),
+            );
             let historical_children = children.clone();
             handlers.register(
                 "rlm.historical_owner_cancellation",

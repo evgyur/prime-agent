@@ -70,7 +70,22 @@ impl TurnRunner {
                 }
                 // A cleared suspension alone must not admit: a manual
                 // compaction is a busy state the resume sites do NOT clear.
-                if self.input_pauses.paused() || core.queued_input_suspended || core.compacting {
+                let quarantined = core
+                    .store
+                    .as_ref()
+                    .filter(|store| !store.path.as_os_str().is_empty())
+                    .is_some_and(|store| {
+                        crate::lease::assert_session_not_quarantined(
+                            &self.passivation.agent_dir,
+                            &store.path,
+                        )
+                        .is_err()
+                    });
+                if quarantined
+                    || self.input_pauses.paused()
+                    || core.queued_input_suspended
+                    || core.compacting
+                {
                     core.busy = false;
                     None
                 } else if core.steering.front().is_some() {
@@ -519,6 +534,28 @@ impl TurnRunner {
         items: Vec<QueuedItem>,
         started_message_ids: Vec<(String, Option<String>)>,
     ) {
+        let path = self
+            .core
+            .lock()
+            .unwrap()
+            .store
+            .as_ref()
+            .map(|store| store.path.clone());
+        if let Some(path) = path.filter(|p| !p.as_os_str().is_empty()) {
+            if let Err(error) =
+                crate::lease::assert_session_not_quarantined(&self.passivation.agent_dir, &path)
+            {
+                let mut core = self.core.lock().unwrap();
+                for item in items.into_iter().rev() {
+                    core.follow_up.push_front(item);
+                }
+                core.queued_input_suspended = true;
+                core.busy = false;
+                eprintln!("pa-daemon: session quarantine denied queued start: {error:#}");
+                self.idle_notify.notify_waiters();
+                return;
+            }
+        }
         let Some((first, batched)) = items.split_first() else {
             return;
         };

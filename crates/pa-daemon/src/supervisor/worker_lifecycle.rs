@@ -175,6 +175,9 @@ impl Supervisor {
             ),
             _ => session_path.clone(),
         };
+        if let Some(file) = session_path.as_deref() {
+            crate::lease::assert_session_not_quarantined(&self.options.agent_dir, Path::new(file))?;
+        }
         let saved_cwd = if explicit_cwd.is_none() {
             session_path
                 .as_deref()

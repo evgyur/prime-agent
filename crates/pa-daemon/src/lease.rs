@@ -10,6 +10,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+mod quarantine;
+pub(crate) use quarantine::{
+    assert_session_not_quarantined, persist_session_quarantine, quarantine_command_is_control,
+    SessionQuarantine,
+};
+
 pub const SESSION_LEASES_ENABLED_ENV: &str = "PRIME_AGENT_INTERNAL_SESSION_LEASES";
 pub const SESSION_LEASE_OWNER_ID_ENV: &str = "PRIME_AGENT_INTERNAL_SESSION_LEASE_OWNER_ID";
 
@@ -320,9 +326,14 @@ fn with_lease_guard<T>(
             directory.display()
         ));
     }
-    let result = action();
-    let _ = fs::remove_dir_all(&guard);
-    result
+    struct GuardCleanup(PathBuf);
+    impl Drop for GuardCleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = GuardCleanup(guard);
+    action()
 }
 
 /// Private supervisor-to-worker proof of an already-held session lease.
@@ -476,7 +487,15 @@ impl SessionLease {
                 && canonical_session_path(path) == self.session_path,
             "session lease does not own append target"
         );
-        action()
+        let agent_dir = self
+            .directory
+            .parent()
+            .and_then(Path::parent)
+            .expect("lease agent root");
+        with_lease_guard(&self.directory, GuardWait::ThroughStale, || {
+            quarantine::assert_not_quarantined_locked(agent_dir, &self.session_path)?;
+            action()
+        })
     }
 
     pub(crate) fn append(&self, path: &Path, bytes: &[u8]) -> Result<()> {
@@ -558,6 +577,7 @@ pub fn acquire_runtime_session_lease(
 
     // The open path outlasts the stale window (see `GuardWait::ThroughStale`).
     with_lease_guard(&directory, GuardWait::ThroughStale, || {
+        quarantine::assert_not_quarantined_locked(agent_dir, &canonical)?;
         for _ in 0..3 {
             let token = uuid::Uuid::new_v4().to_string();
             let candidate = directory.with_extension(format!(

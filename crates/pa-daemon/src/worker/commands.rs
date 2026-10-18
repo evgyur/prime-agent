@@ -13,6 +13,50 @@ use crate::protocol::DaemonResponse;
 
 impl Worker {
     pub(crate) async fn dispatch(&self, command_type: &str, payload: &Value) -> DaemonResponse {
+        if command_type == "configure_orchestration_gate"
+            && payload.get("quarantineSessions").is_some()
+        {
+            let result = async {
+                anyhow::ensure!(
+                    payload
+                        .as_object()
+                        .is_some_and(|object| object.keys().all(|key| matches!(
+                            key.as_str(),
+                            "quarantineSessions" | "type" | "id" | "activeSessionId" | "clientId"
+                        ))),
+                    "Unexpected quarantine fields"
+                );
+                let children = self
+                    .agent_engine
+                    .as_ref()
+                    .and_then(|engine| engine.children.as_ref())
+                    .ok_or_else(|| anyhow::anyhow!("Orchestration children unavailable"))?;
+                children
+                    .quarantine_sessions(&payload["quarantineSessions"])
+                    .await
+            }
+            .await;
+            return match result {
+                Ok(value) => response_success(None, command_type, Some(value)),
+                Err(error) => response_failure(None, command_type, &format!("{error:#}"), None),
+            };
+        }
+        if !crate::lease::quarantine_command_is_control(command_type) {
+            let path = self
+                .core
+                .lock()
+                .unwrap()
+                .store
+                .as_ref()
+                .map(|store| store.path.clone());
+            if let Some(path) = path.filter(|path| !path.as_os_str().is_empty()) {
+                if let Err(error) =
+                    crate::lease::assert_session_not_quarantined(&self.config.agent_dir, &path)
+                {
+                    return response_failure(None, command_type, &format!("{error:#}"), None);
+                }
+            }
+        }
         // Only operations that inspect or change historical branches need hydration.
         // Cancellation is deliberately excluded: it must reach the live turn immediately.
         if matches!(
@@ -1357,6 +1401,70 @@ mod bounce_text_tests {
 #[cfg(test)]
 mod owner_cancel_wire_tests {
     use super::*;
+    #[tokio::test]
+    async fn session_quarantine_denies_actual_worker_admission_routes_preserving_audit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = crate::worker::WorkerConfig {
+            socket_path: dir.path().join("w.sock"),
+            supervisor_socket_path: std::path::PathBuf::new(),
+            token: "fixture".into(),
+            worker_instance_id: String::new(),
+            active_session_id: "child".into(),
+            agent_dir: dir.path().join("agent"),
+            recovery_journal_path: dir.path().join("r.jsonl"),
+            telemetry_disabled: Some(true),
+            script: None,
+        };
+        let worker = Worker::new(config, None);
+        assert!(
+            worker
+                .dispatch("create", &json!({"noSession":true,"cwd":dir.path()}))
+                .await
+                .success
+        );
+        let path = dir.path().join("child.jsonl");
+        std::fs::write(&path, "preserved").unwrap();
+        worker.core.lock().unwrap().store.as_mut().unwrap().path = path.clone();
+        let marker = crate::lease::SessionQuarantine {
+            version: 1,
+            parent_session_file: dir.path().join("parent.jsonl").to_string_lossy().into(),
+            child_id: "child".into(),
+            child_session_file: path.to_string_lossy().into(),
+            task: json!({}),
+            assignment: json!({}),
+            current_admission_generation: None,
+            current_expected_message_id: None,
+        };
+        crate::lease::persist_session_quarantine(&worker.config.agent_dir, &marker).unwrap();
+        for command in [
+            "prompt",
+            "prompt_and_wait",
+            "steer",
+            "follow_up",
+            "start_side_question",
+            "attach",
+            "reattach",
+            "resume_queue",
+            "execute_bash",
+            "worker_deliver_message",
+            "compact",
+            "restore_next_turn",
+        ] {
+            let response = worker
+                .dispatch(command, &json!({"message":"must-not-admit"}))
+                .await;
+            assert!(!response.success, "quarantine route {command} admitted");
+            assert!(
+                response.error.as_deref().unwrap().contains("quarantined"),
+                "{command}: {response:?}"
+            );
+        }
+        assert!(worker.dispatch("get_state", &json!({})).await.success);
+        assert!(worker.core.lock().unwrap().steering.is_empty());
+        assert!(worker.core.lock().unwrap().follow_up.is_empty());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "preserved");
+    }
+
     #[tokio::test]
     async fn historical_owner_cancellation_and_owner_cancel_wire_normalize_only_transport_fields() {
         let dir = tempfile::TempDir::new().unwrap();

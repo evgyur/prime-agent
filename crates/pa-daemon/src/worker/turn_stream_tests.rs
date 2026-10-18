@@ -78,6 +78,64 @@ fn burst_runner(engine: Arc<dyn SessionEngine>) -> TurnRunner {
     }
 }
 
+#[tokio::test]
+async fn session_quarantine_denies_already_queued_goal_or_cron_turn_start() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let file = dir.path().join("s.jsonl");
+    let engine: Arc<dyn SessionEngine> = Arc::new(GateProbeEngine {
+        frames: Vec::new(),
+        boundaries: Mutex::new(Vec::new()),
+    });
+    let mut runner = burst_runner(engine.clone());
+    runner.passivation.agent_dir = dir.path().join("agent");
+    let mut store = SessionFile::create("/fixture", None, 0);
+    store.path = file.clone();
+    runner.core.lock().unwrap().store = Some(store);
+    std::fs::write(&file, "preserved").unwrap();
+    crate::lease::persist_session_quarantine(
+        &runner.passivation.agent_dir,
+        &crate::lease::SessionQuarantine {
+            version: 1,
+            parent_session_file: dir.path().join("p.jsonl").to_string_lossy().into(),
+            child_id: "c".into(),
+            child_session_file: file.to_string_lossy().into(),
+            task: json!({}),
+            assignment: json!({}),
+            current_admission_generation: None,
+            current_expected_message_id: None,
+        },
+    )
+    .unwrap();
+    let mut events = runner.events.subscribe();
+    runner
+        .run_turn(
+            engine,
+            vec![QueuedItem {
+                priority: QueuePriority::Background,
+                preview: None,
+                message: "scheduled".into(),
+                custom_message: None,
+                agent_message: None,
+                queue_key: Some("goal-or-cron".into()),
+                admission_id: None,
+                images: Vec::new(),
+                done: None,
+                queue_visible: true,
+                policy: TurnPolicy::Queued,
+                forced_batch: false,
+            }],
+        )
+        .await;
+    assert!(
+        events.try_recv().is_err(),
+        "No agent_start/provider events under quarantine"
+    );
+    let core = runner.core.lock().unwrap();
+    assert!(core.queued_input_suspended && !core.busy);
+    assert_eq!(core.follow_up.len(), 1);
+    assert_eq!(std::fs::read_to_string(file).unwrap(), "preserved");
+}
+
 async fn turn_session_events(engine: Arc<dyn SessionEngine>) -> Vec<Value> {
     let runner = burst_runner(Arc::clone(&engine));
     let mut subscription = runner.events.subscribe();

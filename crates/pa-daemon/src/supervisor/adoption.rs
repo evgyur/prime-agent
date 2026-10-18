@@ -43,6 +43,94 @@ mod recorded_process_tests {
     }
 
     #[tokio::test]
+    async fn session_quarantine_denies_persisted_adoption_launch_and_restart_without_signal() {
+        use super::*;
+        let dir = tempfile::TempDir::new().unwrap();
+        let options = crate::supervisor::SupervisorOptions {
+            socket_path: dir.path().join("s.sock"),
+            agent_dir: dir.path().join("agent"),
+        };
+        let supervisor = Arc::new(
+            Supervisor::new(crate::supervisor::SupervisorOptions {
+                socket_path: options.socket_path.clone(),
+                agent_dir: options.agent_dir.clone(),
+            })
+            .unwrap(),
+        );
+        let file = dir.path().join("child.jsonl");
+        std::fs::write(&file, "preserved").unwrap();
+        let descriptor: pa_types::daemon::DaemonWorkerDescriptor = serde_json::from_value(serde_json::json!({"version":2,"workerId":"child","pid":std::process::id(),"socketPath":"missing.sock","recoveryJournalPath":"do-not-read","supervisorSocketPath":options.socket_path,"authenticationToken":"fixture","rootActiveSessionId":"child","sessionFile":file,"createdAt":"t","updatedAt":"t","lifecycle":"ready","createCommand":{},"consecutiveFailures":0})).unwrap();
+        let descriptor_path = dir.path().join("child-descriptor.json");
+        crate::descriptor::persist_worker(&descriptor_path, &descriptor).unwrap();
+        crate::lease::persist_session_quarantine(
+            &options.agent_dir,
+            &crate::lease::SessionQuarantine {
+                version: 1,
+                parent_session_file: dir.path().join("parent.jsonl").to_string_lossy().into(),
+                child_id: "child".into(),
+                child_session_file: file.to_string_lossy().into(),
+                task: serde_json::json!({}),
+                assignment: serde_json::json!({}),
+                current_admission_generation: None,
+                current_expected_message_id: None,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            supervisor
+                .adopt_persisted_worker(
+                    descriptor_path.clone(),
+                    descriptor.clone(),
+                    AdoptionBoot::PlainStartup
+                )
+                .await,
+            AdoptionOutcome::Failed
+        ));
+        supervisor
+            .registry
+            .insert(ResidentWorker::new(
+                "child".into(),
+                descriptor.clone(),
+                descriptor_path.clone(),
+            ))
+            .await;
+        let registration: DaemonCommand = serde_json::from_value(serde_json::json!({"type":"worker_register","activeSessionId":"child","sessionId":"child","socketPath":"new.sock","workerInstanceId":"replacement","token":"fixture","pid":std::process::id()})).unwrap();
+        let response = supervisor
+            .handle_worker_register("id", "worker_register", &registration)
+            .await;
+        assert!(!response.success);
+        assert!(response.error.as_deref().unwrap().contains("quarantined"));
+        assert_eq!(
+            supervisor
+                .registry
+                .get("child")
+                .await
+                .unwrap()
+                .descriptor
+                .lock()
+                .await
+                .socket_path,
+            "missing.sock"
+        );
+        let resident = ResidentWorker::new("child".into(), descriptor, descriptor_path.clone());
+        assert!(supervisor
+            .spawn_worker_process(
+                &resident,
+                worker_connect_deadline(),
+                super::super::TempSync::Unsynced
+            )
+            .await
+            .is_err());
+        let create: DaemonCommand =
+            serde_json::from_value(serde_json::json!({"type":"create","sessionPath":file}))
+                .unwrap();
+        assert!(supervisor.launch_worker(&create, None).await.is_err());
+        assert!(descriptor_path.exists());
+        assert!(crate::lease::is_process_alive(std::process::id()).unwrap());
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "preserved");
+    }
+
+    #[tokio::test]
     async fn live_unverified_tombstone_is_failed_not_counted_as_stopped() {
         use super::{AdoptionBoot, AdoptionOutcome, Supervisor};
         use std::sync::Arc;
@@ -250,6 +338,15 @@ impl Supervisor {
         descriptor: crate::descriptor::WorkerDescriptor,
         boot: AdoptionBoot,
     ) -> AdoptionOutcome {
+        if let Some(file) = descriptor.session_file.as_deref() {
+            if let Err(error) = crate::lease::assert_session_not_quarantined(
+                &self.options.agent_dir,
+                Path::new(file),
+            ) {
+                self.log_line(&format!("session quarantine denies adoption: {error:#}"));
+                return AdoptionOutcome::Failed;
+            }
+        }
         let worker_id = descriptor.worker_id.clone();
         let guard = self.registry.adoption_guard(&worker_id).await;
         if self.registry.get(&worker_id).await.is_some() {
@@ -485,6 +582,20 @@ impl Supervisor {
         let guard = self.registry.adoption_guard(active_session_id).await;
         let (resident, re_arm_monitor) = match self.registry.get(active_session_id).await {
             Some(resident) => {
+                {
+                    let descriptor = resident.descriptor.lock().await;
+                    if token.as_str() != descriptor.authentication_token {
+                        return fail("Session worker authentication failed");
+                    }
+                    if let Some(file) = descriptor.session_file.as_deref() {
+                        if let Err(error) = crate::lease::assert_session_not_quarantined(
+                            &self.options.agent_dir,
+                            Path::new(file),
+                        ) {
+                            return fail(&format!("{error:#}"));
+                        }
+                    }
+                }
                 // The monitor ownership reads before this registration's
                 // descriptor update overwrites the pid: a registrant naming
                 // a different process than the watched one takes the resident.
@@ -672,6 +783,9 @@ impl Supervisor {
         let mut descriptor: crate::descriptor::WorkerDescriptor = serde_json::from_str(&content)
             .with_context(|| format!("invalid descriptor {}", descriptor_path.display()))?;
         crate::descriptor::validate_descriptor(&descriptor, &self.options.socket_path)?;
+        if let Some(file) = descriptor.session_file.as_deref() {
+            crate::lease::assert_session_not_quarantined(&self.options.agent_dir, Path::new(file))?;
+        }
         if token != descriptor.authentication_token.as_str() {
             return Err(anyhow!("Session worker authentication failed"));
         }

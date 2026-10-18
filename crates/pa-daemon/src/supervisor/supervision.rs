@@ -538,6 +538,12 @@ impl Supervisor {
         connect_deadline: tokio::time::Instant,
         spawn_record_sync: TempSync,
     ) -> Result<SpawnedWorker> {
+        if let Some(file) = resident.descriptor.lock().await.session_file.as_deref() {
+            crate::lease::assert_session_not_quarantined(
+                &self.options.agent_dir,
+                std::path::Path::new(file),
+            )?;
+        }
         // One env definition for spawn and for the update roster's `launch_env` row
         // (spec §8: "env snapshot to respawn the worker identically").
         let (worker_socket, cwd, launch_env, orphan_path) = {

@@ -72,6 +72,23 @@ struct ReconcileOwnerCancellation {
     assignment: Assignment,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct QuarantineRequest {
+    parent_session_file: String,
+    expected_revision: u64,
+    task: Task,
+    targets: Vec<QuarantineTarget>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct QuarantineTarget {
+    assignment: Assignment,
+    session_file: String,
+    current_admission_generation: Option<String>,
+    current_expected_message_id: Option<String>,
+}
+
 /// A retained management boundary, not permission to admit a model or worker turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -392,6 +409,143 @@ impl SupervisorChildSessions {
             }
         }
     }
+    pub(crate) async fn request_quarantine_sessions(&self, request: Value) -> Result<Value> {
+        let token = std::env::var("PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN")
+            .map_err(|_| anyhow!("Native owner authentication unavailable"))?;
+        self.inner
+            .command(
+                &DaemonCommand::ConfigureOrchestrationGate {
+                    id: None,
+                    active_session_id: self.inner.parent_active_session_id.clone(),
+                    rest: Map::from_iter([
+                        ("workerToken".into(), json!(token)),
+                        ("quarantineSessions".into(), request),
+                    ]),
+                },
+                STATE_TIMEOUT_MS,
+            )
+            .await
+    }
+
+    /// Future admission fence only. Existing work and old execution obligations remain unknown.
+    pub(crate) async fn quarantine_sessions(&self, payload: &Value) -> Result<Value> {
+        let mut request: QuarantineRequest = serde_json::from_value(payload.clone())?;
+        request
+            .targets
+            .sort_by(|a, b| a.assignment.child_id.cmp(&b.assignment.child_id));
+        anyhow::ensure!(
+            !request.targets.is_empty() && request.targets.len() <= MAX_ACTIVE,
+            "Bounded session target list required"
+        );
+        let snapshot = self.inner.children.lock().await.clone();
+        let mut selected = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for target in &request.targets {
+            anyhow::ensure!(
+                seen.insert(target.assignment.child_id.clone()),
+                "Duplicate quarantine child"
+            );
+            let mut found = Vec::new();
+            for record in &snapshot {
+                if record.lock().await.rlm_child_id == target.assignment.child_id {
+                    found.push(record.clone());
+                }
+            }
+            anyhow::ensure!(found.len() == 1, "Unique direct child identity required");
+            selected.push(found.pop().expect("one child"));
+        }
+        let mut rows = Vec::new();
+        for record in selected {
+            rows.push(record.lock_owned().await);
+        }
+        let children = self
+            .inner
+            .children
+            .try_lock()
+            .map_err(|_| anyhow!("Child registry busy; retry exact quarantine request"))?;
+        anyhow::ensure!(
+            children.len() == snapshot.len()
+                && children
+                    .iter()
+                    .zip(&snapshot)
+                    .all(|(a, b)| Arc::ptr_eq(a, b)),
+            "Child registry changed"
+        );
+        let identity = self.inner.identity.lock().expect("identity lock").clone();
+        anyhow::ensure!(
+            identity.rlm_depth == 0,
+            "Only root owner may quarantine sessions"
+        );
+        let parent = identity
+            .session_file
+            .as_deref()
+            .ok_or_else(|| anyhow!("Parent identity unavailable"))?;
+        anyhow::ensure!(
+            parent == request.parent_session_file
+                && Path::new(parent).is_absolute()
+                && crate::lease::canonical_session_path(Path::new(parent)) == Path::new(parent),
+            "Canonical parent required"
+        );
+        let gate = self.inner.gate.lock().expect("gate lock");
+        anyhow::ensure!(
+            gate.revision == request.expected_revision && gate.task.as_ref() == Some(&request.task),
+            "Exact quarantine revision/task required"
+        );
+        let current_identity = self
+            .inner
+            .identity
+            .try_lock()
+            .map_err(|_| anyhow!("Parent identity busy; retry exact quarantine request"))?;
+        anyhow::ensure!(
+            current_identity.rlm_depth == 0
+                && current_identity.session_file.as_deref() == Some(parent),
+            "Parent identity changed"
+        );
+        let mut markers = Vec::new();
+        for (target, row) in request.targets.iter().zip(&rows) {
+            anyhow::ensure!(
+                gate.assignments
+                    .iter()
+                    .filter(|a| *a == &target.assignment)
+                    .count()
+                    == 1,
+                "Exact persisted assignment required"
+            );
+            anyhow::ensure!(
+                row.session_file.as_deref() == Some(&target.session_file)
+                    && row.admission_generation == target.current_admission_generation
+                    && row.expected_message_id == target.current_expected_message_id
+                    && Path::new(&target.session_file).is_absolute()
+                    && crate::lease::canonical_session_path(Path::new(&target.session_file))
+                        == Path::new(&target.session_file),
+                "Exact current child session/admission required"
+            );
+            markers.push(crate::lease::SessionQuarantine {
+                version: 1,
+                parent_session_file: parent.into(),
+                child_id: row.rlm_child_id.clone(),
+                child_session_file: target.session_file.clone(),
+                task: serde_json::to_value(&request.task)?,
+                assignment: serde_json::to_value(&target.assignment)?,
+                current_admission_generation: target.current_admission_generation.clone(),
+                current_expected_message_id: target.current_expected_message_id.clone(),
+            });
+        }
+        let mut effects = Vec::new();
+        for marker in markers {
+            match crate::lease::persist_session_quarantine(&self.inner.agent_dir, &marker) {
+                Ok(()) => effects.push(json!({"childId":marker.child_id,"sessionFile":marker.child_session_file,"status":"future_fenced"})),
+                Err(error) => return Ok(json!({"status":"partial_or_pending","revision":gate.revision,"quarantines":effects,
+                    "failedChildId":marker.child_id,"failedTargetMayBeFenced":true,"error":format!("{error:#}"),"historicalSettlementProven":false,
+                    "processExitObserved":false,"sufficientForSettlement":false})),
+            }
+        }
+        Ok(
+            json!({"status":"future_fenced_historical_coverage_pending","revision":gate.revision,
+            "quarantines":effects,"historicalSettlementProven":false,"processExitObserved":false,"sufficientForSettlement":false}),
+        )
+    }
+
     pub(crate) async fn request_historical_owner_cancellation(
         &self,
         request: Value,
@@ -1208,6 +1362,141 @@ mod tests {
             .historical_owner_cancellation(&request, &[])
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn session_quarantine_exact_owner_refs_leave_gate_and_old_obligation_unchanged() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let parent = dir.path().join("parent.jsonl");
+        let child = dir.path().join("child.jsonl");
+        std::fs::write(&parent, "parent").unwrap();
+        std::fs::write(&child, "child").unwrap();
+        let sessions = SupervisorChildSessions::new(
+            Arc::new(crate::supervisor_link::SupervisorLink::new(PathBuf::new())),
+            dir.path().into(),
+            "parent".into(),
+            Arc::new(crate::model_allowlist::ModelRefusalTelemetry::new(
+                dir.path().into(),
+                true,
+            )),
+        );
+        sessions.set_identity(ParentIdentity {
+            session_file: Some(parent.to_string_lossy().into()),
+            ..ParentIdentity::with_default_depth()
+        });
+        sessions
+            .push_test_child(super::super::RlmChildIdentity {
+                rlm_child_id: "child".into(),
+                active_session_id: "current".into(),
+                session_id: Some("child".into()),
+                session_name: "child".into(),
+            })
+            .await;
+        let record = sessions.inner.children.lock().await[0].clone();
+        {
+            let mut row = record.lock().await;
+            row.session_file = Some(child.to_string_lossy().into());
+            row.admission_generation = Some("current-g".into());
+            row.expected_message_id = Some("current-m".into());
+            row.settled = false;
+            row.admission_blocked = true;
+        }
+        let assignment = json!({"childId":"child","admissionGeneration":"old-g","incarnation":"old-worker","assignmentId":"a","taskGeneration":1,"ownership":"lane","acceptanceRef":"accept","artifactRef":"artifact","dependenciesSatisfied":true});
+        let request = json!({"parentSessionFile":parent,"expectedRevision":7,"task":configure(2)["task"],"targets":[{"assignment":assignment,"sessionFile":child,"currentAdmissionGeneration":"current-g","currentExpectedMessageId":"current-m"}]});
+        {
+            let mut gate = sessions.inner.gate.lock().unwrap();
+            gate.revision = 7;
+            gate.task = Some(serde_json::from_value(request["task"].clone()).unwrap());
+            gate.assignments = vec![serde_json::from_value(assignment).unwrap()];
+            gate.suspended = true;
+            gate.attempts = 2;
+        }
+        let before = serde_json::to_value(&*sessions.inner.gate.lock().unwrap()).unwrap();
+        let mut wrong = request.clone();
+        wrong["expectedRevision"] = json!(6);
+        assert!(sessions.quarantine_sessions(&wrong).await.is_err());
+        wrong = request.clone();
+        wrong["targets"][0]["sessionFile"] = json!(parent);
+        assert!(sessions.quarantine_sessions(&wrong).await.is_err());
+        wrong = request.clone();
+        wrong["targets"][0]["assignment"]["ownership"] = json!("foreign");
+        assert!(sessions.quarantine_sessions(&wrong).await.is_err());
+        assert!(crate::lease::assert_session_not_quarantined(dir.path(), &child).is_ok());
+        let result = sessions.quarantine_sessions(&request).await.unwrap();
+        assert_eq!(
+            result["status"],
+            "future_fenced_historical_coverage_pending"
+        );
+        assert_eq!(result["sufficientForSettlement"], false);
+        assert_eq!(
+            sessions.quarantine_sessions(&request).await.unwrap(),
+            result
+        );
+        assert_eq!(
+            serde_json::to_value(&*sessions.inner.gate.lock().unwrap()).unwrap(),
+            before
+        );
+        assert!(!record.lock().await.owner_cancelled);
+        assert!(record.lock().await.admission_blocked);
+        assert!(crate::lease::assert_session_not_quarantined(dir.path(), &child).is_err());
+        assert!(crate::lease::assert_session_not_quarantined(dir.path(), &parent).is_ok());
+        let second = dir.path().join("second.jsonl");
+        std::fs::write(&second, "second").unwrap();
+        sessions
+            .push_test_child(super::super::RlmChildIdentity {
+                rlm_child_id: "z-second".into(),
+                active_session_id: "second".into(),
+                session_id: Some("second".into()),
+                session_name: "second".into(),
+            })
+            .await;
+        let second_record = sessions.inner.children.lock().await[1].clone();
+        {
+            let mut row = second_record.lock().await;
+            row.session_file = Some(second.to_string_lossy().into());
+            row.admission_generation = Some("second-g".into());
+            row.expected_message_id = Some("second-m".into());
+        }
+        let mut second_assignment = request["targets"][0]["assignment"].clone();
+        second_assignment["childId"] = json!("z-second");
+        second_assignment["assignmentId"] = json!("second");
+        sessions
+            .inner
+            .gate
+            .lock()
+            .unwrap()
+            .assignments
+            .push(serde_json::from_value(second_assignment.clone()).unwrap());
+        let conflict = crate::lease::SessionQuarantine {
+            version: 1,
+            parent_session_file: parent.to_string_lossy().into(),
+            child_id: "z-second".into(),
+            child_session_file: second.to_string_lossy().into(),
+            task: json!({"different":"receipt"}),
+            assignment: second_assignment.clone(),
+            current_admission_generation: Some("second-g".into()),
+            current_expected_message_id: Some("second-m".into()),
+        };
+        crate::lease::persist_session_quarantine(dir.path(), &conflict).unwrap();
+        let mut batch = request.clone();
+        batch["targets"].as_array_mut().unwrap().push(json!({"assignment":second_assignment,"sessionFile":second,"currentAdmissionGeneration":"second-g","currentExpectedMessageId":"second-m"}));
+        let partial = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            sessions.quarantine_sessions(&batch),
+        )
+        .await
+        .expect("two-target batch must not self-deadlock")
+        .unwrap();
+        assert_eq!(partial["status"], "partial_or_pending");
+        assert_eq!(partial["quarantines"].as_array().unwrap().len(), 1);
+        assert_eq!(partial["failedChildId"], "z-second");
+        assert!(crate::lease::assert_session_not_quarantined(dir.path(), &child).is_err());
+        sessions.set_identity(ParentIdentity {
+            rlm_depth: 1,
+            session_file: Some(parent.to_string_lossy().into()),
+            ..ParentIdentity::with_default_depth()
+        });
+        assert!(sessions.quarantine_sessions(&request).await.is_err());
     }
 
     #[test]

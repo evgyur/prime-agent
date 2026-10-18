@@ -344,6 +344,15 @@ async def orchestration_status() -> dict[str, Any]:
     return await host_request("rlm.orchestration_status")
 
 
+async def quarantine_sessions(payload: dict[str, Any]) -> dict[str, Any]:
+    """Fence future admission for parentSessionFile/expectedRevision/task/targets.
+
+    Each target carries full persisted assignment and exact current session/admission/message refs.
+    Does not stop or settle historical work. Partial persistence remains fenced; no release API.
+    """
+    return await host_request("rlm.quarantine_sessions", payload)
+
+
 async def historical_owner_cancellation(payload: dict[str, Any]) -> dict[str, Any]:
     """Read retained parent cancellation facts for exact revision/task/full assignment.
 
@@ -653,6 +662,7 @@ class _RLMFactoryNamespace:
 class _RLMNamespace:
     orchestration_status = staticmethod(orchestration_status)
     historical_owner_cancellation = staticmethod(historical_owner_cancellation)
+    quarantine_sessions = staticmethod(quarantine_sessions)
     configure_orchestration_gate = staticmethod(configure_orchestration_gate)
     harness = _harness_state
     get_harness_state = staticmethod(get_harness_state)

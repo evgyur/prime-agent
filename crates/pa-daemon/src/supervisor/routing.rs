@@ -322,6 +322,47 @@ impl Supervisor {
         // itself; `None` (supervisor-internal callers) forces the typed path.
         raw_out: Option<&tokio::sync::mpsc::Sender<(Vec<Outbound>, bool)>>,
     ) -> (Vec<Value>, bool) {
+        if let DaemonCommand::ConfigureOrchestrationGate {
+            active_session_id,
+            rest,
+            ..
+        } = command
+        {
+            if rest.contains_key("quarantineSessions") {
+                let result = async {
+                    anyhow::ensure!(rest.len() == 2, "Unexpected quarantine transport fields");
+                    let token = rest
+                        .get("workerToken")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| anyhow!("Owner authentication missing"))?;
+                    let owner = self
+                        .registry
+                        .find_by_token(token)
+                        .await
+                        .ok_or_else(|| anyhow!("Owner authentication failed"))?;
+                    let target = self.registry.resolve(active_session_id).await?;
+                    anyhow::ensure!(Arc::ptr_eq(&owner, &target), "Owner target mismatch");
+                    self.route_command_typed(
+                        &owner,
+                        "configure_orchestration_gate",
+                        json!({"quarantineSessions":rest["quarantineSessions"]}),
+                        ROUTE_TIMEOUT_MS,
+                        RouteAdmission::SupervisorInternal,
+                    )
+                    .await
+                }
+                .await;
+                let mut response = match result {
+                    Ok(response) => response,
+                    Err(error) => {
+                        response_failure(Some(&command_id), &type_name, &format!("{error:#}"), None)
+                    }
+                };
+                response.id = Some(command_id);
+                return (vec![response_line(&response)], false);
+            }
+        }
         if let DaemonCommand::GetOrchestrationGate {
             active_session_id,
             rest,
@@ -545,6 +586,24 @@ impl Supervisor {
                 }
             }
         };
+        if !crate::lease::quarantine_command_is_control(&type_name) {
+            if let Some(file) = resident.descriptor.lock().await.session_file.as_deref() {
+                if let Err(error) = crate::lease::assert_session_not_quarantined(
+                    &self.options.agent_dir,
+                    std::path::Path::new(file),
+                ) {
+                    return (
+                        vec![response_line(&response_failure(
+                            Some(&command_id),
+                            &type_name,
+                            &format!("{error:#}"),
+                            None,
+                        ))],
+                        false,
+                    );
+                }
+            }
+        }
         // The plain-kill gate (TS `isRootKill`): the `rlmCloseReason` marker is a child-close
         // cascade, not a root kill. Only the plain kill tombstones and finalizes BEFORE the
         // worker is told, so a mid-stop death adopts the tombstone.
@@ -1250,6 +1309,97 @@ mod saved_delete_tests {
             );
         }
     }
+    #[tokio::test]
+    async fn session_quarantine_denies_resident_routes_and_auth_forgery_without_dispatch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent = dir.path().join("agent");
+        let supervisor = Arc::new(
+            Supervisor::new(super::super::SupervisorOptions {
+                socket_path: dir.path().join("s.sock"),
+                agent_dir: agent.clone(),
+            })
+            .unwrap(),
+        );
+        let file = dir.path().join("child.jsonl");
+        std::fs::write(&file, "unchanged").unwrap();
+        let descriptor: pa_types::daemon::DaemonWorkerDescriptor = serde_json::from_value(json!({"version":1,"workerId":"child","pid":std::process::id(),"socketPath":"unused","recoveryJournalPath":"unused","supervisorSocketPath":"unused","authenticationToken":"fixture-token","rootActiveSessionId":"child","sessionFile":file,"createdAt":"t","updatedAt":"t","lifecycle":"ready","createCommand":{},"consecutiveFailures":0})).unwrap();
+        supervisor
+            .registry
+            .insert(ResidentWorker::new(
+                "child".into(),
+                descriptor,
+                dir.path().join("descriptor"),
+            ))
+            .await;
+        crate::lease::persist_session_quarantine(
+            &agent,
+            &crate::lease::SessionQuarantine {
+                version: 1,
+                parent_session_file: dir.path().join("parent.jsonl").to_string_lossy().into(),
+                child_id: "child".into(),
+                child_session_file: file.to_string_lossy().into(),
+                task: json!({}),
+                assignment: json!({}),
+                current_admission_generation: None,
+                current_expected_message_id: None,
+            },
+        )
+        .unwrap();
+        let (queue, _received) = mpsc::channel(4);
+        let attached =
+            crate::supervisor::subscribers::ClientSubscriptions::new("client".into(), queue);
+        for kind in [
+            "prompt",
+            "steer",
+            "follow_up",
+            "attach",
+            "reattach",
+            "start_side_question",
+        ] {
+            let mut wire = json!({"type":kind,"activeSessionId":"child","message":"blocked"});
+            if kind == "reattach" {
+                wire["targetActiveSessionId"] = json!("child");
+            }
+            let command: DaemonCommand = serde_json::from_value(wire).unwrap();
+            let (lines, _) = supervisor
+                .route_client_command(
+                    &command,
+                    "client",
+                    &attached,
+                    "id".into(),
+                    kind.into(),
+                    None,
+                )
+                .await;
+            assert_eq!(lines[0]["success"], false, "{kind}");
+            assert!(
+                lines[0]["error"].as_str().unwrap().contains("quarantined"),
+                "{kind}: {lines:?}"
+            );
+        }
+        for rest in [
+            json!({"quarantineSessions":{}}),
+            json!({"quarantineSessions":{},"workerToken":"forged"}),
+        ] {
+            let mut wire = rest;
+            wire["type"] = json!("configure_orchestration_gate");
+            wire["activeSessionId"] = json!("child");
+            let command: DaemonCommand = serde_json::from_value(wire).unwrap();
+            let (lines, _) = supervisor
+                .route_client_command(
+                    &command,
+                    "client",
+                    &attached,
+                    "id".into(),
+                    "configure_orchestration_gate".into(),
+                    None,
+                )
+                .await;
+            assert_eq!(lines[0]["success"], false);
+        }
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "unchanged");
+    }
+
     #[tokio::test]
     async fn historical_owner_cancellation_rejects_unauthenticated_lookup_without_wake() {
         let dir = tempfile::TempDir::new().unwrap();
