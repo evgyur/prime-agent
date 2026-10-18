@@ -682,6 +682,29 @@ impl Supervisor {
         type_name: String,
         stream: &tokio::sync::mpsc::Sender<(Vec<Outbound>, bool)>,
     ) -> (Vec<Value>, bool) {
+        if let DaemonCommand::GetOrchestrationGate { rest, .. } = command {
+            if let Some(probe) = rest.get("privateOwnerProbe") {
+                let result = (|| -> Result<Value> {
+                    anyhow::ensure!(rest.len() == 1, "Unexpected private probe fields");
+                    self.private_launch_owner
+                        .lock()
+                        .expect("launch lock")
+                        .as_mut()
+                        .ok_or_else(|| anyhow::anyhow!("Private owner unavailable"))?
+                        .probe(probe)
+                })();
+                let response = match result {
+                    Ok(value) => response_success(Some(&command_id), &type_name, Some(value)),
+                    Err(_) => response_failure(
+                        Some(&command_id),
+                        &type_name,
+                        "Private owner authentication unavailable",
+                        None,
+                    ),
+                };
+                return (vec![response_line(&response)], false);
+            }
+        }
         match command {
             DaemonCommand::AckResult { .. } => (Vec::new(), false),
             DaemonCommand::Restart { .. } | DaemonCommand::Shutdown { .. } => {

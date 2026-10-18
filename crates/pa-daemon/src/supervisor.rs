@@ -41,6 +41,7 @@ use sessions::{saved_session_row, saved_session_summary};
 
 pub(crate) use options::ClientRouting;
 pub use options::SupervisorOptions;
+pub mod private_launch;
 
 // Called only by the routing and clients siblings (their `use super::*` globs); lib-unused.
 #[allow(unused_imports)]
@@ -121,6 +122,7 @@ use crate::update_stop::{stop_workers_gracefully, WorkerStopVerdict, WORKER_REQU
 use crate::{socket, util};
 
 pub struct Supervisor {
+    pub(crate) private_launch_owner: std::sync::Mutex<Option<private_launch::LaunchOwner>>,
     pub(crate) options: SupervisorOptions,
     descriptor_dir: PathBuf,
     /// The bind-time filesystem identity of this supervisor's socket file
@@ -266,6 +268,7 @@ impl Supervisor {
             &options.agent_dir,
         ));
         Ok(Supervisor {
+            private_launch_owner: std::sync::Mutex::new(None),
             options,
             descriptor_dir,
             bound_socket_identity: std::sync::Mutex::new(None),
@@ -551,5 +554,15 @@ pub(crate) enum Outbound {
 /// Returns an error when the supervisor cannot start or its serve loop fails.
 pub async fn run_supervisor(options: SupervisorOptions) -> Result<()> {
     let supervisor = Arc::new(Supervisor::new(options)?);
+    supervisor.run().await
+}
+
+/// Run after the Studio-private inherited setup channel has closed.
+pub async fn run_private_supervisor(
+    options: SupervisorOptions,
+    owner: private_launch::LaunchOwner,
+) -> Result<()> {
+    let supervisor = Arc::new(Supervisor::new(options)?);
+    *supervisor.private_launch_owner.lock().expect("launch lock") = Some(owner);
     supervisor.run().await
 }

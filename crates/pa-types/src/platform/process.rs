@@ -797,3 +797,23 @@ mod executable_path_tests {
         assert_eq!(process_executable_path(0), None);
     }
 }
+
+/// Take the Linux Node extra-stdio Unix stream at fd 3 and prevent exec inheritance.
+/// Only the dedicated private-launch entrypoint may call this once before spawning threads.
+#[cfg(target_os = "linux")]
+pub fn take_studio_launch_stream() -> anyhow::Result<std::os::unix::net::UnixStream> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    // SAFETY: fcntl validates the inherited descriptor before ownership is taken.
+    let flags = unsafe { libc::fcntl(3, libc::F_GETFD) };
+    anyhow::ensure!(flags >= 0, "Private launch descriptor unavailable");
+    // SAFETY: dedicated entrypoint takes validated inherited fd3 exactly once.
+    let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(3) };
+    let fd = stream.as_raw_fd();
+    // SAFETY: the same owned descriptor remains live.
+    anyhow::ensure!(
+        unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == 0,
+        "Private launch descriptor flags unavailable"
+    );
+    stream.peer_addr()?;
+    Ok(stream)
+}

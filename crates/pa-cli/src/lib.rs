@@ -119,6 +119,11 @@ fn main_impl(args: &[String], runtime: &dyn mode::Runtime) -> Result<i32, String
         return Ok(crate::config_command::run());
     }
 
+    let private_launch = args.iter().any(|arg| arg == "--studio-private-launch-v1");
+    let args = args
+        .into_iter()
+        .filter(|arg| arg != "--studio-private-launch-v1")
+        .collect::<Vec<_>>();
     let parsed = args::parse_args(&args);
     if !parsed.diagnostics.is_empty() {
         for diagnostic in &parsed.diagnostics {
@@ -134,6 +139,13 @@ fn main_impl(args: &[String], runtime: &dyn mode::Runtime) -> Result<i32, String
         }
     }
 
+    if private_launch {
+        if parsed.mode != Some(args::Mode::Daemon) {
+            return Err("Private launch requires daemon mode".into());
+        }
+        return crate::daemon_mode::run_private_daemon_mode(parsed.daemon_socket.as_deref())
+            .map_err(|error| error.to_string());
+    }
     let app_mode = mode::AppMode::resolve(&parsed, std::io::stdin().is_terminal());
 
     // Enable Windows VT processing before raw ANSI mode writes.

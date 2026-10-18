@@ -1556,6 +1556,7 @@ dependencies = [
  "anyhow",
  "filetime",
  "futures",
+ "hmac",
  "nix",
  "pa-agent",
  "pa-ai",

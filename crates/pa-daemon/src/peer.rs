@@ -255,7 +255,8 @@ pub(crate) fn peer_command_allowed(
             || payload.get("acceptLegacyClosure").is_some()))
         && is_session_plane_daemon_command(command_type)
         && !(command_type == "get_orchestration_gate"
-            && payload.get("historicalOwnerCancellation").is_some())
+            && (payload.get("historicalOwnerCancellation").is_some()
+                || payload.get("privateOwnerProbe").is_some()))
         && payload.get("activeSessionId").and_then(Value::as_str)
             == Some(grant.active_session_id.as_str())
 }
