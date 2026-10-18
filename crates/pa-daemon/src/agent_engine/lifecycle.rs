@@ -17,6 +17,51 @@ use super::{
 /// the user wants first, never an imperative to execute.
 pub(crate) const BARE_SKILL_INVOCATION_INSTRUCTION: &str = "The user invoked this skill with no task text - ask what they want before executing any protocol inside it.";
 
+/// Remove the SDK host envelope, never any caller evidence or assignment fields.
+fn historical_owner_cancellation_payload(mut wire: Value) -> anyhow::Result<Value> {
+    let object = wire
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("Historical lookup host payload must be an object"))?;
+    anyhow::ensure!(
+        object.get("type").and_then(Value::as_str) == Some("rlm.historical_owner_cancellation"),
+        "Historical lookup host type mismatch"
+    );
+    anyhow::ensure!(
+        object.keys().all(|key| matches!(
+            key.as_str(),
+            "type" | "expectedRevision" | "task" | "assignment"
+        )),
+        "Unexpected historical lookup host fields"
+    );
+    object.remove("type");
+    Ok(wire)
+}
+
+#[cfg(test)]
+mod historical_transport_tests {
+    use super::*;
+
+    #[test]
+    fn historical_owner_cancellation_accepts_sdk_transport_type_only() {
+        let query = serde_json::json!({"expectedRevision":9,"task":{"taskGeneration":3},"assignment":{"childId":"old"}});
+        // rlm.host_request adds this field before repl.host_request sends data to Native.
+        let mut wire = query.clone();
+        wire["type"] = serde_json::json!("rlm.historical_owner_cancellation");
+        assert_eq!(
+            historical_owner_cancellation_payload(wire.clone()).unwrap(),
+            query
+        );
+        for forged in ["fact", "workerToken", "unexpected"] {
+            let mut injected = wire.clone();
+            injected[forged] = serde_json::json!("not-transport");
+            assert!(historical_owner_cancellation_payload(injected).is_err());
+        }
+        wire["type"] = serde_json::json!("rlm.configure_orchestration_gate");
+        assert!(historical_owner_cancellation_payload(wire).is_err());
+        assert!(historical_owner_cancellation_payload(query).is_err());
+    }
+}
+
 impl AgentSessionEngine {
     /// Build the engine: the shared async runtime, the model selection
     /// (create config), the supervisor link, the children registry, and the
@@ -1012,7 +1057,9 @@ impl AgentSessionEngine {
                     let children = historical_children.clone();
                     Box::pin(async move {
                         children
-                            .request_historical_owner_cancellation(payload.data)
+                            .request_historical_owner_cancellation(
+                                historical_owner_cancellation_payload(payload.data)?,
+                            )
                             .await
                     })
                 }),

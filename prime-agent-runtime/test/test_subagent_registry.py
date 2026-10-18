@@ -20,6 +20,17 @@ class RlmSubagentRegistryTest(unittest.TestCase):
         self.assertEqual(result, evidence)
         host_request.assert_awaited_once_with("rlm.historical_owner_cancellation", query)
 
+    def test_historical_owner_cancellation_actual_sdk_transport_envelope(self) -> None:
+        repl_module = importlib.import_module("rlm.repl")
+        query = {"expectedRevision": 9, "task": {"taskGeneration": 3}, "assignment": {"childId": "old"}}
+        evidence = {"status": "not_found_in_parent_fact_set", "sufficientForSettlement": False}
+        transport = AsyncMock(return_value={"status": "ok", "result": evidence})
+        with patch.object(repl_module, "host_request", transport):
+            result = asyncio.run(rlm_module.rlm.historical_owner_cancellation(query))
+        self.assertEqual(result, evidence)
+        transport.assert_awaited_once_with({**query, "type": "rlm.historical_owner_cancellation"})
+        self.assertNotIn("type", query)
+
     def test_lists_parent_scoped_subagents_from_host(self) -> None:
         host_request = AsyncMock(
             return_value={
