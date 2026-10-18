@@ -1,6 +1,8 @@
 //! Task-scoped orchestration accounting. No task text or automatic worker admission.
 use super::*;
 use serde::{Deserialize, Serialize};
+mod legacy_closure;
+use legacy_closure::LegacyClosureReceipt;
 
 pub(crate) const DEFAULT_CORRECTIVE_BUDGET: u32 = 2;
 pub(crate) const MAX_CORRECTIVE_BUDGET: u32 = 5;
@@ -107,6 +109,8 @@ pub(crate) struct Gate {
     assignments: Vec<Assignment>,
     #[serde(default)]
     owner_cancellation_receipts: Vec<OwnerCancellationReceipt>,
+    #[serde(default)]
+    legacy_closure_receipts: Vec<LegacyClosureReceipt>,
     #[serde(skip)]
     pub(super) authenticated_owner_cancellations: Vec<crate::journal::OwnerCancelFact>,
     exception: Option<Exception>,
@@ -148,6 +152,7 @@ impl Gate {
         }
         if self.assignments.iter().any(|assignment| {
             !self.cancellation_settles(assignment, rows)
+                && !self.legacy_closure_applies(assignment, rows)
                 && !rows.iter().any(|row| {
                     assignment_matches(assignment, row) && row["executionKind"] != "unknown"
                 })
@@ -409,6 +414,24 @@ impl SupervisorChildSessions {
             }
         }
     }
+    pub(crate) async fn request_accept_legacy_closure(&self, request: Value) -> Result<Value> {
+        let token = std::env::var("PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN")
+            .map_err(|_| anyhow!("Native owner authentication unavailable"))?;
+        self.inner
+            .command(
+                &DaemonCommand::ConfigureOrchestrationGate {
+                    id: None,
+                    active_session_id: self.inner.parent_active_session_id.clone(),
+                    rest: Map::from_iter([
+                        ("workerToken".into(), json!(token)),
+                        ("acceptLegacyClosure".into(), request),
+                    ]),
+                },
+                STATE_TIMEOUT_MS,
+            )
+            .await
+    }
+
     pub(crate) async fn request_quarantine_sessions(&self, request: Value) -> Result<Value> {
         let token = std::env::var("PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN")
             .map_err(|_| anyhow!("Native owner authentication unavailable"))?;
@@ -928,7 +951,9 @@ impl SupervisorChildSessions {
         let mut active = 0;
         let mut unknown = 0;
         for assignment in &gate.assignments {
-            if gate.cancellation_settles(assignment, &rows) {
+            if gate.cancellation_settles(assignment, &rows)
+                || gate.legacy_closure_applies(assignment, &rows)
+            {
                 continue;
             }
             match rows.iter().find(|row| assignment_matches(assignment, row)) {
@@ -994,6 +1019,7 @@ impl SupervisorChildSessions {
             "complete":unknown==0 && !gate.suspended && !revision_changed,"exception":gate.exception,
             "correctiveAttempts":gate.attempts,"assignments":rows,
             "ownerCancellationReceipts":gate.owner_cancellation_receipts,
+            "ownerAcceptedLegacyClosureReceipts":gate.legacy_closure_receipts,
             "managedContract":{"version":1,"sourceOnlyRebind":true,"causalResults":true},
             "managementScope":gate.management_scope,
             "managementObligation":gate.management_obligation.as_ref().map(|obligation| json!({
@@ -1098,15 +1124,16 @@ impl SupervisorChildSessions {
             .expect("identity lock")
             .session_file
             .clone();
-        let facts = self
-            .inner
-            .gate
-            .lock()
-            .expect("gate lock")
-            .authenticated_owner_cancellations
-            .clone();
+        let (facts, closures) = {
+            let gate = self.inner.gate.lock().expect("gate lock");
+            (
+                gate.authenticated_owner_cancellations.clone(),
+                gate.legacy_closure_receipts.clone(),
+            )
+        };
+        let agent_dir = self.inner.agent_dir.clone();
         use futures::StreamExt;
-        futures::stream::iter(records).map(|record| { let parent = parent.clone(); let facts = facts.clone(); async move {
+        futures::stream::iter(records).map(|record| { let parent = parent.clone(); let facts = facts.clone(); let closures = closures.clone(); let agent_dir = agent_dir.clone(); async move {
             let (id, selector, generation, expected, blocked, obligation)={let row=record.lock().await;
                 (row.rlm_child_id.clone(),durable_child_selector(row.session_id.as_deref(),&row.rlm_child_id),
                  row.admission_generation.clone(),row.expected_message_id.clone(),row.admission_blocked,!row.settled)};
@@ -1119,6 +1146,7 @@ impl SupervisorChildSessions {
                 else { execution_kind(state.as_ref(),expected.as_deref()) };
             json!({"childId":id,"admissionGeneration":generation,"expectedMessageId":expected,
                 "executionKind":kind,"obligation":obligation,"ownerCancellation":authenticated_cancellation(&current,parent.as_deref(),&facts),
+                "ownerAcceptedLegacyClosures":closures.iter().filter(|receipt| receipt.applies_to_record(&agent_dir,parent.as_deref(),&current)).map(|receipt|receipt.authorization_digest.clone()).collect::<Vec<_>>(),
                 "incarnation":state.as_ref().and_then(|s|s.get("workerInstanceId")),
                 "observedAt":now_ms()})
         }}).buffer_unordered(4).collect().await

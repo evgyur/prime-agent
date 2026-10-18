@@ -1050,6 +1050,25 @@ impl AgentSessionEngine {
                     Box::pin(async move { Ok(children.gate_status().await) })
                 }),
             );
+            let legacy_children = children.clone();
+            handlers.register(
+                "rlm.accept_legacy_closure",
+                pa_core::kernel::shared::host_handler(move |payload| {
+                    let children = legacy_children.clone();
+                    Box::pin(async move {
+                        let mut request = payload.data;
+                        let object = request
+                            .as_object_mut()
+                            .ok_or_else(|| anyhow::anyhow!("Invalid legacy closure payload"))?;
+                        anyhow::ensure!(
+                            object.remove("type").as_ref().and_then(Value::as_str)
+                                == Some("rlm.accept_legacy_closure"),
+                            "Legacy closure transport type mismatch"
+                        );
+                        children.request_accept_legacy_closure(request).await
+                    })
+                }),
+            );
             let quarantine_children = children.clone();
             handlers.register(
                 "rlm.quarantine_sessions",

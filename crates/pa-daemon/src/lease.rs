@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 mod quarantine;
 pub(crate) use quarantine::{
     assert_session_not_quarantined, persist_session_quarantine, quarantine_command_is_control,
-    SessionQuarantine,
+    verified_session_quarantine, SessionQuarantine,
 };
 
 pub const SESSION_LEASES_ENABLED_ENV: &str = "PRIME_AGENT_INTERNAL_SESSION_LEASES";

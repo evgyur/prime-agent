@@ -20,6 +20,16 @@ class RlmSubagentRegistryTest(unittest.TestCase):
         self.assertEqual(result, evidence)
         host_request.assert_awaited_once_with("rlm.historical_owner_cancellation", query)
 
+    def test_legacy_closure_actual_sdk_transport_requires_operator_grant(self) -> None:
+        repl_module = importlib.import_module("rlm.repl")
+        query = {"grantId": "owner-approved", "expectedRevision": 61}
+        evidence = {"kind": "owner_accepted_legacy_closure", "historicalSettlementProven": False}
+        transport = AsyncMock(return_value={"status": "ok", "result": evidence})
+        with patch.object(repl_module, "host_request", transport):
+            result = asyncio.run(rlm_module.rlm.accept_legacy_closure(query))
+        self.assertEqual(result, evidence)
+        transport.assert_awaited_once_with({**query, "type": "rlm.accept_legacy_closure"})
+
     def test_session_quarantine_actual_sdk_transport_envelope(self) -> None:
         repl_module = importlib.import_module("rlm.repl")
         query = {"parentSessionFile": "/fixture/parent.jsonl", "expectedRevision": 9, "task": {"taskGeneration": 3}, "targets": []}

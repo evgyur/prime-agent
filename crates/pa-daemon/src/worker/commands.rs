@@ -14,6 +14,34 @@ use crate::protocol::DaemonResponse;
 impl Worker {
     pub(crate) async fn dispatch(&self, command_type: &str, payload: &Value) -> DaemonResponse {
         if command_type == "configure_orchestration_gate"
+            && payload.get("acceptLegacyClosure").is_some()
+        {
+            let result = async {
+                anyhow::ensure!(
+                    payload
+                        .as_object()
+                        .is_some_and(|o| o.keys().all(|k| matches!(
+                            k.as_str(),
+                            "acceptLegacyClosure" | "type" | "id" | "activeSessionId" | "clientId"
+                        ))),
+                    "Unexpected legacy closure fields"
+                );
+                let children = self
+                    .agent_engine
+                    .as_ref()
+                    .and_then(|e| e.children.as_ref())
+                    .ok_or_else(|| anyhow::anyhow!("Orchestration children unavailable"))?;
+                children
+                    .accept_legacy_closure(&payload["acceptLegacyClosure"])
+                    .await
+            }
+            .await;
+            return match result {
+                Ok(value) => response_success(None, command_type, Some(value)),
+                Err(error) => response_failure(None, command_type, &format!("{error:#}"), None),
+            };
+        }
+        if command_type == "configure_orchestration_gate"
             && payload.get("quarantineSessions").is_some()
         {
             let result = async {

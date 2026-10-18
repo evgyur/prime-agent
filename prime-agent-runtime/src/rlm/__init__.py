@@ -344,6 +344,14 @@ async def orchestration_status() -> dict[str, Any]:
     return await host_request("rlm.orchestration_status")
 
 
+async def accept_legacy_closure(payload: dict[str, Any]) -> dict[str, Any]:
+    """Apply grantId/expectedRevision for an immutable privileged operator approval.
+
+    The SDK cannot issue approval. This records owner policy, never observed historical exit.
+    """
+    return await host_request("rlm.accept_legacy_closure", payload)
+
+
 async def quarantine_sessions(payload: dict[str, Any]) -> dict[str, Any]:
     """Fence future admission for parentSessionFile/expectedRevision/task/targets.
 
@@ -663,6 +671,7 @@ class _RLMNamespace:
     orchestration_status = staticmethod(orchestration_status)
     historical_owner_cancellation = staticmethod(historical_owner_cancellation)
     quarantine_sessions = staticmethod(quarantine_sessions)
+    accept_legacy_closure = staticmethod(accept_legacy_closure)
     configure_orchestration_gate = staticmethod(configure_orchestration_gate)
     harness = _harness_state
     get_harness_state = staticmethod(get_harness_state)

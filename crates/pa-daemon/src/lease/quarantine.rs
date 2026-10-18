@@ -42,7 +42,7 @@ fn marker_path(agent_dir: &Path, session: &Path) -> PathBuf {
     lease_directory(agent_dir, session).with_extension("quarantine.json")
 }
 
-fn read_marker(agent_dir: &Path, session: &Path) -> Result<Option<SessionQuarantine>> {
+pub(super) fn read_marker(agent_dir: &Path, session: &Path) -> Result<Option<SessionQuarantine>> {
     let root = agent_dir.join("session-leases");
     if let Ok(metadata) = fs::symlink_metadata(&root) {
         anyhow::ensure!(
@@ -75,6 +75,60 @@ pub(super) fn assert_not_quarantined_locked(agent_dir: &Path, session: &Path) ->
         "Session quarantined: future admission denied; historical execution remains unproved"
     );
     Ok(())
+}
+
+pub(crate) fn verified_session_quarantine(
+    agent_dir: &Path,
+    session: &Path,
+    expected: &SessionQuarantine,
+    digest: &str,
+) -> Result<()> {
+    #[cfg(not(unix))]
+    anyhow::bail!("Secure quarantine ownership validation unsupported");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let directory = lease_directory(agent_dir, session);
+        with_lease_guard(&directory, GuardWait::ThroughStale, || {
+            let root = agent_dir.join("session-leases");
+            anyhow::ensure!(
+                !fs::symlink_metadata(&root)?.file_type().is_symlink(),
+                "Symlink quarantine authority refused"
+            );
+            let mut options = fs::OpenOptions::new();
+            options
+                .read(true)
+                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK);
+            let mut file = options.open(marker_path(agent_dir, session))?;
+            let metadata = file.metadata()?;
+            anyhow::ensure!(
+                metadata.is_file()
+                    && metadata.nlink() == 1
+                    && metadata.uid() == pa_core::platform::process::current_user_id()
+                    && metadata.mode() & 0o777 == 0o600
+                    && metadata.len() <= 1024 * 1024,
+                "Invalid quarantine file identity/permissions/size"
+            );
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            std::io::Read::by_ref(&mut file)
+                .take(1024 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            anyhow::ensure!(bytes.len() <= 1024 * 1024, "Quarantine file too large");
+            anyhow::ensure!(
+                format!("{:x}", Sha256::digest(&bytes)) == digest,
+                "Quarantine hash mismatch"
+            );
+            let parsed: SessionQuarantine = serde_json::from_slice(&bytes)?;
+            anyhow::ensure!(
+                &parsed == expected
+                    && parsed.version == 1
+                    && Path::new(&parsed.child_session_file) == canonical_session_path(session),
+                "Exact durable quarantine required"
+            );
+            Ok(())
+        })
+    }
 }
 
 pub(crate) fn assert_session_not_quarantined(agent_dir: &Path, session: &Path) -> Result<()> {
@@ -127,6 +181,49 @@ pub(crate) fn persist_session_quarantine(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn legacy_closure_secure_marker_denies_link_mode_size_and_missing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let session = dir.path().join("s.jsonl");
+        fs::write(&session, "s").unwrap();
+        let marker = SessionQuarantine {
+            version: 1,
+            parent_session_file: dir.path().join("p.jsonl").to_string_lossy().into(),
+            child_id: "c".into(),
+            child_session_file: session.to_string_lossy().into(),
+            task: serde_json::json!({}),
+            assignment: serde_json::json!({}),
+            current_admission_generation: None,
+            current_expected_message_id: None,
+        };
+        persist_session_quarantine(dir.path(), &marker).unwrap();
+        let path = marker_path(dir.path(), &session);
+        let bytes = fs::read(&path).unwrap();
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        verified_session_quarantine(dir.path(), &session, &marker, &digest).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(verified_session_quarantine(dir.path(), &session, &marker, &digest).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("linked");
+        fs::hard_link(&path, &link).unwrap();
+        assert!(verified_session_quarantine(dir.path(), &session, &marker, &digest).is_err());
+        fs::remove_file(link).unwrap();
+        let saved = dir.path().join("saved");
+        fs::rename(&path, &saved).unwrap();
+        std::os::unix::fs::symlink(&saved, &path).unwrap();
+        assert!(verified_session_quarantine(dir.path(), &session, &marker, &digest).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::rename(saved, &path).unwrap();
+        fs::write(&path, vec![b'x'; 1024 * 1024 + 1]).unwrap();
+        assert!(verified_session_quarantine(dir.path(), &session, &marker, &digest).is_err());
+        fs::write(&path, "corrupt").unwrap();
+        assert!(verified_session_quarantine(dir.path(), &session, &marker, &digest).is_err());
+        fs::remove_file(&path).unwrap();
+        assert!(verified_session_quarantine(dir.path(), &session, &marker, &digest).is_err());
+    }
+
     #[test]
     fn session_quarantine_guard_linearizes_held_mutation_before_durable_fence() {
         let dir = tempfile::TempDir::new().unwrap();

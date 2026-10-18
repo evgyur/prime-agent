@@ -328,7 +328,12 @@ impl Supervisor {
             ..
         } = command
         {
-            if rest.contains_key("quarantineSessions") {
+            if rest.contains_key("quarantineSessions") || rest.contains_key("acceptLegacyClosure") {
+                let operation = if rest.contains_key("acceptLegacyClosure") {
+                    "acceptLegacyClosure"
+                } else {
+                    "quarantineSessions"
+                };
                 let result = async {
                     anyhow::ensure!(rest.len() == 2, "Unexpected quarantine transport fields");
                     let token = rest
@@ -346,7 +351,7 @@ impl Supervisor {
                     self.route_command_typed(
                         &owner,
                         "configure_orchestration_gate",
-                        json!({"quarantineSessions":rest["quarantineSessions"]}),
+                        json!({operation:rest[operation]}),
                         ROUTE_TIMEOUT_MS,
                         RouteAdmission::SupervisorInternal,
                     )
