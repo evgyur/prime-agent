@@ -160,7 +160,9 @@ impl Worker {
                     .orchestration_gate((command_type == "configure_orchestration_gate").then(
                         || {
                             let mut configure = payload.clone();
-                            if configure.get("ownerCancelChild").is_some() {
+                            if configure.get("ownerCancelChild").is_some()
+                                || configure.get("reconcileOwnerCancellation").is_some()
+                            {
                                 if let Some(object) = configure.as_object_mut() {
                                     object.remove("id");
                                     object.remove("type");
@@ -1354,5 +1356,25 @@ mod owner_cancel_wire_tests {
             response.error.as_deref(),
             Some("Invalid owner cancellation request")
         );
+        let request = json!({"expectedRevision":0,"task":{"projectId":"p","planId":"plan","stepId":"step","taskGeneration":1,"policyRevision":1},
+            "assignment":{"childId":"absent","admissionGeneration":"g","incarnation":"old","assignmentId":"a","taskGeneration":1,"ownership":"lane","acceptanceRef":"accept","artifactRef":"artifact","dependenciesSatisfied":true}});
+        let wire = json!({"type":"configure_orchestration_gate","id":"request","activeSessionId":"parent","clientId":"owner-client","reconcileOwnerCancellation":request});
+        let response = worker.dispatch("configure_orchestration_gate", &wire).await;
+        assert_eq!(response.error.as_deref(), Some("Direct child unavailable"));
+        let mut extra = wire.clone();
+        extra["unexpected"] = json!(true);
+        let response = worker
+            .dispatch("configure_orchestration_gate", &extra)
+            .await;
+        assert_eq!(
+            response.error.as_deref(),
+            Some("Unexpected owner reconciliation fields")
+        );
+        let mut forged = wire;
+        forged["reconcileOwnerCancellation"]["fact"] = json!({});
+        let response = worker
+            .dispatch("configure_orchestration_gate", &forged)
+            .await;
+        assert!(response.error.as_deref().unwrap().contains("unknown field"));
     }
 }

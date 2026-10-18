@@ -166,12 +166,30 @@ impl SupervisorChildSessionsInner {
         {
             let mut row = record.lock().await;
             anyhow::ensure!(
-                row.rlm_child_id == fact.child_id
+                self.identity
+                    .lock()
+                    .expect("identity lock")
+                    .session_file
+                    .as_deref()
+                    == Some(fact.parent_session_file.as_str())
+                    && row.rlm_child_id == fact.child_id
                     && row.session_file.as_deref() == Some(fact.child_session_file.as_str())
                     && row.admission_generation == fact.admission_generation
                     && row.expected_message_id == fact.expected_message_id,
                 "Owner cancellation no longer matches child admission"
             );
+            let mut gate = self.gate.lock().expect("gate lock");
+            let changed = !row.owner_cancelled
+                || !row.settled
+                || row.admission_blocked
+                || !gate.authenticated_owner_cancellations.contains(fact);
+            if !gate.authenticated_owner_cancellations.contains(fact) {
+                gate.authenticated_owner_cancellations.push(fact.clone());
+            }
+            if changed {
+                self.accounting_epoch
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             row.owner_cancelled = true;
             row.admission_blocked = false;
             row.settled_status = Some("cancelled");
@@ -1296,8 +1314,172 @@ mod owner_cancel_tests {
             row.settled = false;
             row.settled_status = None;
         }
-        sessions.restore_owner_cancellations(&[fact]).await.unwrap();
+        sessions
+            .restore_owner_cancellations(&[fact.clone()])
+            .await
+            .unwrap();
         assert!(record.lock().await.admission_blocked);
         assert!(record.lock().await.settled_status.is_none());
+        // Exact legacy binding cancellation is separate from current incarnation matching.
+        let parent = dir.path().join("parent.jsonl").display().to_string();
+        sessions.set_identity(ParentIdentity {
+            session_file: Some(parent.clone()),
+            ..ParentIdentity::with_default_depth()
+        });
+        {
+            let mut row = record.lock().await;
+            row.admission_generation = Some("generation".into());
+            row.expected_message_id = Some("message".into());
+            row.owner_cancelled = false;
+            row.settled = true; // Idle alone is not owner evidence.
+        }
+        let task = json!({"projectId":"p","planId":"plan","stepId":"step","taskGeneration":1,"policyRevision":1});
+        let assignment = json!({"childId":"child","admissionGeneration":"generation","incarnation":"old-worker",
+            "assignmentId":"assignment","taskGeneration":1,"ownership":"lane","acceptanceRef":"accept","artifactRef":"result","dependenciesSatisfied":true});
+        {
+            let mut gate = sessions.inner.gate.lock().unwrap();
+            let mut value = serde_json::to_value(&*gate).unwrap();
+            value["revision"] = json!(7);
+            value["task"] = task.clone();
+            value["policy"] = json!({"version":1,"enabled":true,"minActive":5,"maxActive":20,"rootWritesCode":false,"correctiveBudget":2});
+            value["assignments"] = json!([assignment.clone()]);
+            value["attempts"] = json!(2);
+            value["suspended"] = json!(true);
+            *gate = serde_json::from_value(value).unwrap();
+        }
+        sessions.retain_management_obligation("goal").unwrap();
+        let mut request = json!({"expectedRevision":7,"task":task,"assignment":assignment});
+        assert!(sessions
+            .reconcile_owner_cancellation(&request)
+            .await
+            .is_err());
+        request["fact"] = json!({"forged":true});
+        assert!(sessions
+            .reconcile_owner_cancellation(&request)
+            .await
+            .is_err());
+        request.as_object_mut().unwrap().remove("fact");
+        let exact_fact = crate::journal::OwnerCancelFact {
+            parent_session_file: parent,
+            admission_generation: Some("generation".into()),
+            expected_message_id: Some("message".into()),
+            ..fact.clone()
+        };
+        let mut wrong_fact = exact_fact.clone();
+        wrong_fact.expected_message_id = Some("wrong".into());
+        sessions
+            .restore_owner_cancellations(&[wrong_fact])
+            .await
+            .unwrap();
+        assert!(sessions
+            .reconcile_owner_cancellation(&request)
+            .await
+            .is_err());
+        let epoch = sessions
+            .inner
+            .accounting_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+        sessions
+            .restore_owner_cancellations(&[exact_fact.clone()])
+            .await
+            .unwrap();
+        assert!(
+            sessions
+                .inner
+                .accounting_epoch
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > epoch
+        );
+        let epoch = sessions
+            .inner
+            .accounting_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+        sessions
+            .restore_owner_cancellations(&[exact_fact.clone()])
+            .await
+            .unwrap();
+        assert_eq!(
+            sessions
+                .inner
+                .accounting_epoch
+                .load(std::sync::atomic::Ordering::SeqCst),
+            epoch
+        );
+        for (field, value) in [
+            ("incarnation", json!("other")),
+            ("admissionGeneration", json!("other")),
+            ("assignmentId", json!("other")),
+        ] {
+            let mut wrong = request.clone();
+            wrong["assignment"][field] = value;
+            assert!(sessions.reconcile_owner_cancellation(&wrong).await.is_err());
+        }
+        let mut wrong = request.clone();
+        wrong["task"]["policyRevision"] = json!(2);
+        assert!(sessions.reconcile_owner_cancellation(&wrong).await.is_err());
+        let receipt = sessions
+            .reconcile_owner_cancellation(&request)
+            .await
+            .unwrap();
+        assert_eq!(receipt["kind"], "owner_cancel");
+        assert_eq!(receipt["processExitObserved"], false);
+        assert_eq!(receipt["revision"], 8);
+        assert!(sessions
+            .reconcile_owner_cancellation(&request)
+            .await
+            .is_err());
+        request["expectedRevision"] = json!(8);
+        assert_eq!(
+            sessions
+                .reconcile_owner_cancellation(&request)
+                .await
+                .unwrap(),
+            receipt
+        );
+        let status = sessions.gate_status().await;
+        assert_eq!(status["unknown"], 0);
+        assert_eq!(status["knownActive"], 0);
+        assert_eq!(status["decision"], "suspended");
+        assert_eq!(status["correctiveAttempts"], 2);
+        assert_eq!(status["managementObligation"]["goalId"], "goal");
+        assert!(sessions
+            .inner
+            .gate
+            .lock()
+            .unwrap()
+            .consumed_managed_results
+            .is_empty());
+        let bytes = std::fs::read(sessions.inner.gate_path().unwrap()).unwrap();
+        sessions.restore_gate();
+        assert_eq!(sessions.gate_status().await["unknown"], 1); // Receipt alone is not evidence.
+        sessions
+            .restore_owner_cancellations(&[exact_fact])
+            .await
+            .unwrap();
+        let restored = sessions.gate_status().await;
+        assert_eq!(restored["unknown"], 0);
+        assert_eq!(
+            restored["ownerCancellationReceipts"],
+            status["ownerCancellationReceipts"]
+        );
+        assert_eq!(
+            std::fs::read(sessions.inner.gate_path().unwrap()).unwrap(),
+            bytes
+        );
+        record.lock().await.admission_generation = Some("changed".into());
+        assert!(sessions
+            .reconcile_owner_cancellation(&request)
+            .await
+            .is_err());
+        assert!(sessions.gate_status().await["unknown"].as_u64().unwrap() > 0);
+        // A legitimate task change through generic configure invalidates retained receipts.
+        let mut reconfigure = json!({"expectedRevision":8,"task":request["task"].clone(),
+            "policy":{"version":1,"enabled":true,"minActive":5,"maxActive":20,"rootWritesCode":false,"correctiveBudget":2},"assignments":[]});
+        reconfigure["task"]["taskGeneration"] = json!(2);
+        sessions.configure_gate(&reconfigure).await.unwrap();
+        assert_eq!(
+            sessions.gate_status().await["ownerCancellationReceipts"],
+            json!([])
+        );
     }
 }

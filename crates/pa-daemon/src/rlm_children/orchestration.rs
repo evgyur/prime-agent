@@ -33,7 +33,7 @@ pub(crate) struct Task {
     pub(super) task_generation: u64,
     pub(super) policy_revision: u64,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Assignment {
     child_id: String,
@@ -56,6 +56,22 @@ pub(crate) struct Exception {
     task_generation: u64,
     policy_revision: u64,
 }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OwnerCancellationReceipt {
+    version: u32,
+    task: Task,
+    assignment: Assignment,
+    fact: crate::journal::OwnerCancelFact,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReconcileOwnerCancellation {
+    expected_revision: u64,
+    task: Task,
+    assignment: Assignment,
+}
+
 /// A retained management boundary, not permission to admit a model or worker turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -72,6 +88,10 @@ pub(crate) struct Gate {
     pub(super) policy: Option<Policy>,
     pub(super) task: Option<Task>,
     assignments: Vec<Assignment>,
+    #[serde(default)]
+    owner_cancellation_receipts: Vec<OwnerCancellationReceipt>,
+    #[serde(skip)]
+    pub(super) authenticated_owner_cancellations: Vec<crate::journal::OwnerCancelFact>,
     exception: Option<Exception>,
     pub(super) attempts: u32,
     #[serde(default)]
@@ -110,9 +130,10 @@ impl Gate {
             return false;
         }
         if self.assignments.iter().any(|assignment| {
-            !rows
-                .iter()
-                .any(|row| assignment_matches(assignment, row) && row["executionKind"] != "unknown")
+            !self.cancellation_settles(assignment, rows)
+                && !rows.iter().any(|row| {
+                    assignment_matches(assignment, row) && row["executionKind"] != "unknown"
+                })
         }) {
             return false;
         }
@@ -129,6 +150,26 @@ impl Gate {
                         assignment_matches(assignment, row) && row["executionKind"] != "unknown"
                     })
             })
+    }
+
+    fn cancellation_settles(&self, assignment: &Assignment, rows: &[Value]) -> bool {
+        self.owner_cancellation_receipts.iter().any(|receipt| {
+            receipt.version == 1
+                && self.task.as_ref() == Some(&receipt.task)
+                && &receipt.assignment == assignment
+                && rows.iter().any(|row| {
+                    row["childId"] == assignment.child_id
+                        && row["admissionGeneration"] == assignment.admission_generation
+                        && row["obligation"] == false
+                        && row["executionKind"] == "idle"
+                        && serde_json::from_value::<crate::journal::OwnerCancelFact>(
+                            row["ownerCancellation"].clone(),
+                        )
+                        .ok()
+                        .as_ref()
+                            == Some(&receipt.fact)
+                })
+        })
     }
 
     fn same_task(&self, task: &Task) -> bool {
@@ -294,6 +335,71 @@ impl SupervisorChildSessions {
             }
         }
     }
+    /// Bind already authenticated owner exclusion to one retained obligation. No kill or unsuspend.
+    pub(crate) async fn reconcile_owner_cancellation(&self, request: &Value) -> Result<Value> {
+        let request: ReconcileOwnerCancellation = serde_json::from_value(request.clone())?;
+        anyhow::ensure!(
+            self.inner.identity.lock().expect("identity lock").rlm_depth == 0,
+            "Only a root session may reconcile its orchestration gate"
+        );
+        let record = self
+            .inner
+            .find_record(&request.assignment.child_id)
+            .await
+            .ok_or_else(|| anyhow!("Direct child unavailable"))?;
+        let lock = record.lock().await.admission_lock.clone();
+        let _admission = lock.lock().await;
+        let row = record.lock().await;
+        let parent = self
+            .inner
+            .identity
+            .lock()
+            .expect("identity lock")
+            .session_file
+            .clone();
+        let facts = self
+            .inner
+            .gate
+            .lock()
+            .expect("gate lock")
+            .authenticated_owner_cancellations
+            .clone();
+        let fact = authenticated_cancellation(&row, parent.as_deref(), &facts)
+            .ok_or_else(|| anyhow!("Authenticated restored owner cancellation required"))?;
+        anyhow::ensure!(
+            fact.admission_generation.as_deref() == Some(&request.assignment.admission_generation),
+            "Cancelled admission mismatch"
+        );
+        let mut gate = self.inner.gate.lock().expect("gate lock");
+        anyhow::ensure!(
+            gate.revision == request.expected_revision,
+            "Orchestration revision conflict"
+        );
+        anyhow::ensure!(
+            gate.task.as_ref() == Some(&request.task)
+                && gate.assignments.iter().any(|a| a == &request.assignment),
+            "Exact persisted task and assignment required"
+        );
+        let receipt = OwnerCancellationReceipt {
+            version: 1,
+            task: request.task,
+            assignment: request.assignment,
+            fact,
+        };
+        if !gate.owner_cancellation_receipts.contains(&receipt) {
+            let mut next = gate.clone();
+            next.owner_cancellation_receipts.push(receipt.clone());
+            next.revision += 1;
+            anyhow::ensure!(self.gate_path().is_some(), "Durable gate path required");
+            self.persist_gate(&next)?;
+            *gate = next;
+        }
+        Ok(
+            json!({"revision":gate.revision,"ownerCancellationReceipt":receipt,
+            "kind":"owner_cancel","processExitObserved":false}),
+        )
+    }
+
     pub(crate) async fn configure_gate(&self, payload: &Value) -> Result<Value> {
         self.configure_gate_scoped(payload, None, None).await
     }
@@ -473,6 +579,9 @@ impl SupervisorChildSessions {
             }
             next.revision += 1;
             next.policy = Some(policy);
+            if next.task.as_ref() != Some(&task) || next.assignments != assignments {
+                next.owner_cancellation_receipts.clear();
+            }
             next.task = Some(task);
             next.assignments = assignments;
             next.exception = exception;
@@ -500,6 +609,9 @@ impl SupervisorChildSessions {
         let mut active = 0;
         let mut unknown = 0;
         for assignment in &gate.assignments {
+            if gate.cancellation_settles(assignment, &rows) {
+                continue;
+            }
             match rows.iter().find(|row| assignment_matches(assignment, row)) {
                 Some(row)
                     if row["executionKind"] == "executing" && assignment.dependencies_satisfied =>
@@ -562,6 +674,7 @@ impl SupervisorChildSessions {
             "decision":decision,"knownActive":active,"unknown":unknown,"observedAt":now_ms(),
             "complete":unknown==0 && !gate.suspended && !revision_changed,"exception":gate.exception,
             "correctiveAttempts":gate.attempts,"assignments":rows,
+            "ownerCancellationReceipts":gate.owner_cancellation_receipts,
             "managedContract":{"version":1,"sourceOnlyRebind":true,"causalResults":true},
             "managementScope":gate.management_scope,
             "managementObligation":gate.management_obligation.as_ref().map(|obligation| json!({
@@ -659,8 +772,22 @@ impl SupervisorChildSessions {
     }
     pub(crate) async fn accounting_rows(&self) -> Vec<Value> {
         let records = self.inner.children.lock().await.clone();
+        let parent = self
+            .inner
+            .identity
+            .lock()
+            .expect("identity lock")
+            .session_file
+            .clone();
+        let facts = self
+            .inner
+            .gate
+            .lock()
+            .expect("gate lock")
+            .authenticated_owner_cancellations
+            .clone();
         use futures::StreamExt;
-        futures::stream::iter(records).map(|record| async move {
+        futures::stream::iter(records).map(|record| { let parent = parent.clone(); let facts = facts.clone(); async move {
             let (id, selector, generation, expected, blocked, obligation)={let row=record.lock().await;
                 (row.rlm_child_id.clone(),durable_child_selector(row.session_id.as_deref(),&row.rlm_child_id),
                  row.admission_generation.clone(),row.expected_message_id.clone(),row.admission_blocked,!row.settled)};
@@ -672,10 +799,29 @@ impl SupervisorChildSessions {
                 else if current.settled { "idle" }
                 else { execution_kind(state.as_ref(),expected.as_deref()) };
             json!({"childId":id,"admissionGeneration":generation,"expectedMessageId":expected,
-                "executionKind":kind,"obligation":obligation,"incarnation":state.as_ref().and_then(|s|s.get("workerInstanceId")),
+                "executionKind":kind,"obligation":obligation,"ownerCancellation":authenticated_cancellation(&current,parent.as_deref(),&facts),
+                "incarnation":state.as_ref().and_then(|s|s.get("workerInstanceId")),
                 "observedAt":now_ms()})
-        }).buffer_unordered(4).collect().await
+        }}).buffer_unordered(4).collect().await
     }
+}
+// owner_cancelled is set only by authenticated journal restoration / owner cancellation.
+fn authenticated_cancellation(
+    row: &ChildRecord,
+    parent: Option<&str>,
+    facts: &[crate::journal::OwnerCancelFact],
+) -> Option<crate::journal::OwnerCancelFact> {
+    if !row.owner_cancelled || !row.settled || row.admission_blocked {
+        return None;
+    }
+    let fact = crate::journal::OwnerCancelFact {
+        parent_session_file: parent?.to_owned(),
+        child_id: row.rlm_child_id.clone(),
+        child_session_file: row.session_file.clone()?,
+        admission_generation: Some(row.admission_generation.clone().filter(|s| !s.is_empty())?),
+        expected_message_id: Some(row.expected_message_id.clone().filter(|s| !s.is_empty())?),
+    };
+    facts.contains(&fact).then_some(fact)
 }
 fn assignment_matches(a: &Assignment, row: &Value) -> bool {
     row["childId"] == a.child_id
@@ -736,6 +882,44 @@ impl SupervisorChildSessionsInner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn owner_cancel_receipt_requires_exact_restored_fact_and_cannot_prove_execution() {
+        let task: Task = serde_json::from_value(configure(2)["task"].clone()).unwrap();
+        let assignment: Assignment = serde_json::from_value(json!({"childId":"old","admissionGeneration":"g","incarnation":"historic",
+            "assignmentId":"a","taskGeneration":1,"ownership":"lane","acceptanceRef":"accept","artifactRef":"artifact","dependenciesSatisfied":true})).unwrap();
+        let fact = crate::journal::OwnerCancelFact {
+            parent_session_file: "parent".into(),
+            child_id: "old".into(),
+            child_session_file: "child".into(),
+            admission_generation: Some("g".into()),
+            expected_message_id: Some("m".into()),
+        };
+        let mut gate = Gate {
+            task: Some(task.clone()),
+            assignments: vec![assignment.clone()],
+            owner_cancellation_receipts: vec![OwnerCancellationReceipt {
+                version: 1,
+                task,
+                assignment: assignment.clone(),
+                fact: fact.clone(),
+            }],
+            ..Gate::default()
+        };
+        let old = json!({"childId":"old","admissionGeneration":"g","incarnation":null,"executionKind":"idle","obligation":false,"ownerCancellation":fact});
+        assert!(!assignment_matches(&assignment, &old));
+        assert!(gate.cancellation_settles(&assignment, &[old.clone()]));
+        let permit = json!({"childId":"new","admissionGeneration":"new-g","incarnation":"new-worker","expectedMessageId":"new-m"});
+        let new = json!({"childId":"new","admissionGeneration":"new-g","incarnation":"new-worker","expectedMessageId":"new-m","executionKind":"executing","obligation":true});
+        assert!(gate.start_accounting_complete(&[old.clone(), new.clone()], &permit));
+        let mut missing = old.clone();
+        missing["ownerCancellation"] = Value::Null;
+        assert!(!gate.start_accounting_complete(&[missing, new.clone()], &permit));
+        let mut obligated = old.clone();
+        obligated["obligation"] = json!(true);
+        assert!(!gate.start_accounting_complete(&[obligated, new], &permit));
+        gate.task.as_mut().unwrap().task_generation += 1;
+        assert!(!gate.cancellation_settles(&assignment, &[old]));
+    }
     #[test]
     fn retask_requires_current_message_start_not_old_busy_or_queue() {
         let mut state = json!({"workerInstanceId":"new-worker","isStreaming":true,

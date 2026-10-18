@@ -32,6 +32,13 @@ impl SessionEngine for AgentSessionEngine {
                 .ok_or_else(|| anyhow::anyhow!("Orchestration children unavailable"))?;
             match configure {
                 Some(mut payload) => {
+                    if let Some(request) = payload.get("reconcileOwnerCancellation") {
+                        anyhow::ensure!(
+                            payload.as_object().is_some_and(|object| object.len() == 1),
+                            "Unexpected owner reconciliation fields"
+                        );
+                        return children.reconcile_owner_cancellation(request).await;
+                    }
                     if let Some(request) = payload.get("ownerCancelChild") {
                         anyhow::ensure!(
                             payload.as_object().is_some_and(|object| object.len() == 1),
