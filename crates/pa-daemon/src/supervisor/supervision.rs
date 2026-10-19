@@ -9,6 +9,8 @@ use super::{
     WorkerReply, WorkerRequest, DEFAULT_PRIVATE_FRAME_LIMITS, ROUTE_TIMEOUT_MS,
     WORKER_AUTH_FLOOR_MS,
 };
+use std::fmt::Write as _;
+
 use crate::lease::is_process_alive;
 use crate::registry::WorkerRelay;
 
@@ -627,24 +629,22 @@ impl Supervisor {
             let descriptor = resident.descriptor.lock().await;
             let setup = json!({"version":1,"kind":"owner_setup","supervisorGeneration":self.owner_cleanup_generation,
                 "workerInstanceId":worker_instance_id,"workerId":descriptor.root_active_session_id,
-                "keyHex":key.iter().map(|byte|format!("{byte:02x}")).collect::<String>()});
+                "keyHex":key.iter().fold(String::new(), |mut hex, byte| { let _ = write!(hex, "{byte:02x}"); hex })});
             drop(descriptor);
             let mut input = child
                 .stdin
                 .take()
                 .ok_or_else(|| anyhow!("Private worker setup pipe unavailable"))?;
             let frame = format!("{setup}\n");
-            match tokio::time::timeout_at(connect_deadline, async {
+            if let Ok(Ok(())) = tokio::time::timeout_at(connect_deadline, async {
                 input.write_all(frame.as_bytes()).await?;
                 input.shutdown().await
             })
             .await
             {
-                Ok(Ok(())) => {}
-                _ => {
-                    let _ = child.kill().await;
-                    return Err(anyhow!("Private worker setup failed"));
-                }
+            } else {
+                let _ = child.kill().await;
+                return Err(anyhow!("Private worker setup failed"));
             }
             drop(input);
             *resident.owner_bootstrap_key.lock().expect("owner key lock") = Some(key);

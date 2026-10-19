@@ -12,7 +12,7 @@ pub struct LaunchOwner {
     nonce: String,
     key: Vec<u8>,
     instance_id: String,
-    _source: Source,
+    source: Source,
     sequence: u64,
     last: Option<(String, Value)>,
     bootstrap_last: Option<(String, Value)>,
@@ -232,7 +232,7 @@ impl LaunchOwner {
             "Invalid owner target"
         );
         self.sequence = probe.sequence;
-        payload["pinnedSource"] = serde_json::json!({"socketPath":self._source.socket_path,"token":self._source.token,"instanceId":self._source.instance_id});
+        payload["pinnedSource"] = serde_json::json!({"socketPath":self.source.socket_path,"token":self.source.token,"instanceId":self.source.instance_id});
         self.bootstrap_last = Some((probe.payload, payload.clone()));
         Ok(payload)
     }
@@ -243,7 +243,7 @@ impl LaunchOwner {
                 && probe.launch_id == self.launch_id
                 && probe.generation_nonce == self.nonce
                 && probe.sequence > 0
-                && probe.sequence <= 9007199254740991
+                && probe.sequence <= 9_007_199_254_740_991
                 && probe.payload.len() <= 1024,
             "Private owner identity mismatch"
         );
@@ -282,6 +282,10 @@ impl LaunchOwner {
     }
 }
 /// Consume and close inherited setup before the public supervisor starts.
+///
+/// # Errors
+///
+/// Returns an error if setup I/O, framing, authentication or acknowledgement fails.
 #[cfg(target_os = "linux")]
 pub fn setup(mut stream: std::os::unix::net::UnixStream, socket: &Path) -> Result<LaunchOwner> {
     stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
@@ -341,7 +345,7 @@ pub fn setup(mut stream: std::os::unix::net::UnixStream, socket: &Path) -> Resul
         nonce,
         key,
         instance_id: setup.source.instance_id.clone(),
-        _source: setup.source,
+        source: setup.source,
         sequence: 0,
         last: None,
         bootstrap_last: None,
@@ -365,7 +369,7 @@ mod tests {
             nonce: "nonce".into(),
             key: key.clone(),
             instance_id: "source".into(),
-            _source: Source {
+            source: Source {
                 socket_path: "/bridge".into(),
                 token: "private".into(),
                 instance_id: "source".into(),

@@ -274,6 +274,12 @@ fn with_lease_guard<T>(
     wait: GuardWait,
     action: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
+    struct GuardCleanup(PathBuf);
+    impl Drop for GuardCleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
     let guard = PathBuf::from(format!("{}.guard", directory.display()));
     let deadline = match wait {
         GuardWait::Fast => None,
@@ -325,12 +331,6 @@ fn with_lease_guard<T>(
             "Could not coordinate session lease: {}",
             directory.display()
         ));
-    }
-    struct GuardCleanup(PathBuf);
-    impl Drop for GuardCleanup {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
     }
     let _cleanup = GuardCleanup(guard);
     action()

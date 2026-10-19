@@ -1920,7 +1920,6 @@ async fn a_saved_child_delete_preserves_artifacts_without_verified_stop() {
             Some("sub-gone"),
             crate::rlm_ledger::RlmLedgerDeleteReason::User,
         )
-        .await
         .unwrap_err();
     assert!(outcome.to_string().contains("reconciliation required"));
     assert_eq!(ledger.live_edges().unwrap().len(), 1);
@@ -1935,7 +1934,6 @@ async fn a_saved_child_delete_preserves_artifacts_without_verified_stop() {
             None,
             crate::rlm_ledger::RlmLedgerDeleteReason::User
         )
-        .await
         .is_err());
 }
 
@@ -2053,7 +2051,6 @@ async fn unverified_saved_child_delete_preserves_roster_and_usage() {
             Some("sub-gone"),
             crate::rlm_ledger::RlmLedgerDeleteReason::User,
         )
-        .await
         .unwrap_err();
     assert!(error.to_string().contains("reconciliation required"));
     assert_eq!(ledger.live_edges().unwrap().len(), 1);
@@ -2116,7 +2113,6 @@ async fn a_ledger_delete_never_tombstones_an_unrelated_edge_sharing_the_child_id
             Some("sub-shared"),
             crate::rlm_ledger::RlmLedgerDeleteReason::User,
         )
-        .await
         .unwrap_err();
     assert!(error.to_string().contains("reconciliation required"));
     let live = ledger.live_edges().unwrap();
@@ -2217,7 +2213,6 @@ async fn a_ledger_child_wake_joins_an_already_hosting_resident() {
             Some("sub-kid-1"),
             crate::rlm_ledger::RlmLedgerDeleteReason::User,
         )
-        .await
         .unwrap_err();
     assert!(delete.to_string().contains("reconciliation required"));
     assert_eq!(ledger.live_edges().unwrap().len(), 1);

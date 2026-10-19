@@ -107,9 +107,12 @@ enum PromptContextBoundary {
     Leaf(String),
 }
 
+/// Callback for one task-scoped gate admission.
+pub(crate) type GateAdmissionCallback = Arc<dyn Fn(String, Value) + Send + Sync>;
+
 /// A [`SessionEngine`] running real agent turns.
 pub struct AgentSessionEngine {
-    pub(crate) gate_admission: std::sync::Mutex<Option<Arc<dyn Fn(String, Value) + Send + Sync>>>,
+    pub(crate) gate_admission: std::sync::Mutex<Option<GateAdmissionCallback>>,
     pub(crate) runtime: crate::async_safe_runtime::AsyncSafeRuntime,
     pub(crate) config: AgentEngineConfig,
     /// The session-scoped ACP MCP store, shared with the core engine's prompt gating.

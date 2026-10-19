@@ -560,6 +560,14 @@ pub async fn run_supervisor(options: SupervisorOptions) -> Result<()> {
 }
 
 /// Run after the Studio-private inherited setup channel has closed.
+///
+/// # Errors
+///
+/// Returns an error when supervisor initialization or its serve loop fails.
+///
+/// # Panics
+///
+/// Panics if the private-launch owner mutex is poisoned.
 pub async fn run_private_supervisor(
     options: SupervisorOptions,
     owner: private_launch::LaunchOwner,

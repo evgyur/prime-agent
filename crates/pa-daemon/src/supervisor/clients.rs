@@ -1,5 +1,9 @@
 //! Client connections: the per-connection task - read loop, dispatch,
 //! and the parsed-command execution surface.
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+use std::fmt::Write as _;
+
 use super::{
     app_version, broadcast, command_type_name, current_protocol_info,
     daemon_closing_shutdown_event, input_admission_id, json, parse_supervisor_command_line,
@@ -696,10 +700,9 @@ impl Supervisor {
                     anyhow::ensure!(descriptor.session_file.as_deref()==payload["sessionFile"].as_str()&&descriptor.root_session_id.as_deref()==payload["rootSessionId"].as_str(),"Owner target mismatch");drop(descriptor);
                     let sequence=resident.owner_bootstrap_sequence.fetch_add(1,Ordering::SeqCst)+1;
                     let raw=serde_json::to_string(&payload)?;
-                    use hmac::{Hmac,Mac};use sha2::Sha256;
                     let mut mac=Hmac::<Sha256>::new_from_slice(&key).map_err(|_|anyhow::anyhow!("Owner key unavailable"))?;
                     mac.update(&crate::worker::owner_bootstrap::bytes(&self.owner_cleanup_generation,&instance,&resident.worker_id,sequence,&raw));
-                    let signature=mac.finalize().into_bytes().iter().map(|b|format!("{b:02x}")).collect::<String>();
+                    let signature=mac.finalize().into_bytes().iter().fold(String::new(), |mut hex, byte| { let _ = write!(hex, "{byte:02x}"); hex });
                     self.route_command_typed(&resident,"private_owner_bootstrap",json!({"version":1,"generation":self.owner_cleanup_generation,"instance":instance,"worker":resident.worker_id,"sequence":sequence,"payload":raw,"macHex":signature}),super::routing::ROUTE_TIMEOUT_MS,RouteAdmission::SupervisorInternal).await
                 }.await;
                 let mut response = match result {
@@ -712,7 +715,7 @@ impl Supervisor {
                     ),
                 };
                 response.id = Some(command_id);
-                response.command = type_name.clone();
+                response.command.clone_from(&type_name);
                 return (vec![response_line(&response)], false);
             }
         }

@@ -1,5 +1,8 @@
 //! Durable session-level admission fence. Not process termination or historical settlement.
-use super::*;
+use super::{
+    canonical_session_path, fs, lease_directory, with_lease_guard, Deserialize, Digest, GuardWait,
+    Path, PathBuf, Result, Serialize, Sha256,
+};
 use std::io::Write;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +90,7 @@ pub(crate) fn verified_session_quarantine(
     anyhow::bail!("Secure quarantine ownership validation unsupported");
     #[cfg(unix)]
     {
+        use std::io::Read;
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         let directory = lease_directory(agent_dir, session);
         with_lease_guard(&directory, GuardWait::ThroughStale, || {
@@ -109,7 +113,6 @@ pub(crate) fn verified_session_quarantine(
                     && metadata.len() <= 1024 * 1024,
                 "Invalid quarantine file identity/permissions/size"
             );
-            use std::io::Read;
             let mut bytes = Vec::new();
             std::io::Read::by_ref(&mut file)
                 .take(1024 * 1024 + 1)
