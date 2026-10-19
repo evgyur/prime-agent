@@ -1348,6 +1348,73 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn a_committed_update_reply_never_enters_terminal_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = Arc::new(
+            Supervisor::new(SupervisorOptions {
+                socket_path: dir.path().join("daemon.sock"),
+                agent_dir: dir.path().join("agent"),
+            })
+            .unwrap(),
+        );
+        let update_id = pa_types::daemon::update_flow::UpdateId::from("queued-update".to_string());
+        let budget = pa_types::daemon::update_flow::UpdateTimeoutBudget::from_env();
+        supervisor
+            .update_prepare
+            .begin(update_id.clone(), crate::util::now_ms(), &budget);
+        supervisor.update_prepare.drain_complete(&update_id);
+        supervisor
+            .update_prepare
+            .snapshot_written(&update_id, crate::util::now_ms(), &budget);
+        supervisor.update_prepare.prepare_acked(&update_id);
+        let (server, client) = tokio::net::UnixStream::pair().unwrap();
+        let connection = {
+            let supervisor = Arc::clone(&supervisor);
+            tokio::spawn(async move { supervisor.handle_client(Box::new(server)).await })
+        };
+        let (read, mut write) = client.into_split();
+        let mut read = BufReader::new(read);
+        let mut line = String::new();
+        read.read_line(&mut line).await.unwrap();
+        assert!(line.contains("daemon_hello"));
+        let envelope = json!({"type":"command","id":"update-commit","protocol":{"name":"prime-agent.daemon","version":7},"clientId":"installer","command":{"type":"commit_update_restart","updateId":"queued-update"}});
+        write
+            .write_all((envelope.to_string() + "\n").as_bytes())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                line.clear();
+                assert!(
+                    read.read_line(&mut line).await.unwrap() > 0,
+                    "commit reply disappeared"
+                );
+                let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+                if value["id"] == "update-commit" {
+                    assert_eq!(value["success"], json!(true));
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("commit reply");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !supervisor.accept_exit.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("scheduled update exit");
+        assert!(
+            !supervisor.shutdown_started.load(Ordering::SeqCst),
+            "successful update response must not run the descriptor-retiring terminal stop pass"
+        );
+        assert!(supervisor.shutdown_owner.lock().unwrap().is_none());
+        connection.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn a_shutdown_request_logs_its_client() {
         let dir = tempfile::TempDir::new().unwrap();
         let options = SupervisorOptions {

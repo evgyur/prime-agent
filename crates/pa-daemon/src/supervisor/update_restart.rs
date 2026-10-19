@@ -468,7 +468,10 @@ impl Supervisor {
                             "stopped": stopped,
                         })),
                     ))],
-                    true,
+                    // The response loop's stop flag owns TERMINAL shutdown and
+                    // retires descriptors/journals. The scheduled update exit
+                    // above owns this restart, including a lost acknowledgement.
+                    false,
                 )
             }
         }
