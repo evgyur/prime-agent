@@ -66,6 +66,11 @@ async fn turn_session_events_with_custom_message(
     custom_message: Value,
 ) -> Vec<Value> {
     let runner = burst_runner(Arc::clone(&engine));
+    let recovery_dir = tempfile::tempdir().unwrap();
+    *runner.recovery.lock().unwrap() = Some(
+        crate::journal::WorkerRecoveryJournal::open(&recovery_dir.path().join("worker.jsonl"))
+            .unwrap(),
+    );
     let mut subscription = runner.events.subscribe();
     runner
         .run_turn(
@@ -110,6 +115,7 @@ async fn an_injected_custom_turn_replaces_the_user_row() {
         "customType": "rlm_child_terminal_notice",
         "content": "[child-exited: no-reply child:lane]",
         "display": true,
+        "timestamp": 1,
         "details": {
             "kind": "completed_without_reply",
             "childId": "sub-1",

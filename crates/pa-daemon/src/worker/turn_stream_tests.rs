@@ -86,6 +86,7 @@ async fn session_quarantine_denies_already_queued_goal_or_cron_turn_start() {
     let engine: Arc<dyn SessionEngine> = Arc::new(GateProbeEngine {
         frames: Vec::new(),
         boundaries: Mutex::new(Vec::new()),
+        on_prompt: Mutex::new(None),
     });
     let mut runner = burst_runner(engine.clone());
     runner.passivation.agent_dir = dir.path().join("agent");
@@ -182,9 +183,12 @@ fn positions_of(events: &[Value], frame_type: &str) -> Vec<usize> {
 // The abort gate's arm semantics, pinned on the wire: `run_turn` driven
 // directly (the pickup's delivery-scoped clear never ran), so the final-emit
 // race is deterministic.
+type PromptStartedHook = Box<dyn FnOnce() + Send>;
+
 struct GateProbeEngine {
     frames: Vec<EngineEvent>,
     boundaries: Mutex<Vec<Option<String>>>,
+    on_prompt: Mutex<Option<PromptStartedHook>>,
 }
 
 impl SessionEngine for GateProbeEngine {
@@ -199,6 +203,9 @@ impl SessionEngine for GateProbeEngine {
         _aborted: &dyn Fn() -> bool,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     ) {
+        if let Some(on_prompt) = self.on_prompt.lock().unwrap().take() {
+            on_prompt();
+        }
         for frame in &self.frames {
             if !emit(frame.clone()) {
                 return;
@@ -254,16 +261,24 @@ async fn gate_sighting_events(
     abort_requested: bool,
     suppress_aborted_row: bool,
 ) -> Vec<Value> {
-    let engine: Arc<dyn SessionEngine> = Arc::new(GateProbeEngine {
+    let probe = Arc::new(GateProbeEngine {
         frames,
         boundaries: Mutex::new(Vec::new()),
+        on_prompt: Mutex::new(None),
     });
+    let engine: Arc<dyn SessionEngine> = probe.clone();
     let runner = burst_runner(Arc::clone(&engine));
-    {
-        let mut core = runner.core.lock().unwrap();
+    let recovery_dir = tempfile::tempdir().unwrap();
+    *runner.recovery.lock().unwrap() = Some(
+        crate::journal::WorkerRecoveryJournal::open(&recovery_dir.path().join("worker.jsonl"))
+            .unwrap(),
+    );
+    let core = Arc::clone(&runner.core);
+    *probe.on_prompt.lock().unwrap() = Some(Box::new(move || {
+        let mut core = core.lock().unwrap();
         core.abort_requested = abort_requested;
         core.suppress_aborted_row = suppress_aborted_row;
-    }
+    }));
     let mut subscription = runner.events.subscribe();
     runner
         .run_turn(
@@ -385,20 +400,29 @@ async fn model_transitions_reach_the_worker_owned_session_file() {
                 matches!(event, EngineEvent::ModelChange(_) | EngineEvent::Done(_))
             });
         }
-        let engine: Arc<dyn SessionEngine> = Arc::new(GateProbeEngine {
+        let probe = Arc::new(GateProbeEngine {
             frames,
             boundaries: Mutex::new(Vec::new()),
+            on_prompt: Mutex::new(None),
         });
+        let engine: Arc<dyn SessionEngine> = probe.clone();
         let runner = burst_runner(Arc::clone(&engine));
+        *runner.recovery.lock().unwrap() = Some(
+            crate::journal::WorkerRecoveryJournal::open(&dir.path().join("worker.jsonl")).unwrap(),
+        );
         let mut store = crate::session_store::SessionFile::create("/fixture", None, 0);
         store.set_path(path.clone());
         store.rewrite().unwrap();
         {
             let mut core = runner.core.lock().unwrap();
             core.store = Some(store);
+        }
+        let core = Arc::clone(&runner.core);
+        *probe.on_prompt.lock().unwrap() = Some(Box::new(move || {
+            let mut core = core.lock().unwrap();
             core.abort_requested = abort_suppressed.is_some();
             core.suppress_aborted_row = abort_suppressed.unwrap_or(false);
-        }
+        }));
         runner
             .run_turn(
                 engine,
@@ -458,6 +482,7 @@ async fn prompt_restore_boundary_is_supplied_only_for_file_backed_stores() {
         let engine = Arc::new(GateProbeEngine {
             frames: vec![EngineEvent::Done(Ok(()))],
             boundaries: Mutex::new(Vec::new()),
+            on_prompt: Mutex::new(None),
         });
         let dynamic: Arc<dyn SessionEngine> = engine.clone();
         let runner = burst_runner(Arc::clone(&dynamic));

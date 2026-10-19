@@ -265,10 +265,31 @@ fn cache_rejects_replacement_and_same_length_in_place_rewrite() {
         read_session_info(&path).unwrap().name.as_deref(),
         Some("bravo")
     );
+    #[cfg(unix)]
+    let saved_generation =
+        super::info::SessionInfoGeneration::from_metadata(&fs::metadata(&path).unwrap());
     let saved_mtime = fs::metadata(&path).unwrap().modified().unwrap();
     let original = fs::read_to_string(&path).unwrap();
     fs::write(&path, original.replace("bravo", "delta")).unwrap();
     filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(saved_mtime)).unwrap();
+    // A same-tick rewrite can preserve even ctime on the test filesystem.
+    // Exercise the changed-generation contract rather than relying on its clock resolution.
+    #[cfg(unix)]
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while super::info::SessionInfoGeneration::from_metadata(&fs::metadata(&path).unwrap())
+            == saved_generation
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "filesystem ctime never advanced"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            fs::write(&path, original.replace("bravo", "delta")).unwrap();
+            filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(saved_mtime))
+                .unwrap();
+        }
+    }
     assert_eq!(fs::metadata(&path).unwrap().len(), original.len() as u64);
     assert_fold_matches(&path);
     assert_eq!(
