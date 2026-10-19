@@ -408,6 +408,7 @@ impl SupervisorChildSessions {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn install_next_work_source(&self, value: &Value) -> Result<()> {
         let source: Source = serde_json::from_value(value.clone())?;
         anyhow::ensure!(

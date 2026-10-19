@@ -800,6 +800,9 @@ mod executable_path_tests {
 
 /// Take the Linux Node extra-stdio Unix stream at fd 3 and prevent exec inheritance.
 /// Only the dedicated private-launch entrypoint may call this once before spawning threads.
+///
+/// # Errors
+/// Returns an error if fd 3 is unavailable, cannot be made close-on-exec, or is not a Unix stream.
 #[cfg(target_os = "linux")]
 pub fn take_studio_launch_stream() -> anyhow::Result<std::os::unix::net::UnixStream> {
     use std::os::fd::{AsRawFd, FromRawFd};
@@ -819,6 +822,9 @@ pub fn take_studio_launch_stream() -> anyhow::Result<std::os::unix::net::UnixStr
 }
 
 /// Close the dedicated worker setup stdin after its single bounded frame was consumed.
+///
+/// # Errors
+/// Returns an error if closing the dedicated stdin descriptor fails.
 #[cfg(target_os = "linux")]
 pub fn close_private_worker_setup_stdin() -> anyhow::Result<()> {
     // SAFETY: called once in dedicated worker startup before any other stdin user or child.
@@ -830,6 +836,9 @@ pub fn close_private_worker_setup_stdin() -> anyhow::Result<()> {
 }
 
 /// Read one EOF-terminated private worker setup frame, bounded in bytes and time.
+///
+/// # Errors
+/// Returns an error on a timeout, descriptor/read failure, or an oversized frame.
 #[cfg(target_os = "linux")]
 pub fn read_private_worker_setup_frame() -> anyhow::Result<Vec<u8>> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -842,14 +851,9 @@ pub fn read_private_worker_setup_frame() -> anyhow::Result<Vec<u8>> {
             events: libc::POLLIN,
             revents: 0,
         };
+        let timeout_ms = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
         // SAFETY: stack pollfd and fixed bounded stack buffer, fd0 owned by private startup.
-        let ready = unsafe {
-            libc::poll(
-                &mut fd,
-                1,
-                remaining.as_millis().min(i32::MAX as u128) as i32,
-            )
-        };
+        let ready = unsafe { libc::poll(&raw mut fd, 1, timeout_ms) };
         anyhow::ensure!(ready > 0, "Private worker setup unavailable");
         let mut chunk = [0u8; 512];
         let count = unsafe { libc::read(0, chunk.as_mut_ptr().cast(), chunk.len()) };
@@ -857,7 +861,7 @@ pub fn read_private_worker_setup_frame() -> anyhow::Result<Vec<u8>> {
         if count == 0 {
             break;
         }
-        frame.extend_from_slice(&chunk[..count as usize]);
+        frame.extend_from_slice(&chunk[..count.cast_unsigned()]);
         anyhow::ensure!(frame.len() <= 4096, "Private worker setup too large");
     }
     Ok(frame)

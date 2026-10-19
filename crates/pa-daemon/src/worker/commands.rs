@@ -1,10 +1,10 @@
 //! The dispatch surface: command routing, the command handlers,
 //! and the abort family.
 use super::{
-    KillCloseReason, Lane, PROMPT_ABORTED_BEFORE_DELIVERY, QueueCheckpoint, QueuePriority,
-    QueuedItem, Result, SIDE_QUESTION_SETTLE_TIMEOUT, SessionFile, TurnPolicy, TurnSettle,
-    VecDeque, Worker, checkpoint_queue_recovery, clear_withdrawn_progress_note, enqueue_priority,
-    json, persist_custom_row, response_failure, response_success,
+    checkpoint_queue_recovery, clear_withdrawn_progress_note, enqueue_priority, json,
+    persist_custom_row, response_failure, response_success, KillCloseReason, Lane, QueueCheckpoint,
+    QueuePriority, QueuedItem, Result, SessionFile, TurnPolicy, TurnSettle, VecDeque, Worker,
+    PROMPT_ABORTED_BEFORE_DELIVERY, SIDE_QUESTION_SETTLE_TIMEOUT,
 };
 
 use serde_json::Value;
@@ -713,12 +713,11 @@ impl Worker {
                             .as_ref()
                             .is_some_and(|action| action.phase == "running")
                 );
-                value["runningMessageIds"] = json!(
-                    core.running_admission_ids
-                        .iter()
-                        .filter_map(|id| id.strip_prefix("message:"))
-                        .collect::<Vec<_>>()
-                );
+                value["runningMessageIds"] = json!(core
+                    .running_admission_ids
+                    .iter()
+                    .filter_map(|id| id.strip_prefix("message:"))
+                    .collect::<Vec<_>>());
                 value
             }),
         )

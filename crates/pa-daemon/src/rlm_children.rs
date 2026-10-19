@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use pa_core::kernel::rlm_runtime::create_default_rlm_subagent_session_name;
 use pa_core::session_engine::rlm_host::{
     RlmChildResult, RlmCreateSessionHandle, RlmCreateSessionRequest, RlmDeleteSubagentResult,
@@ -19,12 +19,12 @@ use pa_core::session_engine::rlm_host::{
     RlmSubagentHost,
 };
 use pa_core::session_engine::rlm_notices::{
-    RlmChildTerminalNotice, create_rlm_child_failure_message, create_rlm_child_terminal_notice,
+    create_rlm_child_failure_message, create_rlm_child_terminal_notice, RlmChildTerminalNotice,
 };
 use pa_core::session_engine::rlm_usage::{RlmChildUsageReport, RlmChildUsageSink};
 use pa_types::daemon::{DaemonCommand, DaemonSessionLifecycle, PromptInput};
 use pa_types::session::CustomMessage;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use pa_core::session_engine::rlm_host::{
@@ -32,8 +32,8 @@ use pa_core::session_engine::rlm_host::{
 };
 
 use crate::rlm_child_model::{
-    ANSWER_TEXT_MAX_CHARS, assert_thinking_supported, cap_text, compact_rlm_text,
-    resolve_child_model, rlm_child_label,
+    assert_thinking_supported, cap_text, compact_rlm_text, resolve_child_model, rlm_child_label,
+    ANSWER_TEXT_MAX_CHARS,
 };
 use crate::supervisor_link::SupervisorLink;
 use crate::util::now_ms;
@@ -64,7 +64,6 @@ impl ChildCloseReason {
 
 /// How long a detached child prompt waits for its spawning parent turn
 /// before prompting anyway; a stuck turn must not orphan the child's task.
-const TURN_DONE_WAIT_SECS: u64 = 60;
 
 /// Grace between the first idle observation and the settle decision.
 const WATCH_SETTLE_GRACE_MS: u64 = 250;
@@ -1144,18 +1143,6 @@ impl SupervisorChildSessionsInner {
             record.snapshot_value()
         };
         sink(row);
-    }
-
-    /// Wait for the parent turn that spawned a task to complete (generation
-    /// strictly greater than the one captured at spawn admission). Bounded:
-    /// a turn that never settles releases the child anyway.
-    pub async fn wait_turn_done(&self, generation: u64) {
-        let mut receiver = self.turn_done.subscribe();
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(TURN_DONE_WAIT_SECS),
-            receiver.wait_for(|value| *value > generation),
-        )
-        .await;
     }
 
     /// Send one daemon command over the link; the link owns timeouts/reconnects.
