@@ -526,7 +526,7 @@ impl Supervisor {
                                     .get("rlmChildId")
                                     .and_then(Value::as_str)
                                     .map(str::to_string);
-                                match self.tombstone_saved_rlm_child(
+                                match Self::tombstone_saved_rlm_child(
                                     &selector,
                                     child_id.as_deref(),
                                     reason,
@@ -1230,7 +1230,6 @@ impl Supervisor {
     /// The ledger tombstone for a delete aimed at a STOPPED child: no worker to kill, the
     /// tombstone IS the deletion boundary, persisted before any teardown.
     pub(super) fn tombstone_saved_rlm_child(
-        self: &Arc<Self>,
         selector: &str,
         child_id: Option<&str>,
         reason: crate::rlm_ledger::RlmLedgerDeleteReason,
@@ -1294,13 +1293,12 @@ mod saved_delete_tests {
             .unwrap();
         let before = ledger.live_edges().unwrap().len();
         for identity in [Some("sub-child"), None, Some("unknown-child")] {
-            let error = supervisor
-                .tombstone_saved_rlm_child(
-                    "child",
-                    identity,
-                    crate::rlm_ledger::RlmLedgerDeleteReason::User,
-                )
-                .unwrap_err();
+            let error = Supervisor::tombstone_saved_rlm_child(
+                "child",
+                identity,
+                crate::rlm_ledger::RlmLedgerDeleteReason::User,
+            )
+            .unwrap_err();
             assert!(error.to_string().contains("reconciliation required"));
             assert_eq!(ledger.live_edges().unwrap().len(), before);
             assert_eq!(std::fs::read_to_string(&child).unwrap(), original);

@@ -1914,13 +1914,12 @@ async fn a_saved_child_delete_preserves_artifacts_without_verified_stop() {
         .expect("the spawn edge appends");
     assert_eq!(ledger.live_edges().expect("edges").len(), 1);
 
-    let outcome = supervisor
-        .tombstone_saved_rlm_child(
-            "child-gone",
-            Some("sub-gone"),
-            crate::rlm_ledger::RlmLedgerDeleteReason::User,
-        )
-        .unwrap_err();
+    let outcome = Supervisor::tombstone_saved_rlm_child(
+        "child-gone",
+        Some("sub-gone"),
+        crate::rlm_ledger::RlmLedgerDeleteReason::User,
+    )
+    .unwrap_err();
     assert!(outcome.to_string().contains("reconciliation required"));
     assert_eq!(ledger.live_edges().unwrap().len(), 1);
     assert!(ledger.edges(true).unwrap()[0].deleted.is_none());
@@ -1928,13 +1927,12 @@ async fn a_saved_child_delete_preserves_artifacts_without_verified_stop() {
     assert!(!std::fs::read_to_string(&child_file)
         .unwrap()
         .contains("archived"));
-    assert!(supervisor
-        .tombstone_saved_rlm_child(
-            "no-such-child",
-            None,
-            crate::rlm_ledger::RlmLedgerDeleteReason::User
-        )
-        .is_err());
+    assert!(Supervisor::tombstone_saved_rlm_child(
+        "no-such-child",
+        None,
+        crate::rlm_ledger::RlmLedgerDeleteReason::User
+    )
+    .is_err());
 }
 
 /// Without a verified stop, deletion must not change usage or roster ownership.
@@ -2045,13 +2043,12 @@ async fn unverified_saved_child_delete_preserves_roster_and_usage() {
         .expect("the spawn edge appends");
     let before = serde_json::to_value(supervisor.roster.lock().unwrap().entries()).unwrap();
     let mut events = supervisor.events.subscribe();
-    let error = supervisor
-        .tombstone_saved_rlm_child(
-            "sub-gone",
-            Some("sub-gone"),
-            crate::rlm_ledger::RlmLedgerDeleteReason::User,
-        )
-        .unwrap_err();
+    let error = Supervisor::tombstone_saved_rlm_child(
+        "sub-gone",
+        Some("sub-gone"),
+        crate::rlm_ledger::RlmLedgerDeleteReason::User,
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("reconciliation required"));
     assert_eq!(ledger.live_edges().unwrap().len(), 1);
     assert_eq!(
@@ -2107,13 +2104,12 @@ async fn a_ledger_delete_never_tombstones_an_unrelated_edge_sharing_the_child_id
             .expect("the spawn edge appends");
     }
     assert_eq!(ledger.live_edges().expect("edges").len(), 2);
-    let error = supervisor
-        .tombstone_saved_rlm_child(
-            "child-a",
-            Some("sub-shared"),
-            crate::rlm_ledger::RlmLedgerDeleteReason::User,
-        )
-        .unwrap_err();
+    let error = Supervisor::tombstone_saved_rlm_child(
+        "child-a",
+        Some("sub-shared"),
+        crate::rlm_ledger::RlmLedgerDeleteReason::User,
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("reconciliation required"));
     let live = ledger.live_edges().unwrap();
     assert_eq!(live.len(), 2);
@@ -2207,13 +2203,12 @@ async fn a_ledger_child_wake_joins_an_already_hosting_resident() {
         .registry
         .insert(std::sync::Arc::clone(&resident))
         .await;
-    let delete = supervisor
-        .tombstone_saved_rlm_child(
-            "kid-1",
-            Some("sub-kid-1"),
-            crate::rlm_ledger::RlmLedgerDeleteReason::User,
-        )
-        .unwrap_err();
+    let delete = Supervisor::tombstone_saved_rlm_child(
+        "kid-1",
+        Some("sub-kid-1"),
+        crate::rlm_ledger::RlmLedgerDeleteReason::User,
+    )
+    .unwrap_err();
     assert!(delete.to_string().contains("reconciliation required"));
     assert_eq!(ledger.live_edges().unwrap().len(), 1);
     assert!(session_file.exists());
