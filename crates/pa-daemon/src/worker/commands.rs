@@ -1222,11 +1222,11 @@ impl Worker {
             .store
             .as_ref()
             .and_then(|store| assistant_text_after_admission(&store.messages(), scope));
-        response_success(
-            None,
-            "get_last_assistant_text",
-            Some(json!({ "text": text, "answerScopeMessageId": scope })),
-        )
+        let mut data = json!({ "text": text });
+        if let Some(scope) = scope {
+            data["answerScopeMessageId"] = json!(scope);
+        }
+        response_success(None, "get_last_assistant_text", Some(data))
     }
 
     async fn handle_kill(&self, payload: &Value) -> DaemonResponse {
