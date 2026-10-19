@@ -772,8 +772,6 @@ mod suspend_shield_tests {
     }
 }
 
-/// The executable-path probe: the own pid resolves to the running binary, pid 0 never does.
-
 /// Take the Linux Node extra-stdio Unix stream at fd 3 and prevent exec inheritance.
 /// Only the dedicated private-launch entrypoint may call this once before spawning threads.
 ///
@@ -843,6 +841,7 @@ pub fn read_private_worker_setup_frame() -> anyhow::Result<Vec<u8>> {
     Ok(frame)
 }
 
+/// The executable-path probe: the own pid resolves to the running binary, pid 0 never does.
 #[cfg(test)]
 mod executable_path_tests {
     use super::*;
