@@ -1,6 +1,6 @@
 //! Task-scoped orchestration accounting. No task text or automatic worker admission.
 #[cfg(test)]
-use super::ParentIdentity;
+use super::{ParentIdentity, RlmChildIdentity};
 use super::{
     anyhow, durable_child_selector, json, now_ms, Arc, ChildRecord, DaemonCommand, Duration, Map,
     Path, PathBuf, Result, RlmSubagentHost, SupervisorChildSessions, SupervisorChildSessionsInner,

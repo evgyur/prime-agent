@@ -4,7 +4,7 @@ use super::{
     SupervisorChildSessions, Value,
 };
 #[cfg(test)]
-use super::{Arc, ParentIdentity};
+use super::{Arc, ParentIdentity, RlmChildIdentity};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
