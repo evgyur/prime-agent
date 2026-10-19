@@ -5,7 +5,7 @@ use super::{
     STATE_TIMEOUT_MS,
 };
 #[cfg(test)]
-use super::{ParentIdentity, RlmChildIdentity, RlmSubagentHost};
+use super::{ParentIdentity, RlmChildIdentity};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::io::Write;

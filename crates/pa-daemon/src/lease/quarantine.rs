@@ -184,6 +184,7 @@ pub(crate) fn persist_session_quarantine(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lease::acquire_runtime_session_lease;
     #[cfg(unix)]
     #[test]
     fn legacy_closure_secure_marker_denies_link_mode_size_and_missing() {

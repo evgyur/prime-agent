@@ -4,7 +4,7 @@ use super::{
     Value,
 };
 #[cfg(test)]
-use super::{Arc, ParentIdentity, RlmChildIdentity, RlmSubagentHost};
+use super::{Arc, ParentIdentity, RlmChildIdentity};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

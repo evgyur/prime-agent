@@ -1,10 +1,10 @@
 //! Explicit operator evidence policy for retained legacy bindings, not terminal proof.
+#[cfg(test)]
+use super::ParentIdentity;
 use super::{
     anyhow, json, Arc, Assignment, ChildRecord, Deserialize, Gate, Path, PathBuf, Result,
     Serialize, SupervisorChildSessions, Task, Value, MAX_ACTIVE,
 };
-#[cfg(test)]
-use super::{ParentIdentity, RlmSubagentHost};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
