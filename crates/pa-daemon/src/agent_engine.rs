@@ -143,6 +143,7 @@ pub struct AgentSessionEngine {
     pub(crate) goal_input_probe: std::sync::Mutex<Option<crate::engine::SessionInputProbe>>,
     /// Minted goal follow-ups admit through the turn runner's queue lanes
     /// (steering for the budget steer, follow-up for the continuation).
+    pub(crate) goal_deferral_sink: std::sync::Mutex<Option<crate::goal_deferral::Sink>>,
     pub(crate) goal_admission_sink: std::sync::Mutex<Option<crate::engine::GoalAdmissionSink>>,
     /// The queued-goal-context purge (TS `_clearQueuedGoalContexts`):
     /// invoked by pause/clear/start and `goal.complete`.

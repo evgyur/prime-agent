@@ -453,7 +453,25 @@ impl Supervisor {
                 AdoptionBoot::UpdateRoster { kept } => kept.contains(&worker_id),
                 AdoptionBoot::PlainStartup => false,
             };
-            if !interrupted && !kept {
+            let deferred_goal = {
+                let descriptor = resident.descriptor.lock().await;
+                descriptor
+                    .session_file
+                    .as_deref()
+                    .and_then(|file| crate::goal_deferral::from_file(Path::new(file)))
+                    .is_some_and(|recovery| {
+                        descriptor.root_session_id.as_deref()
+                            == Some(recovery.intent.session_id.as_str())
+                            && recovery.intent.worker_id == descriptor.worker_id
+                            && Path::new(&recovery.intent.journal_path) == journal_path
+                            && (recovery.prepared.is_none() || journal_path.is_file())
+                            && !crate::goal_deferral::started(
+                                &journal_path,
+                                &recovery.intent.deferral_id,
+                            )
+                    })
+            };
+            if !interrupted && !kept && !deferred_goal {
                 // Dead worker with no durable busy state — and, on an update boot, not
                 // kept: leave it down (the descriptor stays on disk); the session reopens
                 // on the next client create.
@@ -469,12 +487,16 @@ impl Supervisor {
             let busy_recorded_at =
                 crate::journal::WorkerRecoveryJournal::latest_busy_recorded_at(&journal_path);
             let gated = resident.descriptor.lock().await;
-            let veto = crate::revival_gate::revival_veto(
-                &self.options.agent_dir,
-                &gated,
-                kept,
-                busy_recorded_at.as_deref(),
-            );
+            let veto = if deferred_goal && !interrupted && !kept {
+                crate::revival_gate::ownership_veto(&self.options.agent_dir, &gated)
+            } else {
+                crate::revival_gate::revival_veto(
+                    &self.options.agent_dir,
+                    &gated,
+                    kept,
+                    busy_recorded_at.as_deref(),
+                )
+            };
             drop(gated);
             if let Some(veto) = veto {
                 self.log_line(&format!(

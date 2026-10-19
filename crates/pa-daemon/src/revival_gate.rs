@@ -64,17 +64,8 @@ pub(crate) fn revival_veto(
     kept_by_update: bool,
     busy_recorded_at: Option<&str>,
 ) -> Option<RevivalVeto> {
-    if matches!(descriptor.lifecycle, DaemonWorkerLifecycle::Failed) {
-        return Some(RevivalVeto::GaveUp);
-    }
-    let session_file = descriptor.session_file.as_deref().map(Path::new);
-    if let Some(file) = session_file {
-        if session_is_archived(file) {
-            return Some(RevivalVeto::SessionArchived);
-        }
-        if let Some(owner) = crate::lease::live_lease_owner(agent_dir, file) {
-            return Some(RevivalVeto::LiveLeaseHeld { pid: owner.pid });
-        }
+    if let Some(veto) = ownership_veto(agent_dir, descriptor) {
+        return Some(veto);
     }
     if !kept_by_update {
         // The busy-evidence path: the journal's proof must be fresh. A
@@ -90,6 +81,25 @@ pub(crate) fn revival_veto(
             return Some(RevivalVeto::StaleBusyEvidence {
                 recorded_at: recorded_at.to_string(),
             });
+        }
+    }
+    None
+}
+
+pub(crate) fn ownership_veto(
+    agent_dir: &Path,
+    descriptor: &DaemonWorkerDescriptor,
+) -> Option<RevivalVeto> {
+    if matches!(descriptor.lifecycle, DaemonWorkerLifecycle::Failed) {
+        return Some(RevivalVeto::GaveUp);
+    }
+    let session_file = descriptor.session_file.as_deref().map(Path::new);
+    if let Some(file) = session_file {
+        if session_is_archived(file) {
+            return Some(RevivalVeto::SessionArchived);
+        }
+        if let Some(owner) = crate::lease::live_lease_owner(agent_dir, file) {
+            return Some(RevivalVeto::LiveLeaseHeld { pid: owner.pid });
         }
     }
     None

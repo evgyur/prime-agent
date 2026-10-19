@@ -639,7 +639,9 @@ impl Worker {
                 let Ok(model) = engine.resolve_model() else {
                     return;
                 };
-                let _ = engine.ensure_core_session_async(&model).await;
+                if engine.ensure_core_session_async(&model).await.is_ok() {
+                    engine.restore_deferred_goal().await;
+                }
             });
         }
         // Bind the schedule catalog onto the session (artifact partition,

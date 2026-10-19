@@ -504,6 +504,13 @@ impl TurnRunner {
         items
             .iter()
             .filter_map(|item| {
+                if let Some(token) = item
+                    .custom_message
+                    .as_ref()
+                    .and_then(|row| row["details"][crate::goal_deferral::TOKEN_KEY].as_str())
+                {
+                    return Some((format!("goal-deferral:{token}"), Some(token.to_string())));
+                }
                 item.custom_message
                     .as_ref()
                     .filter(|row| {

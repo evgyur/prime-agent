@@ -320,6 +320,11 @@ impl SessionEngine for AgentSessionEngine {
             let mut driver = handles.driver.lock().await;
             // The quiescence arm: unsettled work defers the mint (owed, not consumed).
             if self.has_unsettled_rlm_work().await || self.has_live_background_bash_handles() {
+                if let Err(error) = self.deferred_goal(Some(&driver.state_with_creation_elapsed()))
+                {
+                    eprintln!("pa-daemon: durable post-compaction deferral failed: {error:#}");
+                    return None;
+                }
                 driver.mark_continuation_owed();
                 return None;
             }
@@ -341,13 +346,14 @@ impl SessionEngine for AgentSessionEngine {
             // one continuation per owed boundary (an inactive goal or a
             // failed persist ends the boundary without minting).
             driver.mark_continuation_owed();
-            let message = match driver.take_owed_continuation(&mut session, last_turn.as_ref()) {
-                Ok(message) => message,
-                Err(error) => {
-                    eprintln!("pa-daemon: goal continuation mint persist failed: {error:#}");
-                    None
-                }
-            };
+            let message =
+                match self.take_deferred_goal(&mut driver, &mut session, last_turn.as_ref()) {
+                    Ok(message) => message,
+                    Err(error) => {
+                        eprintln!("pa-daemon: goal continuation mint persist failed: {error:#}");
+                        None
+                    }
+                };
             if message.is_none() {
                 // A refused mint still changed the state: publish it and arm the backoff wake.
                 let state = driver.state_with_creation_elapsed();

@@ -27,6 +27,39 @@ pub(crate) enum HeadlessGoalWait {
 }
 
 impl AgentSessionEngine {
+    pub(crate) fn deferred_goal(
+        &self,
+        goal: Option<&pa_types::goal::GoalState>,
+    ) -> anyhow::Result<Option<crate::goal_deferral::Recovery>> {
+        let sink = self
+            .goal_deferral_sink
+            .lock()
+            .expect("goal deferral sink lock")
+            .clone();
+        sink.map_or(Ok(None), |sink| sink(goal))
+    }
+
+    pub(crate) fn take_deferred_goal(
+        &self,
+        driver: &mut pa_core::session_engine::goal_driver::GoalDriver,
+        session: &mut pa_core::session::manager::SessionManager,
+        last_turn: Option<&pa_agent::types::AssistantMessage>,
+    ) -> anyhow::Result<Option<pa_types::session::CustomMessage>> {
+        if let Some(recovery) = self.deferred_goal(None)? {
+            if let Some(prepared) = &recovery.prepared {
+                Ok(driver.recover_prepared_continuation(prepared))
+            } else {
+                driver.take_owed_continuation_with_deferral(
+                    session,
+                    last_turn,
+                    &recovery.intent.deferral_id,
+                )
+            }
+        } else {
+            driver.take_owed_continuation(session, last_turn)
+        }
+    }
+
     /// Wire the worker's session-input probe, goal admission sink, and
     /// queued-goal-context purge, and register the RLM settle hook; the
     /// hook holds a weak engine reference so the registry never pins it.
@@ -55,6 +88,24 @@ impl AgentSessionEngine {
                 engine.retry_owed_autonomous_continuation();
             }
         }));
+    }
+
+    pub(crate) async fn discard_deferred_goal(&self) {
+        let handles = self.goal_runtime.lock().expect("goal runtime lock").clone();
+        if let Some(handles) = handles {
+            handles.driver.lock().await.discard_owed_continuation();
+        }
+    }
+
+    pub(crate) async fn restore_deferred_goal(self: &Arc<Self>) {
+        let Ok(Some(_)) = self.deferred_goal(None) else {
+            return;
+        };
+        let Some(handles) = self.goal_runtime.lock().expect("goal runtime lock").clone() else {
+            return;
+        };
+        handles.driver.lock().await.mark_continuation_owed();
+        self.retry_owed_goal_continuation();
     }
 
     pub(crate) fn set_late_agent_message_sink(&self, sink: pa_core::LateSentAgentMessageHandler) {
@@ -243,7 +294,27 @@ impl AgentSessionEngine {
         }
         let mut driver = handles.driver.lock().await;
         let mut session = handles.session.lock().await;
-        let message = match driver.take_owed_continuation(&mut session, last_turn.as_ref()) {
+        let recovery = match self.deferred_goal(None) {
+            Ok(recovery) => recovery,
+            Err(error) => {
+                eprintln!("pa-daemon: deferred goal read failed: {error:#}");
+                return;
+            }
+        };
+        let minted = if let Some(recovery) = &recovery {
+            if let Some(prepared) = &recovery.prepared {
+                Ok(driver.recover_prepared_continuation(prepared))
+            } else {
+                driver.take_owed_continuation_with_deferral(
+                    &mut session,
+                    last_turn.as_ref(),
+                    &recovery.intent.deferral_id,
+                )
+            }
+        } else {
+            driver.take_owed_continuation(&mut session, last_turn.as_ref())
+        };
+        let message = match minted {
             Ok(Some(message)) => message,
             Ok(None) => {
                 // An inactive goal drops the deferral; a live goal in the
@@ -384,6 +455,11 @@ impl AgentSessionEngine {
             // The quiescence gate: the continuation waits (not consumed)
             // until the descendants settle or the bash handles finish.
             if self.has_unsettled_rlm_work().await || self.has_live_background_bash_handles() {
+                if let Err(error) = self.deferred_goal(Some(&driver.state_with_creation_elapsed()))
+                {
+                    eprintln!("pa-daemon: durable descendant deferral failed: {error:#}");
+                    return GoalBoundary::End;
+                }
                 driver.mark_continuation_owed();
                 return GoalBoundary::End;
             }
@@ -403,7 +479,24 @@ impl AgentSessionEngine {
             }
             let was_owed = driver.owes_continuation();
             let mut session = handles.session.lock().await;
-            let message = if was_owed {
+            let recovery = match self.deferred_goal(None) {
+                Ok(recovery) => recovery,
+                Err(error) => {
+                    eprintln!("pa-daemon: deferred goal read failed: {error:#}");
+                    return GoalBoundary::End;
+                }
+            };
+            let message = if let Some(recovery) = &recovery {
+                if let Some(prepared) = &recovery.prepared {
+                    Ok(driver.recover_prepared_continuation(prepared))
+                } else {
+                    driver.take_owed_continuation_with_deferral(
+                        &mut session,
+                        last_turn.as_ref(),
+                        &recovery.intent.deferral_id,
+                    )
+                }
+            } else if was_owed {
                 driver.take_owed_continuation(&mut session, last_turn.as_ref())
             } else {
                 driver.next_continuation_message(&mut session, last_turn.as_ref())

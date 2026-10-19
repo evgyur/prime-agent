@@ -579,6 +579,77 @@ impl Worker {
                         },
                     );
                 });
+                let deferral_core = Arc::clone(&core);
+                let deferral_journal = config.recovery_journal_path.clone();
+                let deferral_worker = config.active_session_id.clone();
+                *concrete
+                    .goal_deferral_sink
+                    .lock()
+                    .expect("goal deferral sink lock") = Some(Arc::new(move |goal| {
+                    let mut core = deferral_core.lock().unwrap();
+                    anyhow::ensure!(
+                        !core.queued_input_suspended
+                            && !core.abort_requested
+                            && !core.shutdown_requested,
+                        "Goal owner suspended"
+                    );
+                    let store = core
+                        .store
+                        .as_mut()
+                        .ok_or_else(|| anyhow::anyhow!("No durable goal store"))?;
+                    if let Some(goal) = goal {
+                        crate::goal_deferral::persist(
+                            store,
+                            goal,
+                            &deferral_worker,
+                            &deferral_journal,
+                        )
+                        .map(Some)
+                    } else {
+                        anyhow::ensure!(
+                            store.path.is_file(),
+                            "Deferred goal authority file unavailable"
+                        );
+                        let certified =
+                            crate::session_store::SessionFile::open_windowed(&store.path)?;
+                        anyhow::ensure!(
+                            certified.skipped_lines == 0,
+                            "Deferred goal authority has unreadable entries"
+                        );
+                        let recovery = crate::goal_deferral::from_file(&store.path);
+                        if let Some(recovery) = &recovery {
+                            anyhow::ensure!(
+                                recovery.intent.worker_id == deferral_worker
+                                    && std::path::Path::new(&recovery.intent.journal_path)
+                                        == deferral_journal,
+                                "Deferred goal belongs to another native owner"
+                            );
+                            anyhow::ensure!(
+                                recovery.prepared.is_none() || deferral_journal.is_file(),
+                                "Prepared goal admission journal unavailable"
+                            );
+                            anyhow::ensure!(
+                                !crate::goal_deferral::started(
+                                    &deferral_journal,
+                                    &recovery.intent.deferral_id
+                                ),
+                                "Deferred goal token already started or history unavailable"
+                            );
+                            let queued =
+                                core.steering
+                                    .iter()
+                                    .chain(core.follow_up.iter())
+                                    .any(|item| {
+                                        item.custom_message.as_ref().is_some_and(|row| {
+                                            row["details"][crate::goal_deferral::TOKEN_KEY].as_str()
+                                                == Some(recovery.intent.deferral_id.as_str())
+                                        })
+                                    });
+                            anyhow::ensure!(!queued, "Deferred goal token already queued");
+                        }
+                        Ok(recovery)
+                    }
+                }));
                 concrete.set_goal_admission(probe, sink, queue_purge);
                 let late_core = Arc::clone(&core);
                 let late_events = Arc::clone(&events);

@@ -1,11 +1,13 @@
 //! The dispatch surface: command routing, the command handlers,
 //! and the abort family.
+use super::SessionCore;
 use super::{
     checkpoint_queue_recovery, clear_withdrawn_progress_note, enqueue_priority, json,
     persist_custom_row, response_failure, response_success, KillCloseReason, Lane, QueueCheckpoint,
     QueuePriority, QueuedItem, Result, SessionFile, TurnPolicy, TurnSettle, VecDeque, Worker,
     PROMPT_ABORTED_BEFORE_DELIVERY, SIDE_QUESTION_SETTLE_TIMEOUT,
 };
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
@@ -49,6 +51,31 @@ mod scoped_answer_tests {
             assistant_text_after_admission(&[old, marker, new], Some("m")).as_deref(),
             Some("SECOND")
         );
+    }
+}
+
+struct GoalOwnerCancelFence {
+    core: Arc<Mutex<SessionCore>>,
+    previously_suspended: bool,
+}
+impl GoalOwnerCancelFence {
+    fn new(core: &Arc<Mutex<SessionCore>>, abort: bool) -> Self {
+        let mut state = core.lock().unwrap();
+        let previously_suspended = state.queued_input_suspended;
+        state.queued_input_suspended = true;
+        state.abort_requested |= abort;
+        Self {
+            core: Arc::clone(core),
+            previously_suspended,
+        }
+    }
+}
+impl Drop for GoalOwnerCancelFence {
+    fn drop(&mut self) {
+        let mut core = self.core.lock().unwrap();
+        if !core.abort_requested {
+            core.queued_input_suspended = self.previously_suspended;
+        }
     }
 }
 
@@ -186,8 +213,8 @@ impl Worker {
             "prompt_and_wait" => self.handle_prompt(payload, true).await,
             "steer" => self.handle_queue(payload, Lane::Steering),
             "follow_up" => self.handle_queue(payload, Lane::FollowUp),
-            "abort" => self.handle_abort(),
-            "abort_and_send_queued" => self.handle_abort_and_send_queued(),
+            "abort" => self.handle_abort().await,
+            "abort_and_send_queued" => self.handle_abort_and_send_queued().await,
             "start_side_question" => {
                 if let Err(response) = self.require_created("start_side_question") {
                     return response;
@@ -346,8 +373,8 @@ impl Worker {
             "get_session_stats" => self.handle_get_session_stats(),
             "get_model_catalog" => self.handle_get_model_catalog(),
             "get_queue" => self.handle_get_queue(),
-            "clear_queue" => self.handle_clear_queue(),
-            "abort_and_clear_queue" => self.handle_abort_and_clear_queue(),
+            "clear_queue" => self.handle_clear_queue().await,
+            "abort_and_clear_queue" => self.handle_abort_and_clear_queue().await,
             "get_last_assistant_text" => self.handle_get_last_assistant_text(payload),
             "get_connection_state" => self.handle_get_connection_state(),
             "get_mcp_connections" => self.handle_get_mcp_connections().await,
@@ -661,12 +688,59 @@ impl Worker {
         self.idle_notify.notify_waiters();
     }
 
-    fn handle_abort(&self) -> DaemonResponse {
+    async fn cancel_goal_deferral(&self) -> anyhow::Result<()> {
+        let identity = {
+            let core = self.core.lock().unwrap();
+            core.store.as_ref().and_then(|store| {
+                crate::goal_deferral::from_file(&store.path).map(|recovery| {
+                    (
+                        core.active_session_id.clone(),
+                        store.session_id().to_string(),
+                        recovery.intent.deferral_id,
+                    )
+                })
+            })
+        };
+        if let Some((active_session_id, session_id, token)) = identity {
+            // Record cancellation before the branch-local marker: selecting an older
+            // branch must never resurrect the exact cancelled native obligation.
+            self.recovery
+                .lock()
+                .unwrap()
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("Goal cancellation journal unavailable"))?
+                .record_message_fact(crate::journal::WorkerMessageFact {
+                    active_session_id,
+                    session_id,
+                    message_id: format!("goal-deferral:{token}"),
+                    phase: "cancelled".into(),
+                    admission_generation: Some(token),
+                    incarnation: std::env::var(super::WORKER_INSTANCE_ID_ENV).unwrap_or_default(),
+                })?;
+            if let Some(store) = self.core.lock().unwrap().store.as_mut() {
+                crate::goal_deferral::cancel(store)?;
+            }
+            if let Some(engine) = &self.agent_engine {
+                engine.discard_deferred_goal().await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_abort(&self) -> DaemonResponse {
+        let _goal_owner_fence = GoalOwnerCancelFence::new(&self.core, true);
+        if let Err(error) = self.cancel_goal_deferral().await {
+            return response_failure(None, "abort", &error.to_string(), None);
+        }
         self.request_abort();
         response_success(None, "abort", None)
     }
 
-    fn handle_abort_and_send_queued(&self) -> DaemonResponse {
+    async fn handle_abort_and_send_queued(&self) -> DaemonResponse {
+        let _goal_owner_fence = GoalOwnerCancelFence::new(&self.core, true);
+        if let Err(error) = self.cancel_goal_deferral().await {
+            return response_failure(None, "abort_and_send_queued", &error.to_string(), None);
+        }
         // The response acknowledges the abort itself, never the
         // async deliveries the resumed pump runs at the settle.
         self.abort_and_send_queued();
@@ -1103,7 +1177,11 @@ impl Worker {
         )
     }
 
-    fn handle_clear_queue(&self) -> DaemonResponse {
+    async fn handle_clear_queue(&self) -> DaemonResponse {
+        let _goal_owner_fence = GoalOwnerCancelFence::new(&self.core, false);
+        if let Err(error) = self.cancel_goal_deferral().await {
+            return response_failure(None, "clear_queue", &error.to_string(), None);
+        }
         if let Err(response) = self.require_created("clear_queue") {
             return response;
         }
@@ -1194,8 +1272,9 @@ impl Worker {
         });
     }
 
-    fn handle_abort_and_clear_queue(&self) -> DaemonResponse {
-        let cleared = self.handle_clear_queue();
+    async fn handle_abort_and_clear_queue(&self) -> DaemonResponse {
+        let _goal_owner_fence = GoalOwnerCancelFence::new(&self.core, true);
+        let cleared = self.handle_clear_queue().await;
         if !cleared.success {
             return cleared;
         }
@@ -1615,5 +1694,105 @@ mod owner_cancel_wire_tests {
             .dispatch("configure_orchestration_gate", &forged)
             .await;
         assert!(response.error.as_deref().unwrap().contains("unknown field"));
+    }
+}
+
+#[cfg(test)]
+mod native_goal_deferral_cancel_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn exact_owner_cancel_survives_old_selected_branch_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::worker::WorkerConfig {
+            socket_path: dir.path().join("worker.sock"),
+            supervisor_socket_path: std::path::PathBuf::new(),
+            token: "fixture".into(),
+            worker_instance_id: "fixture".into(),
+            active_session_id: "owner".into(),
+            agent_dir: dir.path().join("agent"),
+            recovery_journal_path: dir.path().join("recovery.jsonl"),
+            telemetry_disabled: Some(true),
+            script: Some(json!({"responses":[]})),
+        };
+        let worker = Worker::new(config, None);
+        let mut store = crate::session_store::SessionFile::create("/fixture", None, 0);
+        store.set_path(dir.path().join("session.jsonl"));
+        store.rewrite().unwrap();
+        let goal = pa_types::goal::GoalState {
+            active: true,
+            status: pa_types::goal::GoalStatus::Active,
+            goal_id: Some("goal".into()),
+            objective: Some("after child".into()),
+            ..pa_types::goal::GoalState::default()
+        };
+        store
+            .persist_entry(
+                "custom",
+                json!({"customType":pa_core::goals::GOAL_STATE_CUSTOM_TYPE,"data":goal}),
+            )
+            .unwrap();
+        let token = crate::goal_deferral::persist(
+            &mut store,
+            &goal,
+            "owner",
+            &worker.config.recovery_journal_path,
+        )
+        .unwrap()
+        .intent
+        .deferral_id;
+        let old_branch = std::fs::read(&store.path).unwrap();
+        let path = store.path.clone();
+        worker.core.lock().unwrap().store = Some(store);
+        *worker.recovery.lock().unwrap() = Some(
+            crate::journal::WorkerRecoveryJournal::open(&worker.config.recovery_journal_path)
+                .unwrap(),
+        );
+        worker.cancel_goal_deferral().await.unwrap();
+        assert!(crate::goal_deferral::from_file(&path).is_none());
+        // Restore an old selected branch without touching the independent admission journal.
+        std::fs::write(&path, old_branch).unwrap();
+        assert!(crate::goal_deferral::from_file(&path).is_some());
+        assert!(crate::goal_deferral::started(
+            &worker.config.recovery_journal_path,
+            &token
+        ));
+        let delayed = crate::engine::GoalTurnEndWork::Continuation(
+            crate::engine::GoalContinuation {
+                request: crate::engine::PromptRequest {
+                    message: "cancelled delayed continuation".into(),
+                    images: Vec::new(),
+                    source: "user".into(),
+                    agent_message_id: None,
+                    custom_message: Some(
+                        json!({"customType":pa_core::goals::GOAL_CONTEXT_CUSTOM_TYPE,"content":"cancelled delayed continuation","display":false,"timestamp":1,"details":{"nativeDeferralId":token}}),
+                    ),
+                    batch: Vec::new(),
+                },
+                goal_update: Some(serde_json::to_value(&goal).unwrap()),
+                pending_handle: None,
+            },
+        );
+        crate::worker::admit_goal_follow_up(
+            &worker.recovery,
+            &worker.core,
+            &worker.events,
+            &worker.work_notify,
+            delayed,
+        );
+        let core = worker.core.lock().unwrap();
+        assert!(
+            core.steering.is_empty() && core.follow_up.is_empty(),
+            "a delayed old sink cannot reinsert cancelled work"
+        );
+        drop(core);
+        let facts = crate::journal::WorkerRecoveryJournal::read_message_facts(
+            &worker.config.recovery_journal_path,
+        )
+        .unwrap();
+        assert!(facts
+            .values()
+            .any(|fact| fact.message_id == format!("goal-deferral:{token}")
+                && fact.phase == "cancelled"));
     }
 }

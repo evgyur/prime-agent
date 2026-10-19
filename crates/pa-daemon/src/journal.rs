@@ -476,6 +476,10 @@ impl WorkerRecoveryJournal {
         Ok(facts)
     }
 
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub(crate) fn record_message_fact(&mut self, fact: WorkerMessageFact) -> Result<()> {
         append_records(
             &self.path,

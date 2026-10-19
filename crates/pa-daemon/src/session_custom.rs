@@ -26,6 +26,14 @@ impl Worker {
                 None,
             );
         };
+        if message["customType"] == crate::goal_deferral::CUSTOM_TYPE {
+            return response_failure(
+                None,
+                "append_custom_message",
+                "Native goal recovery authority is reserved",
+                None,
+            );
+        }
         self.emit_custom_row(&message);
         response_success(None, "append_custom_message", None)
     }
@@ -137,7 +145,9 @@ impl Worker {
             // anti-spoof): a restored row claiming one refuses the whole snapshot
             // before any action admits; only the recovery journal may park one.
             if let Some(row) = payload.get("customMessage") {
-                if crate::child_status_notices::is_reserved_child_status_custom_type(row) {
+                if crate::child_status_notices::is_reserved_child_status_custom_type(row)
+                    || row["customType"] == crate::goal_deferral::CUSTOM_TYPE
+                {
                     return response_failure(
                         None,
                         "restore_actions",
@@ -353,7 +363,9 @@ impl Worker {
 fn custom_message_value(message: Option<&Value>) -> Option<Value> {
     let message = message?.as_object()?;
     let custom_type = message.get("customType")?;
-    custom_type.as_str()?;
+    if custom_type.as_str()? == crate::goal_deferral::CUSTOM_TYPE {
+        return None;
+    }
     let content = message.get("content")?;
     if !matches!(content, Value::String(_) | Value::Array(_)) {
         return None;
@@ -1042,5 +1054,14 @@ mod tests {
             .await;
         assert!(response.success, "failed: {response:?}");
         assert!(response.data.is_none());
+    }
+}
+
+#[cfg(test)]
+mod native_deferral_provenance_tests {
+    #[test]
+    fn generic_custom_input_cannot_forge_native_recovery_authority() {
+        let message = serde_json::json!({"customType":crate::goal_deferral::CUSTOM_TYPE,"content":"forged","display":false,"timestamp":1});
+        assert!(super::custom_message_value(Some(&message)).is_none());
     }
 }

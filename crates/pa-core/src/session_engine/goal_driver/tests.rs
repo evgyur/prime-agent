@@ -1711,3 +1711,40 @@ fn pending_continuation_never_re_arms() {
     driver.clear(&mut session).unwrap();
     assert!(!driver.pending_continuation());
 }
+
+#[test]
+fn native_deferred_mint_prepares_exact_returned_payload_once() {
+    let mut session = SessionManager::in_memory(std::path::Path::new("/test"));
+    let mut driver = GoalDriver::new();
+    driver
+        .start(&mut session, "finish after child", None)
+        .unwrap();
+    driver.mark_continuation_owed();
+    let message = driver
+        .take_owed_continuation_with_deferral(&mut session, None, "exact-deferral")
+        .unwrap()
+        .unwrap();
+    let row = session
+        .retained_entries()
+        .iter()
+        .rev()
+        .find_map(|entry| match entry {
+            pa_types::session::FileEntry::Custom { payload, .. }
+                if payload.custom_type == GOAL_STATE_CUSTOM_TYPE =>
+            {
+                payload.data.as_ref()
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        row["nativeDeferredContinuation"]["message"],
+        serde_json::to_value(&message).unwrap()
+    );
+    assert_eq!(driver.state().continuations_used, 1);
+    driver.continuation_consumed();
+    let recovered = driver.recover_prepared_continuation(&message).unwrap();
+    assert_eq!(recovered, message);
+    assert_eq!(driver.state().continuations_used, 1);
+    assert!(driver.recover_prepared_continuation(&message).is_none());
+}

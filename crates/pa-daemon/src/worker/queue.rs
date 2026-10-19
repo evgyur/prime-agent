@@ -520,23 +520,67 @@ pub(crate) fn admit_goal_follow_up(
         crate::engine::GoalTurnEndWork::BudgetLimitSteer(follow_up) => (Lane::Steering, follow_up),
         crate::engine::GoalTurnEndWork::Continuation(follow_up) => (Lane::FollowUp, follow_up),
     };
-    if let Some(goal) = &follow_up.goal_update {
-        {
-            let mut guard = core.lock().unwrap();
-            if let Some(store) = guard.store.as_mut() {
-                let _ = store.persist_entry(
-                    "custom",
-                    json!({
-                        "customType": pa_core::goals::GOAL_STATE_CUSTOM_TYPE,
-                        "data": goal,
-                    }),
-                );
+    let token = follow_up
+        .request
+        .custom_message
+        .as_ref()
+        .and_then(|row| row["details"][crate::goal_deferral::TOKEN_KEY].as_str())
+        .map(str::to_string);
+    let journal_path = if token.is_some() {
+        recovery
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|journal| journal.path().to_path_buf())
+    } else {
+        None
+    };
+    let goal_update = follow_up.goal_update.clone();
+    {
+        let mut guard = core.lock().unwrap();
+        if let Some(token) = &token {
+            // Owner cancellation and the exact obligation check share the enqueue
+            // lock. A delayed sink can neither recreate a cleared row nor enqueue
+            // after the owner action removed the corresponding obligation.
+            if guard.queued_input_suspended || guard.abort_requested || guard.shutdown_requested {
+                return;
+            }
+            let Some(store) = guard.store.as_ref() else {
+                return;
+            };
+            let Some(authority) = crate::goal_deferral::from_file(&store.path) else {
+                return;
+            };
+            if authority.intent.worker_id != guard.active_session_id
+                || journal_path
+                    .as_ref()
+                    .is_none_or(|path| std::path::Path::new(&authority.intent.journal_path) != path)
+            {
+                return;
+            }
+            if authority.intent.deferral_id != *token
+                || journal_path
+                    .as_ref()
+                    .is_none_or(|path| crate::goal_deferral::started(path, token))
+            {
+                return;
             }
         }
-        emit_worker_event_with(core, events, json!({ "type": "goal_update", "goal": goal }));
-    }
-    {
-        let mut core = core.lock().unwrap();
+        if let Some(goal) = &goal_update {
+            let mut durable_goal = goal.clone();
+            if let Some(token) = &token {
+                durable_goal[crate::goal_deferral::PREPARED_KEY] = json!({
+                    "version":1,"deferralId":token,"message":follow_up.request.custom_message,"goal":goal,
+                });
+            }
+            if let Some(store) = guard.store.as_mut() {
+                let persisted = store.persist_entry("custom",json!({"customType":pa_core::goals::GOAL_STATE_CUSTOM_TYPE,"data":durable_goal}));
+                if token.is_some() && persisted.is_err() {
+                    eprintln!("pa-daemon: deferred goal prepared payload was not durably admitted: {persisted:?}");
+                    return;
+                }
+            }
+        }
         let item = QueuedItem {
             priority: QueuePriority::Background,
             preview: None,
@@ -552,9 +596,12 @@ pub(crate) fn admit_goal_follow_up(
             forced_batch: false,
         };
         match lane {
-            Lane::Steering => enqueue_priority(&mut core.steering, item),
-            Lane::FollowUp => enqueue_priority(&mut core.follow_up, item),
+            Lane::Steering => enqueue_priority(&mut guard.steering, item),
+            Lane::FollowUp => enqueue_priority(&mut guard.follow_up, item),
         }
+    }
+    if let Some(goal) = &goal_update {
+        emit_worker_event_with(core, events, json!({"type":"goal_update","goal":goal}));
     }
     // The admission checkpoint: same idle-admission gap as the
     // autonomous continuation above.

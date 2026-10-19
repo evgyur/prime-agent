@@ -55,6 +55,8 @@ pub struct GoalDriver {
     /// A continuation is owed behind unsettled RLM descendant work.
     /// In-memory only: descendant quiescence is a live-session fact.
     owed_continuation_for_rlm_work: bool,
+    mint_recovery_deferral_id: Option<String>,
+    mint_recovery_message: Option<CustomMessage>,
     /// A minted continuation its surface has not admitted yet; while set no
     /// mint site re-arms another. In-memory only.
     pending_continuation: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -87,6 +89,13 @@ pub use progress::{
     GOAL_BACKOFF_WAKE_MARKER_TEXT,
 };
 
+fn recovery_continuation_message(state: &GoalState, token: &str) -> anyhow::Result<CustomMessage> {
+    let mut message = create_goal_context_message(state, GoalContextKind::Continuation, &[])?;
+    message.details.get_or_insert_with(|| serde_json::json!({}))["nativeDeferralId"] =
+        serde_json::json!(token);
+    Ok(message)
+}
+
 impl GoalDriver {
     #[must_use]
     pub fn new() -> Self {
@@ -95,6 +104,8 @@ impl GoalDriver {
             accounting_started_at: None,
             accounted_messages: std::collections::HashSet::default(),
             owed_continuation_for_rlm_work: false,
+            mint_recovery_deferral_id: None,
+            mint_recovery_message: None,
             pending_continuation: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             no_progress_streak: 0,
             no_progress_backoff_until_ms: 0,
@@ -414,9 +425,24 @@ impl GoalDriver {
             time_used_seconds: normalized.time_used_seconds.saturating_add(elapsed),
             ..normalized
         };
-        let value = serde_json::to_value(&normalized)?;
+        let mut value = serde_json::to_value(&normalized)?;
+        let mut recovery_message = None;
+        if normalized.status == GoalStatus::Active
+            && normalized.goal_id == self.state.goal_id
+            && self.state.continuations_used.checked_add(1) == Some(normalized.continuations_used)
+        {
+            if let Some(token) = &self.mint_recovery_deferral_id {
+                let message = recovery_continuation_message(&normalized, token)?;
+                value["nativeDeferredContinuation"] = serde_json::json!({
+                    "version":1,"deferralId":token,"message":&message,"goal":&normalized
+                });
+                recovery_message = Some(message);
+            }
+        }
+        // Goal charge and its exact recoverable payload share one durable row.
         session.append_custom_entry(GOAL_STATE_CUSTOM_TYPE, Some(value))?;
         session.flush_now()?;
+        self.mint_recovery_message = recovery_message;
         // A goal leaving the active state drops its pending mint: a continuation
         // owed to a dead goal never wedges the next one's mint.
         if normalized.status != GoalStatus::Active {
@@ -683,8 +709,11 @@ impl GoalDriver {
                 ..self.state.clone()
             },
         )?;
-        let message =
-            create_goal_context_message(&self.state, GoalContextKind::Continuation, &[]).ok();
+        let message = if self.mint_recovery_deferral_id.is_some() {
+            self.mint_recovery_message.take()
+        } else {
+            create_goal_context_message(&self.state, GoalContextKind::Continuation, &[]).ok()
+        };
         // The mint is owed to the calling surface until it admits the turn; a rollback un-mints it.
         if message.is_some() {
             self.mark_continuation_pending();
@@ -743,11 +772,70 @@ impl GoalDriver {
         }
     }
 
+    /// Mint an owed native descendant boundary with its exact recovery payload
+    /// in the same durable goal-state row. No second counter increment is needed
+    /// if a crash happens before the surface queues this payload.
+    ///
+    /// # Errors
+    /// Returns the normal mint/persistence error, or an invalid token error.
+    pub fn take_owed_continuation_with_deferral(
+        &mut self,
+        session: &mut SessionManager,
+        last_turn: Option<&pa_agent::types::AssistantMessage>,
+        token: &str,
+    ) -> anyhow::Result<Option<CustomMessage>> {
+        anyhow::ensure!(
+            !token.is_empty() && token.len() <= 128,
+            "Invalid goal deferral token"
+        );
+        let previous = self.mint_recovery_deferral_id.replace(token.to_string());
+        let previous_message = self.mint_recovery_message.take();
+        let result = self.take_owed_continuation(session, last_turn);
+        self.mint_recovery_deferral_id = previous;
+        self.mint_recovery_message = previous_message;
+        result
+    }
+
+    /// Re-arm the exact already-charged payload after native recovery proved
+    /// that its token has neither queued nor started. This never allocates a
+    /// continuation or rolls back usage. The caller owns durable admission proof.
+    #[must_use]
+    pub fn recover_prepared_continuation(
+        &mut self,
+        message: &CustomMessage,
+    ) -> Option<CustomMessage> {
+        let details = message.details.as_ref()?;
+        if !self.owns_continuation_wakeup()
+            || self.pending_continuation()
+            || self.no_progress_streak >= CONTINUATION_NO_PROGRESS_CAP
+            || self
+                .state
+                .token_budget
+                .is_some_and(|budget| self.state.tokens_used >= budget)
+            || message.custom_type != crate::goals::GOAL_CONTEXT_CUSTOM_TYPE
+            || details["goalId"].as_str() != self.state.goal_id.as_deref()
+            || details["continuationsUsed"].as_u64() != Some(self.state.continuations_used)
+            || details["nativeDeferralId"]
+                .as_str()
+                .is_none_or(str::is_empty)
+        {
+            return None;
+        }
+        self.owed_continuation_for_rlm_work = false;
+        self.mark_continuation_pending();
+        Some(message.clone())
+    }
+
     /// The surface admitted the minted continuation: the pending guard
     /// releases, so the next boundary may mint again.
     pub fn continuation_consumed(&mut self) {
         self.pending_continuation
             .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Withdraw the exact owed boundary after an explicit owner queue clear.
+    pub fn discard_owed_continuation(&mut self) {
+        self.owed_continuation_for_rlm_work = false;
     }
 
     /// Whether a minted continuation is still waiting for its surface's
