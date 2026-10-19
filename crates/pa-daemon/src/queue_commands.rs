@@ -218,6 +218,14 @@ fn mutate_lane(
                 return "rejected";
             };
             item.message = text.to_string();
+            // A replacement is not the input authorized by the original live request.
+            if item
+                .queue_key
+                .as_deref()
+                .is_some_and(|key| key.starts_with("studio-live:"))
+            {
+                item.queue_key = None;
+            }
             // The edited row loses its labeled preview: the client's
             // own text becomes the preview.
             item.preview = None;
@@ -236,6 +244,60 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::Arc;
+
+    #[test]
+    fn live_provenance_move_delete_replace_keep_only_unchanged_input_identity() {
+        let item = |key: &str| crate::worker::QueuedItem {
+            priority: crate::worker::QueuePriority::Human,
+            message: "same".into(),
+            preview: None,
+            custom_message: None,
+            agent_message: None,
+            queue_key: Some(key.into()),
+            admission_id: None,
+            images: vec![],
+            done: None,
+            queue_visible: true,
+            policy: crate::worker::TurnPolicy::Queued,
+            forced_batch: false,
+        };
+        let mut lane = std::collections::VecDeque::from([
+            item("studio-live:run:request-abcdefghijkl1"),
+            item("studio-live:run:request-abcdefghijkl2"),
+        ]);
+        assert_eq!(
+            mutate_lane(
+                &mut lane,
+                0,
+                "same",
+                &json!({"direction":1}),
+                "move",
+                "deleted"
+            ),
+            "applied"
+        );
+        assert_eq!(
+            lane[0].queue_key.as_deref(),
+            Some("studio-live:run:request-abcdefghijkl2")
+        );
+        assert_eq!(
+            mutate_lane(
+                &mut lane,
+                0,
+                "same",
+                &json!({"text":"edited"}),
+                "replace",
+                "deleted"
+            ),
+            "applied"
+        );
+        assert!(lane[0].queue_key.is_none());
+        assert_eq!(
+            mutate_lane(&mut lane, 1, "same", &json!({}), "delete", "deleted"),
+            "applied"
+        );
+        assert_eq!(lane.len(), 1);
+    }
 
     async fn created_worker() -> Arc<Worker> {
         let dir = std::env::temp_dir().join(format!("pa-worker-qc-{}", uuid::Uuid::new_v4()));

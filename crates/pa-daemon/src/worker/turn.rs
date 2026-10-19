@@ -645,6 +645,15 @@ impl TurnRunner {
             .iter()
             .filter_map(|item| item.admission_id.clone())
             .collect();
+        let mut live_input_keys: std::collections::VecDeque<Option<String>> = items
+            .iter()
+            .filter(|item| item.custom_message.is_none())
+            .map(|item| {
+                item.queue_key
+                    .clone()
+                    .filter(|key| key.starts_with("studio-live:"))
+            })
+            .collect();
         let items_done: Vec<oneshot::Sender<TurnSettle>> =
             items.into_iter().filter_map(|item| item.done).collect();
         let turn_outcome = Arc::new(std::sync::Mutex::new(None::<TurnSettle>));
@@ -861,8 +870,23 @@ impl TurnRunner {
                         }
                     }
                     // A `message` entry per row (TS's appendMessage path).
-                    EngineEvent::UserMessage(message)
-                    | EngineEvent::AssistantMessage(message)
+                    EngineEvent::UserMessage(message) => {
+                        let key = live_input_keys.pop_front().flatten();
+                        if let Some(store) = core.store.as_mut() {
+                            // Provenance is atomic with the durable user row; queue acceptance is not proof.
+                            let fields = match key {
+                                Some(key) => json!({"message":message,"studioLiveInputKey":key}),
+                                None => json!({"message":message}),
+                            };
+                            if let Err(error) = store.persist_entry("message", fields) {
+                                *turn_outcome_slot.lock().unwrap() = Some(TurnSettle::Failed(
+                                    format!("User row persist failed: {error:#}"),
+                                ));
+                                return false;
+                            }
+                        }
+                    }
+                    EngineEvent::AssistantMessage(message)
                     | EngineEvent::ToolResultMessage(message) => {
                         if let Some(store) = core.store.as_mut() {
                             let _ = store.persist_entry("message", json!({ "message": message }));

@@ -15,6 +15,7 @@ mod feed;
 mod interleave;
 mod park;
 mod queue;
+mod provenance;
 
 /// A minimal turn runner over a fresh session core: exactly what `run_turn` touches.
 fn burst_runner(engine: Arc<dyn SessionEngine>) -> TurnRunner {

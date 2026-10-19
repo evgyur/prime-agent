@@ -121,7 +121,11 @@ impl Worker {
                 message: message.to_string(),
                 custom_message,
                 agent_message: None,
-                queue_key: None,
+                queue_key: payload
+                    .get("queueKey")
+                    .and_then(Value::as_str)
+                    .filter(|key| key.starts_with("studio-live:") && key.len() <= 250)
+                    .map(str::to_string),
                 admission_id: admission_id.clone(),
                 images: images.clone(),
                 done,
@@ -229,7 +233,11 @@ impl Worker {
             message: message.to_string(),
             custom_message,
             agent_message: None,
-            queue_key: None,
+            queue_key: payload
+                .get("queueKey")
+                .and_then(Value::as_str)
+                .filter(|key| key.starts_with("studio-live:") && key.len() <= 250)
+                .map(str::to_string),
             admission_id: None,
             images,
             done: None,
