@@ -1,10 +1,10 @@
 //! Explicit operator evidence policy for retained legacy bindings, not terminal proof.
-#[cfg(test)]
-use super::ParentIdentity;
 use super::{
     anyhow, json, Arc, Assignment, ChildRecord, Deserialize, Gate, Path, PathBuf, Result,
-    RlmSubagentHost, Serialize, SupervisorChildSessions, Task, Value, MAX_ACTIVE,
+    Serialize, SupervisorChildSessions, Task, Value, MAX_ACTIVE,
 };
+#[cfg(test)]
+use super::{ParentIdentity, RlmSubagentHost};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
@@ -100,7 +100,9 @@ fn bounded_read(path: &Path) -> Result<Vec<u8>> {
         );
     }
     let mut bytes = Vec::new();
-    file.by_ref().take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    Read::by_ref(&mut file)
+        .take(MAX_BYTES + 1)
+        .read_to_end(&mut bytes)?;
     anyhow::ensure!(bytes.len() as u64 <= MAX_BYTES, "Evidence too large");
     Ok(bytes)
 }
@@ -140,7 +142,9 @@ fn trusted_approval(path: &Path) -> Result<Vec<u8>> {
             "Operator approval changed during open"
         );
         let mut bytes = Vec::new();
-        file.by_ref().take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
+        Read::by_ref(&mut file)
+            .take(MAX_BYTES + 1)
+            .read_to_end(&mut bytes)?;
         anyhow::ensure!(
             bytes.len() as u64 <= MAX_BYTES,
             "Operator approval too large"

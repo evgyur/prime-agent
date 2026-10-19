@@ -1,10 +1,10 @@
 //! Owner-authenticated Roadmap projection at existing continuation/admission boundaries.
 use super::{
-    anyhow, json, DaemonCommand, Duration, Gate, Map, PathBuf, Result, RlmSubagentHost,
-    SupervisorChildSessions, Value,
+    anyhow, json, DaemonCommand, Duration, Gate, Map, PathBuf, Result, SupervisorChildSessions,
+    Value,
 };
 #[cfg(test)]
-use super::{Arc, ParentIdentity, RlmChildIdentity};
+use super::{Arc, ParentIdentity, RlmChildIdentity, RlmSubagentHost};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

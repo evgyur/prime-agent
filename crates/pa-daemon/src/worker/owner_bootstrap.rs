@@ -1,7 +1,6 @@
 //! Independent supervisor-to-worker owner proof. Not the model-known worker token.
 use super::{
-    anyhow, response_failure, response_success, DaemonResponse, Result, SessionEngine, Value,
-    Worker, WorkerConfig,
+    anyhow, response_failure, response_success, DaemonResponse, Result, Value, Worker, WorkerConfig,
 };
 use hmac::{Hmac, Mac};
 use serde::Deserialize;

@@ -1,11 +1,11 @@
 //! Task-scoped orchestration accounting. No task text or automatic worker admission.
-#[cfg(test)]
-use super::{ParentIdentity, RlmChildIdentity};
 use super::{
     anyhow, durable_child_selector, json, now_ms, Arc, ChildRecord, DaemonCommand, Duration, Map,
-    Path, PathBuf, Result, RlmSubagentHost, SupervisorChildSessions, SupervisorChildSessionsInner,
-    Value, STATE_TIMEOUT_MS,
+    Path, PathBuf, Result, SupervisorChildSessions, SupervisorChildSessionsInner, Value,
+    STATE_TIMEOUT_MS,
 };
+#[cfg(test)]
+use super::{ParentIdentity, RlmChildIdentity, RlmSubagentHost};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
