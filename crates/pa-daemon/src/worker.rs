@@ -597,6 +597,11 @@ impl Worker {
                         .store
                         .as_mut()
                         .ok_or_else(|| anyhow::anyhow!("No durable goal store"))?;
+                    // Intentionally in-memory sessions retain ordinary live goal
+                    // continuation without claiming durable restart authority.
+                    if store.path.as_os_str().is_empty() {
+                        return Ok(None);
+                    }
                     if let Some(goal) = goal {
                         crate::goal_deferral::persist(
                             store,

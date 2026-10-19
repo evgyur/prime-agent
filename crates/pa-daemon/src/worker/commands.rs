@@ -720,9 +720,11 @@ impl Worker {
             if let Some(store) = self.core.lock().unwrap().store.as_mut() {
                 crate::goal_deferral::cancel(store)?;
             }
-            if let Some(engine) = &self.agent_engine {
-                engine.discard_deferred_goal().await;
-            }
+        }
+        // In-memory sessions have no durable marker, but owner cancellation
+        // must still withdraw their live descendant-deferral obligation.
+        if let Some(engine) = &self.agent_engine {
+            engine.discard_deferred_goal().await;
         }
         Ok(())
     }

@@ -1162,3 +1162,93 @@ async fn compact_mint_persists_the_goal_state_row() {
     assert_eq!(rows[0]["data"]["continuationsUsed"], 1);
     assert_eq!(rows[0]["data"]["objective"], "ship the port");
 }
+
+/// Owner queue withdrawal also cancels an ephemeral descendant obligation.
+#[allow(clippy::await_holding_lock)] // the faux registry is process-global
+#[tokio::test]
+async fn no_session_clear_queue_withdraws_owed_goal_continuation() {
+    let _faux = crate::agent_engine::tests::FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let worker = std::sync::Arc::new(Worker::new(
+        WorkerConfig {
+            socket_path: dir.path().join("worker.sock"),
+            supervisor_socket_path: PathBuf::new(),
+            token: "token".into(),
+            worker_instance_id: String::new(),
+            active_session_id: "ephemeral-owner".into(),
+            agent_dir: dir.path().join("agent"),
+            recovery_journal_path: dir.path().join("recovery.jsonl"),
+            telemetry_disabled: None,
+            script: Some(
+                json!({"engine":"faux","responses":["warm","await child","unexpected continuation"]}),
+            ),
+        },
+        None,
+    ));
+    assert!(
+        worker
+            .dispatch("create", &json!({"noSession":true,"cwd":"/tmp"}))
+            .await
+            .success
+    );
+    assert!(
+        worker
+            .dispatch("prompt_and_wait", &json!({"message":"warm"}))
+            .await
+            .success
+    );
+    let engine = worker.agent_engine.as_ref().unwrap();
+    let live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let probe = std::sync::Arc::clone(&live);
+    *engine.background_bash_probe.lock().unwrap() = Some(std::sync::Arc::new(move || {
+        probe.load(std::sync::atomic::Ordering::SeqCst)
+    }));
+    assert!(
+        worker
+            .dispatch(
+                "prompt_and_wait",
+                &json!({"message":"/goal await the child"})
+            )
+            .await
+            .success
+    );
+    assert_eq!(
+        engine.headless_goal_wait_state().await,
+        crate::goal_continuation::HeadlessGoalWait::Pending
+    );
+    assert!(worker
+        .core
+        .lock()
+        .unwrap()
+        .store
+        .as_ref()
+        .unwrap()
+        .path
+        .as_os_str()
+        .is_empty());
+    assert!(worker.dispatch("clear_queue", &json!({})).await.success);
+    live.store(false, std::sync::atomic::Ordering::SeqCst);
+    engine.retry_owed_goal_continuation();
+    assert_eq!(
+        engine.headless_goal_wait_state().await,
+        crate::goal_continuation::HeadlessGoalWait::Settled
+    );
+    assert_eq!(worker.engine.goal_state_value()["continuationsUsed"], 0);
+
+    // Only an intentionally empty path is ephemeral. A declared authority
+    // file that disappeared or became corrupt must never silently fall back.
+    let missing = dir.path().join("missing-authority.jsonl");
+    worker
+        .core
+        .lock()
+        .unwrap()
+        .store
+        .as_mut()
+        .unwrap()
+        .set_path(missing.clone());
+    assert!(engine.deferred_goal(None).is_err());
+    std::fs::write(missing, "not valid session JSON\n").unwrap();
+    assert!(engine.deferred_goal(None).is_err());
+}
