@@ -773,30 +773,6 @@ mod suspend_shield_tests {
 }
 
 /// The executable-path probe: the own pid resolves to the running binary, pid 0 never does.
-#[cfg(test)]
-mod executable_path_tests {
-    use super::*;
-
-    #[test]
-    fn own_pid_resolves_and_zero_does_not() {
-        let resolved = process_executable_path(std::process::id())
-            .expect("the own pid's executable must resolve");
-        let current = std::env::current_exe().expect("current_exe");
-        let resolved_name = resolved
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let current_name = current
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_default();
-        assert_eq!(
-            resolved_name, current_name,
-            "the own pid must resolve to the running executable ({resolved:?} vs {current:?})"
-        );
-        assert_eq!(process_executable_path(0), None);
-    }
-}
 
 /// Take the Linux Node extra-stdio Unix stream at fd 3 and prevent exec inheritance.
 /// Only the dedicated private-launch entrypoint may call this once before spawning threads.
@@ -865,4 +841,29 @@ pub fn read_private_worker_setup_frame() -> anyhow::Result<Vec<u8>> {
         anyhow::ensure!(frame.len() <= 4096, "Private worker setup too large");
     }
     Ok(frame)
+}
+
+#[cfg(test)]
+mod executable_path_tests {
+    use super::*;
+
+    #[test]
+    fn own_pid_resolves_and_zero_does_not() {
+        let resolved = process_executable_path(std::process::id())
+            .expect("the own pid's executable must resolve");
+        let current = std::env::current_exe().expect("current_exe");
+        let resolved_name = resolved
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let current_name = current
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        assert_eq!(
+            resolved_name, current_name,
+            "the own pid must resolve to the running executable ({resolved:?} vs {current:?})"
+        );
+        assert_eq!(process_executable_path(0), None);
+    }
 }
