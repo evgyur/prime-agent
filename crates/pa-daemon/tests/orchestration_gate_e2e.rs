@@ -227,7 +227,7 @@ fn actual_kernel_binding_start_and_settle_reconciles_before_quiescence() {
     let child_code=format!("import asyncio, pathlib\nbase=pathlib.Path({release:?})\nfor i in range(5):\n    try:\n        (base/('claim-'+str(i))).mkdir()\n        break\n    except FileExistsError: pass\nwhile not (base/'all').exists() and not (base/('release-'+str(i))).exists():\n    await asyncio.sleep(0.02)\nprint('released')",release=release.display().to_string());
     std::fs::write(&child,json!({"engine":"faux","responses":[{"content":[{"type":"toolCall","name":"ipython","arguments":{"code":child_code}}]},{"text":"child done"}]}).to_string()).unwrap();
     let first = format!(
-        r#"import asyncio,json,pathlib
+        r"import asyncio,json,pathlib
 handles=[]
 for i in range(5):
     handles.append(await rlm.spawn('independent fixture lane '+str(i),name='lane-'+str(i)))
@@ -240,17 +240,17 @@ for i in range(500):
     await asyncio.sleep(0.02)
 assert s['knownActive']==5,s
 pathlib.Path({receipt:?}).write_text(json.dumps(s))
-"#,
+",
         receipt = receipt.display().to_string()
     );
     let correction = format!(
-        r#"import pathlib,json
+        r"import pathlib,json
 s=await rlm.orchestration_status()
 assert s['knownActive']==4,s
 pathlib.Path({reaction:?}).write_text(json.dumps(s))
 e=dict(reason='draining',evidence='four independent fixture lanes remain',dependency='remaining four fixture workers',clearCondition='all workers settled',taskGeneration=1,policyRevision=1)
 await rlm.configure_orchestration_gate(dict(expectedRevision=s['revision'],policy=s['policy'],task=s['task'],assignments=[dict(childId=r['childId'],admissionGeneration=r['admissionGeneration'],incarnation=r['incarnation'],assignmentId='assignment-'+str(i),taskGeneration=1,ownership='lane-'+str(i),acceptanceRef='fixture-acceptance',artifactRef='fixture-result',dependenciesSatisfied=True) for i,r in enumerate(s['assignments'])],exception=e))
-"#,
+",
         reaction = reaction.display().to_string()
     );
     let parent_script = dir.path().join("parent.json");
