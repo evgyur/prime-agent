@@ -780,8 +780,13 @@ fn queue_delivery_projects_the_active_action_phases_around_the_turn() {
         })
         .map(|(index, _)| index)
         .collect();
+    let first_turn_end = events
+        .iter()
+        .position(|event| event["type"] == "agent_end")
+        .expect("the initial busy turn settles");
     let phase_at = |index: usize, phase: &str| {
-        events[index]["actions"]["active"]["phase"].as_str() == Some(phase)
+        index > first_turn_end
+            && events[index]["actions"]["active"]["phase"].as_str() == Some(phase)
     };
     let preparing = action_updates
         .iter()

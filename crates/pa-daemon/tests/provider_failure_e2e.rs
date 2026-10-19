@@ -490,13 +490,21 @@ fn provider_failure_is_retried_then_surfaced_to_attached_clients() {
 
     assert_eq!(mock.count(), 3, "requests: initial + 2 retries");
 
-    // The accepted user message is a message_start + message_end pair (TS wire),
-    // and an unchanged queue projection stays silent (TS `_emitQueueUpdate` dedup).
+    // Active-action phase changes may project while retrying, but they must
+    // not invent parked input. The accepted user message still pairs on the wire.
     let types = event_types(&client.events);
-    assert!(
-        !types.iter().any(|t| t == "session_action_update"),
-        "an empty-to-empty queue is not an update, events: {types:?}"
-    );
+    for event in client
+        .events
+        .iter()
+        .filter(|event| event["type"] == "session_action_update")
+    {
+        assert_eq!(
+            event["actions"]["queuedCount"], 0,
+            "retry must not queue input: {event}"
+        );
+        assert_eq!(event["actions"]["steering"], json!([]));
+        assert_eq!(event["actions"]["followUps"], json!([]));
+    }
     let user_pairs = client
         .events
         .iter()
