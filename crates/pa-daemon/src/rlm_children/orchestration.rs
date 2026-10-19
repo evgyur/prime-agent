@@ -135,6 +135,8 @@ pub(crate) struct Gate {
     pub(super) management_scope: Option<Value>,
     #[serde(default)]
     pub(super) consumed_managed_results: Vec<Value>,
+    #[serde(default)]
+    pub(super) owner_bootstrap_receipt: Option<Value>,
 }
 impl Gate {
     pub(super) fn enabled(&self) -> bool {
@@ -262,6 +264,188 @@ impl Gate {
 }
 
 impl SupervisorChildSessions {
+    pub(crate) async fn owner_bootstrap(
+        &self,
+        payload: &Value,
+        finalize: &(dyn Fn(&mut dyn FnMut() -> Result<Value>) -> Result<Value> + Sync),
+    ) -> Result<Value> {
+        let identity = self.inner.identity.lock().expect("identity lock").clone();
+        anyhow::ensure!(
+            identity.rlm_depth == 0
+                && payload["rootSessionId"].as_str() == identity.session_id.as_deref()
+                && payload["sessionFile"].as_str() == identity.session_file.as_deref()
+                && payload["cwd"].as_str() == identity.cwd.as_deref(),
+            "Owner identity mismatch"
+        );
+        let rows = self.accounting_rows().await;
+        anyhow::ensure!(
+            rows.iter()
+                .all(|row| row["obligation"] == false && row["executionKind"] != "unknown"),
+            "Unresolved runtime accounting blocks owner bootstrap"
+        );
+        let epoch = self
+            .inner
+            .accounting_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let snapshot = self.inner.gate.lock().expect("gate lock").clone();
+        anyhow::ensure!(
+            snapshot.enabled()
+                && snapshot.suspended
+                && snapshot
+                    .assignments
+                    .iter()
+                    .all(|a| snapshot.cancellation_settles(a, &rows)
+                        || snapshot.legacy_closure_applies(a, &rows)),
+            "Configured owner reconciliation incomplete"
+        );
+        anyhow::ensure!(
+            snapshot.management_scope.is_none() || snapshot.owner_bootstrap_receipt.is_some(),
+            "Existing management owner cannot be replaced"
+        );
+        let view = json!({"version":1,"gateRevision":snapshot.revision,"accountingEpoch":epoch,"task":snapshot.task,"policy":snapshot.policy,
+            "configuredAssignments":snapshot.assignments,"legacyClosureReceipts":snapshot.legacy_closure_receipts,
+            "correctiveAttempts":snapshot.attempts,"suspended":snapshot.suspended,"admissionPermission":false,
+            "rootSessionId":identity.session_id,"sessionFile":identity.session_file,"cwd":identity.cwd});
+        if payload["operation"] == "owner_bootstrap_preflight" {
+            let preflight_id = uuid::Uuid::new_v4().to_string();
+            *self
+                .inner
+                .owner_preflight
+                .lock()
+                .expect("owner preflight lock") = Some((preflight_id.clone(), view.clone()));
+            let mut response = view;
+            response["preflightId"] = json!(preflight_id);
+            return Ok(response);
+        }
+        anyhow::ensure!(
+            payload["operation"] == "owner_bootstrap_commit"
+                && payload["mode"] == "source_bootstrap_only",
+            "Owner operation unavailable"
+        );
+        let mut replay_request = payload.clone();
+        if let Some(object) = replay_request.as_object_mut() {
+            object.remove("pinnedSource");
+        }
+        let digest = payload["operationId"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow!("Owner operation identity missing"))?;
+        if let Some(receipt) = &snapshot.owner_bootstrap_receipt {
+            anyhow::ensure!(
+                receipt["operationId"] == digest && receipt["request"] == replay_request,
+                "Changed owner replay"
+            );
+            return Ok(receipt.clone());
+        }
+        anyhow::ensure!(
+            self.inner
+                .owner_preflight
+                .lock()
+                .expect("owner preflight lock")
+                .as_ref()
+                .is_some_and(
+                    |(id, before)| payload["preflightId"].as_str() == Some(id.as_str())
+                        && *before == view
+                ),
+            "Owner preflight changed"
+        );
+        anyhow::ensure!(
+            payload["expectedGateRevision"].as_u64() == Some(snapshot.revision)
+                && payload["expectedAccountingEpoch"].as_u64() == Some(epoch)
+                && payload["expectedTask"] == serde_json::to_value(&snapshot.task)?
+                && payload["expectedPolicy"] == serde_json::to_value(&snapshot.policy)?
+                && payload["expectedAssignments"] == serde_json::to_value(&snapshot.assignments)?,
+            "Owner snapshot changed"
+        );
+        anyhow::ensure!(
+            payload["callback"]
+                .as_object()
+                .is_some_and(|o| o.keys().all(|k| [
+                    "instanceId",
+                    "operationId",
+                    "envelope",
+                    "intendedWork",
+                    "expectedSourceSnapshotRevision",
+                    "expectedSourceEpoch"
+                ]
+                .contains(&k.as_str())))
+                && payload["callback"]["operationId"] == digest
+                && payload["callback"]["envelope"] == payload["envelope"]
+                && payload["callback"]["intendedWork"] == payload["intendedWork"],
+            "Invalid owner callback"
+        );
+        let source = super::next_work::Source::parse(&payload["pinnedSource"])?;
+        let confirmation=tokio::time::timeout(Duration::from_millis(2000),source.owner_callback(json!({"sessionId":identity.session_id,"sessionFile":identity.session_file,"cwd":identity.cwd}),payload["callback"].clone())).await??;
+        anyhow::ensure!(
+            confirmation["operationId"] == digest
+                && confirmation["envelope"] == payload["envelope"]
+                && confirmation["complete"] == true
+                && confirmation["instanceId"].as_str() == Some(source.instance_id.as_str())
+                && confirmation["sourceRevision"]
+                    == payload["callback"]["expectedSourceSnapshotRevision"]
+                && confirmation["sourceEpoch"] == payload["callback"]["expectedSourceEpoch"],
+            "Owner source confirmation mismatch"
+        );
+        let source_snapshot = &confirmation["snapshot"];
+        anyhow::ensure!(
+            source_snapshot["complete"] == true
+                && source_snapshot["revision"] == confirmation["sourceRevision"]
+                && source_snapshot["items"]
+                    .as_array()
+                    .is_some_and(|items| items.len() <= 2000
+                        && items
+                            .iter()
+                            .any(|item| item["planId"] == payload["intendedWork"]["planId"]
+                                && item["stepId"] == payload["intendedWork"]["stepId"])),
+            "Owner source snapshot mismatch"
+        );
+        // Never hold spawn admission across a callback: invalidation needs it to ACK.
+        let _admission = self.inner.spawn_gate.lock().await;
+        let fresh_rows = self.accounting_rows().await;
+        anyhow::ensure!(
+            fresh_rows
+                .iter()
+                .all(|r| r["obligation"] == false && r["executionKind"] != "unknown")
+                && snapshot
+                    .assignments
+                    .iter()
+                    .all(|a| snapshot.cancellation_settles(a, &fresh_rows)
+                        || snapshot.legacy_closure_applies(a, &fresh_rows)),
+            "Owner accounting changed"
+        );
+        finalize(&mut || {
+            let mut gate = self.inner.gate.lock().expect("gate lock");
+            let owner = self
+                .inner
+                .identity
+                .try_lock()
+                .map_err(|_| anyhow!("Owner identity busy"))?;
+            anyhow::ensure!(
+                owner.session_file == identity.session_file
+                    && owner.session_id == identity.session_id
+                    && gate.revision == snapshot.revision
+                    && self
+                        .inner
+                        .accounting_epoch
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        == epoch,
+                "Owner final CAS changed"
+            );
+            let mut next = gate.clone();
+            let scope = json!({"rootSessionId":identity.session_id,"goalId":payload["expectedGoalId"],"taskGeneration":snapshot.task.as_ref().map(|t|t.task_generation),"policyRevision":snapshot.task.as_ref().map(|t|t.policy_revision),"ownerBindingId":uuid::Uuid::new_v4().to_string(),"envelope":payload["envelope"],"intendedWork":payload["intendedWork"]});
+            let receipt = json!({"version":1,"operationId":digest,"request":replay_request,"revision":next.revision+1,"managementScope":scope,"envelope":payload["envelope"],"sourceInstanceId":confirmation["instanceId"],"reconciliationResolved":true,"admissionPermission":false,"pilotAdmitted":false,"automaticCorrectionAvailable":false});
+            next.management_scope = Some(scope);
+            next.next_work_source = Some(source.clone());
+            next.next_work_enabled = true;
+            next.next_work = Some(confirmation["snapshot"].clone());
+            next.owner_bootstrap_receipt = Some(receipt.clone());
+            next.revision += 1;
+            drop(owner);
+            self.persist_gate(&next)?;
+            *gate = next;
+            Ok(receipt)
+        })
+    }
     #[cfg(test)]
     pub(crate) fn inner_disable_gate_for_test(&self) {
         let mut gate = self.inner.gate.lock().expect("gate lock");
@@ -1019,13 +1203,14 @@ impl SupervisorChildSessions {
             "complete":unknown==0 && !gate.suspended && !revision_changed,"exception":gate.exception,
             "correctiveAttempts":gate.attempts,"assignments":rows,
             "ownerCancellationReceipts":gate.owner_cancellation_receipts,
+            "ownerBootstrapReceipt":gate.owner_bootstrap_receipt,
             "ownerAcceptedLegacyClosureReceipts":gate.legacy_closure_receipts,
             "managedContract":{"version":1,"sourceOnlyRebind":true,"causalResults":true},
             "managementScope":gate.management_scope,
             "managementObligation":gate.management_obligation.as_ref().map(|obligation| json!({
                 "sessionId":obligation.session_id,"goalId":obligation.goal_id,
                 "taskGeneration":obligation.task_generation,"state":if gate.correction_pending {"pending"} else {"owed"},
-                "blockReason":if gate.suspended {Some("reconciliation_required")} else if unknown > 0 {Some("unknown_obligation")} else if decision == "suspended" {Some("corrective_budget_exhausted")} else {None},
+                "blockReason":if gate.suspended && gate.owner_bootstrap_receipt.is_some() {Some("corrective_budget_exhausted")} else if gate.suspended {Some("reconciliation_required")} else if unknown > 0 {Some("unknown_obligation")} else if decision == "suspended" {Some("corrective_budget_exhausted")} else {None},
                 "admissionPermission":false})),
             "nextWorkSourceInstanceId":gate.next_work_source.as_ref().map(|source| source.instance_id.as_str()),"nextWork":next_work,"rootWritesCodeEnforcement":"policy-audit-only"})
     }
@@ -1630,6 +1815,142 @@ mod tests {
         state["workerInstanceId"] = Value::Null;
         assert_eq!(execution_kind(Some(&state), Some("new")), "unknown");
     }
+
+    #[tokio::test]
+    async fn owner_bootstrap_preflight_retains_server_snapshot_and_blocks_modified_view() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let parent = dir.path().join("root.jsonl");
+        let sessions = sessions();
+        sessions.set_identity(ParentIdentity {
+            session_id: Some("root".into()),
+            session_file: Some(parent.to_string_lossy().into()),
+            cwd: Some("/fixture".into()),
+            ..ParentIdentity::with_default_depth()
+        });
+        sessions.configure_gate(&configure(2)).await.unwrap();
+        {
+            let mut gate = sessions.inner.gate.lock().unwrap();
+            gate.suspended = true;
+            gate.attempts = 2;
+        }
+        let payload = json!({"version":1,"operation":"owner_bootstrap_preflight","rootSessionId":"root","sessionFile":parent,"cwd":"/fixture","expectedGoalId":"goal","intendedWork":{"planId":"p","stepId":"s"}});
+        let finalize = |commit: &mut dyn FnMut() -> Result<Value>| commit();
+        let view = sessions.owner_bootstrap(&payload, &finalize).await.unwrap();
+        let preflight = sessions
+            .inner
+            .owner_preflight
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        assert_eq!(preflight.0, view["preflightId"].as_str().unwrap());
+        assert_eq!(preflight.1["configuredAssignments"], json!([]));
+        let before = sessions.inner.gate.lock().unwrap().clone();
+        let mut commit = payload.clone();
+        commit["operation"] = json!("owner_bootstrap_commit");
+        commit["operationId"] = json!("op");
+        commit["mode"] = json!("source_bootstrap_only");
+        commit["preflightId"] = json!("caller-recomputed");
+        assert!(sessions.owner_bootstrap(&commit, &finalize).await.is_err());
+        assert_eq!(
+            serde_json::to_value(sessions.inner.gate.lock().unwrap().clone()).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_bootstrap_source_cas_both_invalidation_orders_and_denied_final_goal() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for mode in ["commit_first", "invalidate_first", "goal_changed"] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let socket = dir.path().join("source.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let sessions = std::sync::Arc::new(sessions());
+            let file = dir.path().join("root.jsonl");
+            std::fs::write(&file, "fixture").unwrap();
+            sessions.set_identity(ParentIdentity {
+                session_id: Some("root".into()),
+                session_file: Some(file.to_string_lossy().into()),
+                cwd: Some(dir.path().to_string_lossy().into()),
+                ..ParentIdentity::with_default_depth()
+            });
+            sessions.configure_gate(&configure(2)).await.unwrap();
+            {
+                let mut gate = sessions.inner.gate.lock().unwrap();
+                gate.suspended = true;
+                gate.attempts = 2;
+            }
+            let identity = json!({"version":1,"operation":"owner_bootstrap_preflight","rootSessionId":"root","sessionFile":file,"cwd":dir.path(),"expectedGoalId":"goal","intendedWork":{"planId":"p","stepId":"s"}});
+            let before = sessions.owner_bootstrap(&identity, &|f| f()).await.unwrap();
+            let envelope = json!({"planIds":["p"],"requiredLeaves":[{"planId":"p","stepId":"s"}],"launchRevision":4});
+            let mut request = identity.clone();
+            request["operation"] = json!("owner_bootstrap_commit");
+            request["preflightId"] = before["preflightId"].clone();
+            request["mode"] = json!("source_bootstrap_only");
+            request["operationId"] = json!("op");
+            request["expectedGateRevision"] = before["gateRevision"].clone();
+            request["expectedAccountingEpoch"] = before["accountingEpoch"].clone();
+            request["expectedTask"] = before["task"].clone();
+            request["expectedPolicy"] = before["policy"].clone();
+            request["expectedAssignments"] = before["configuredAssignments"].clone();
+            request["envelope"] = envelope.clone();
+            request["pinnedSource"] =
+                json!({"socketPath":socket,"token":"fixture-secret","instanceId":"source"});
+            request["callback"] = json!({"instanceId":"source","operationId":"op","envelope":envelope,"intendedWork":{"planId":"p","stepId":"s"},"expectedSourceSnapshotRevision":4,"expectedSourceEpoch":0});
+            let server_sessions = sessions.clone();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = vec![0u8; 8192];
+                let _ = stream.read(&mut bytes).await.unwrap();
+                if mode == "invalidate_first" {
+                    server_sessions.invalidate_next_work().await.unwrap();
+                }
+                let body=json!({"operationId":"op","envelope":envelope,"complete":true,"instanceId":"source","sourceRevision":4,"sourceEpoch":0,
+           "snapshot":{"complete":true,"revision":4,"planIds":["p"],"items":[{"planId":"p","stepId":"s","status":"ready"}]}}).to_string();
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                stream.shutdown().await.unwrap();
+            });
+            let result = sessions
+                .owner_bootstrap(&request, &|f| {
+                    anyhow::ensure!(mode != "goal_changed", "Owner goal changed");
+                    f()
+                })
+                .await;
+            server.await.unwrap();
+            let gate = sessions.inner.gate.lock().unwrap().clone();
+            assert!(gate.suspended);
+            assert_eq!(gate.attempts, 2);
+            assert_eq!(gate.assignments.len(), 0);
+            assert!(!sessions.gate_permit_is_current(&json!({})));
+            if mode == "commit_first" {
+                assert_eq!(result.as_ref().unwrap()["admissionPermission"], false);
+                assert!(gate.next_work.is_some());
+                assert!(gate.management_scope.is_some());
+                let replay = sessions.owner_bootstrap(&request, &|f| f()).await.unwrap();
+                assert_eq!(result.unwrap(), replay);
+                let mut changed = request.clone();
+                changed["intendedWork"]["stepId"] = json!("foreign");
+                assert!(sessions.owner_bootstrap(&changed, &|f| f()).await.is_err());
+                sessions.invalidate_next_work().await.unwrap();
+                assert!(sessions.inner.gate.lock().unwrap().next_work.is_none());
+            } else {
+                assert!(result.is_err());
+                assert!(gate.management_scope.is_none());
+                assert!(gate.next_work_source.is_none());
+            }
+        }
+    }
+
     fn sessions() -> SupervisorChildSessions {
         SupervisorChildSessions::new(
             Arc::new(crate::supervisor_link::SupervisorLink::new(PathBuf::new())),

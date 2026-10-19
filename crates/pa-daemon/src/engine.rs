@@ -35,6 +35,14 @@ pub trait SessionEngine: Send + Sync {
         false
     }
 
+    /// Private supervisor-owned source bootstrap. Never exposed as a model host operation.
+    fn owner_bootstrap(
+        &self,
+        _payload: Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send + '_>> {
+        Box::pin(async { anyhow::bail!("Owner bootstrap unavailable") })
+    }
+
     /// Native task-scoped orchestration control; unsupported engines fail explicitly.
     fn orchestration_gate(
         &self,

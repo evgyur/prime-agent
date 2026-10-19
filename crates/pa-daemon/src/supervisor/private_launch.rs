@@ -15,6 +15,7 @@ pub struct LaunchOwner {
     _source: Source,
     sequence: u64,
     last: Option<(String, Value)>,
+    bootstrap_last: Option<(String, Value)>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -112,7 +113,7 @@ impl<'de> Deserialize<'de> for StrictValue {
         d.deserialize_any(Visitor)
     }
 }
-fn strict(bytes: &[u8]) -> Result<Value> {
+pub(crate) fn strict(bytes: &[u8]) -> Result<Value> {
     Ok(serde_json::from_slice::<StrictValue>(bytes)?.0)
 }
 fn unhex(text: &str) -> Result<Vec<u8>> {
@@ -141,6 +142,100 @@ fn message(launch: &str, nonce: &str, sequence: u64, payload: &str) -> Vec<u8> {
     bytes
 }
 impl LaunchOwner {
+    pub(crate) fn authenticate_bootstrap(&mut self, value: &Value) -> Result<Value> {
+        let probe: Probe = serde_json::from_value(value.clone())?;
+        anyhow::ensure!(
+            probe.version == 1
+                && probe.launch_id == self.launch_id
+                && probe.generation_nonce == self.nonce
+                && (probe.sequence == self.sequence + 1 || probe.sequence == self.sequence)
+                && probe.payload.len() <= 32768,
+            "Private bootstrap identity mismatch"
+        );
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.key)
+            .map_err(|_| anyhow!("Invalid private key"))?;
+        mac.update(&message(
+            &probe.launch_id,
+            &probe.generation_nonce,
+            probe.sequence,
+            &probe.payload,
+        ));
+        mac.verify_slice(&unhex(&probe.mac_hex)?)
+            .map_err(|_| anyhow!("Private bootstrap authentication failed"))?;
+        if probe.sequence == self.sequence {
+            return self
+                .bootstrap_last
+                .as_ref()
+                .filter(|(raw, _)| raw == &probe.payload)
+                .map(|(_, payload)| payload.clone())
+                .ok_or_else(|| anyhow!("Changed bootstrap replay"));
+        }
+        let mut payload = strict(probe.payload.as_bytes())?;
+        anyhow::ensure!(
+            matches!(
+                payload["operation"].as_str(),
+                Some("owner_bootstrap_preflight" | "owner_bootstrap_commit")
+            ) && payload.get("pinnedSource").is_none(),
+            "Private bootstrap operation unavailable"
+        );
+        let operation = payload["operation"].as_str().unwrap_or_default();
+        let common = [
+            "version",
+            "operation",
+            "rootSessionId",
+            "activeSessionId",
+            "sessionFile",
+            "cwd",
+            "expectedGoalId",
+            "intendedWork",
+        ];
+        let commit = [
+            "preflightId",
+            "operationId",
+            "mode",
+            "expectedGateRevision",
+            "expectedAccountingEpoch",
+            "expectedTask",
+            "expectedPolicy",
+            "expectedAssignments",
+            "envelope",
+            "callback",
+        ];
+        anyhow::ensure!(
+            payload["version"] == 1
+                && payload
+                    .as_object()
+                    .is_some_and(|obj| obj.keys().all(|k| common.contains(&k.as_str())
+                        || (operation == "owner_bootstrap_commit"
+                            && commit.contains(&k.as_str())))),
+            "Unexpected owner fields"
+        );
+        anyhow::ensure!(
+            [
+                "rootSessionId",
+                "activeSessionId",
+                "sessionFile",
+                "cwd",
+                "expectedGoalId"
+            ]
+            .iter()
+            .all(|key| payload[*key]
+                .as_str()
+                .is_some_and(|s| !s.is_empty() && s.len() <= 4096))
+                && payload["intendedWork"]
+                    .as_object()
+                    .is_some_and(|o| o.len() == 2
+                        && ["planId", "stepId"].iter().all(|key| o
+                            .get(*key)
+                            .and_then(Value::as_str)
+                            .is_some_and(|s| !s.is_empty()))),
+            "Invalid owner target"
+        );
+        self.sequence = probe.sequence;
+        payload["pinnedSource"] = serde_json::json!({"socketPath":self._source.socket_path,"token":self._source.token,"instanceId":self._source.instance_id});
+        self.bootstrap_last = Some((probe.payload, payload.clone()));
+        Ok(payload)
+    }
     pub(crate) fn probe(&mut self, value: &Value) -> Result<Value> {
         let probe: Probe = serde_json::from_value(value.clone())?;
         anyhow::ensure!(
@@ -249,6 +344,7 @@ pub fn setup(mut stream: std::os::unix::net::UnixStream, socket: &Path) -> Resul
         _source: setup.source,
         sequence: 0,
         last: None,
+        bootstrap_last: None,
     };
     drop(stream);
     Ok(owner)
@@ -276,6 +372,7 @@ mod tests {
             },
             sequence: 0,
             last: None,
+            bootstrap_last: None,
         };
         let payload = r#"{"operation":"owner_probe"}"#;
         let mut mac = Hmac::<Sha256>::new_from_slice(&key).unwrap();

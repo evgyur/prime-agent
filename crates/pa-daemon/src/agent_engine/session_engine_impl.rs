@@ -11,6 +11,51 @@ use super::{
 };
 
 impl SessionEngine for AgentSessionEngine {
+    fn owner_bootstrap(
+        &self,
+        payload: Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Value>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let goal = self.current_goal_state();
+            anyhow::ensure!(
+                goal.as_ref().and_then(|g| g.goal_id.as_deref())
+                    == payload["expectedGoalId"].as_str()
+                    && goal
+                        .as_ref()
+                        .is_some_and(|g| g.status == pa_core::goals::GoalStatus::Active),
+                "Owner goal changed"
+            );
+            let children = self
+                .children
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Children unavailable"))?;
+            children
+                .owner_bootstrap(&payload, &|commit: &mut dyn FnMut() -> anyhow::Result<
+                    Value,
+                >| {
+                    let handles = self
+                        .goal_runtime
+                        .lock()
+                        .expect("goal runtime lock")
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("Owner goal unavailable"))?;
+                    let driver = handles
+                        .driver
+                        .try_lock()
+                        .map_err(|_| anyhow::anyhow!("Owner goal busy"))?;
+                    let current = driver.state_with_creation_elapsed();
+                    anyhow::ensure!(
+                        current.goal_id.as_deref() == payload["expectedGoalId"].as_str()
+                            && current.status == pa_core::goals::GoalStatus::Active,
+                        "Owner goal changed"
+                    );
+                    commit()
+                })
+                .await
+        })
+    }
+
     fn orchestration_permit_is_current(&self, permit: &Value) -> bool {
         !self.session_is_closed()
             && !self.gate_budget_or_quota_blocks()

@@ -123,6 +123,7 @@ use crate::{socket, util};
 
 pub struct Supervisor {
     pub(crate) private_launch_owner: std::sync::Mutex<Option<private_launch::LaunchOwner>>,
+    pub(crate) private_bootstrap_operation: tokio::sync::Mutex<()>,
     pub(crate) options: SupervisorOptions,
     descriptor_dir: PathBuf,
     /// The bind-time filesystem identity of this supervisor's socket file
@@ -269,6 +270,7 @@ impl Supervisor {
         ));
         Ok(Supervisor {
             private_launch_owner: std::sync::Mutex::new(None),
+            private_bootstrap_operation: tokio::sync::Mutex::new(()),
             options,
             descriptor_dir,
             bound_socket_identity: std::sync::Mutex::new(None),

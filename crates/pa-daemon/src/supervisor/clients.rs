@@ -682,6 +682,40 @@ impl Supervisor {
         type_name: String,
         stream: &tokio::sync::mpsc::Sender<(Vec<Outbound>, bool)>,
     ) -> (Vec<Value>, bool) {
+        if let DaemonCommand::ConfigureOrchestrationGate { rest, .. } = command {
+            if let Some(proof) = rest.get("privateOwnerBootstrap") {
+                let _operation = self.private_bootstrap_operation.lock().await;
+                let result=async {
+                    anyhow::ensure!(rest.len()==1,"Unexpected owner bootstrap wrapper");
+                    let payload=self.private_launch_owner.lock().expect("launch lock").as_mut().ok_or_else(||anyhow::anyhow!("Private owner unavailable"))?.authenticate_bootstrap(proof)?;
+                    let selector=payload["activeSessionId"].as_str().ok_or_else(||anyhow::anyhow!("Owner session missing"))?;
+                    let resident=self.registry.resolve(selector).await?;
+                    let key=resident.owner_bootstrap_key.lock().expect("owner key lock").clone().ok_or_else(||anyhow::anyhow!("Private worker owner unavailable"))?;
+                    let descriptor=resident.descriptor.lock().await;
+                    let instance=descriptor.worker_instance_id.clone().ok_or_else(||anyhow::anyhow!("Worker instance missing"))?;
+                    anyhow::ensure!(descriptor.session_file.as_deref()==payload["sessionFile"].as_str()&&descriptor.root_session_id.as_deref()==payload["rootSessionId"].as_str(),"Owner target mismatch");drop(descriptor);
+                    let sequence=resident.owner_bootstrap_sequence.fetch_add(1,Ordering::SeqCst)+1;
+                    let raw=serde_json::to_string(&payload)?;
+                    use hmac::{Hmac,Mac};use sha2::Sha256;
+                    let mut mac=Hmac::<Sha256>::new_from_slice(&key).map_err(|_|anyhow::anyhow!("Owner key unavailable"))?;
+                    mac.update(&crate::worker::owner_bootstrap::bytes(&self.owner_cleanup_generation,&instance,&resident.worker_id,sequence,&raw));
+                    let signature=mac.finalize().into_bytes().iter().map(|b|format!("{b:02x}")).collect::<String>();
+                    self.route_command_typed(&resident,"private_owner_bootstrap",json!({"version":1,"generation":self.owner_cleanup_generation,"instance":instance,"worker":resident.worker_id,"sequence":sequence,"payload":raw,"macHex":signature}),super::routing::ROUTE_TIMEOUT_MS,RouteAdmission::SupervisorInternal).await
+                }.await;
+                let mut response = match result {
+                    Ok(response) => response,
+                    Err(_) => response_failure(
+                        Some(&command_id),
+                        &type_name,
+                        "Private owner bootstrap unavailable",
+                        None,
+                    ),
+                };
+                response.id = Some(command_id);
+                response.command = type_name.clone();
+                return (vec![response_line(&response)], false);
+            }
+        }
         if let DaemonCommand::GetOrchestrationGate { rest, .. } = command {
             if let Some(probe) = rest.get("privateOwnerProbe") {
                 let result = (|| -> Result<Value> {

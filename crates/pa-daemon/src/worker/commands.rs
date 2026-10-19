@@ -13,6 +13,9 @@ use crate::protocol::DaemonResponse;
 
 impl Worker {
     pub(crate) async fn dispatch(&self, command_type: &str, payload: &Value) -> DaemonResponse {
+        if command_type == "private_owner_bootstrap" {
+            return self.handle_private_owner(payload).await;
+        }
         if command_type == "configure_orchestration_gate"
             && payload.get("acceptLegacyClosure").is_some()
         {

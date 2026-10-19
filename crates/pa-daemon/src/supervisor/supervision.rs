@@ -546,6 +546,7 @@ impl Supervisor {
         }
         // One env definition for spawn and for the update roster's `launch_env` row
         // (spec §8: "env snapshot to respawn the worker identically").
+        let worker_instance_id = uuid::Uuid::new_v4().to_string();
         let (worker_socket, cwd, launch_env, orphan_path) = {
             let mut descriptor = resident.descriptor.lock().await.clone();
             // Each process lifetime owns a different file. An old owner's
@@ -569,7 +570,7 @@ impl Supervisor {
                 crate::descriptor::worker_launch_env(
                     &self.options.agent_dir,
                     &self.options.socket_path.to_string_lossy(),
-                    &uuid::Uuid::new_v4().to_string(),
+                    &worker_instance_id,
                     &descriptor,
                 ),
                 orphan_path,
@@ -589,8 +590,25 @@ impl Supervisor {
         let mut command = Command::new(&executable);
         command.arg("worker");
         apply_worker_env(&mut command, client_launch_env.as_ref(), launch_env);
+        let private_owner = self
+            .private_launch_owner
+            .lock()
+            .expect("launch lock")
+            .is_some();
+        let owner_key = private_owner.then(|| {
+            let mut key = uuid::Uuid::new_v4().as_bytes().to_vec();
+            key.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+            key
+        });
+        if private_owner {
+            command.arg("--private-owner-setup-v1");
+        }
         command
-            .stdin(std::process::Stdio::null())
+            .stdin(if private_owner {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            })
             .stdout(std::process::Stdio::null())
             // The worker's stderr lands in its per-worker log (a detached supervisor has no
             // inherited stderr): the launch failure errors below tail this file.
@@ -601,9 +619,37 @@ impl Supervisor {
         // Detached and window-hidden, the TS worker spawn (`spawnHidden`, `{ detached: true }`):
         // the worker leaves the supervisor's console group and shows no fresh console.
         pa_core::platform::process::set_new_process_group(command.as_std_mut());
-        let child = command
+        let mut child = command
             .spawn()
             .with_context(|| format!("spawn session worker {}", resident.worker_id))?;
+        if let Some(key) = owner_key {
+            use tokio::io::AsyncWriteExt;
+            let descriptor = resident.descriptor.lock().await;
+            let setup = json!({"version":1,"kind":"owner_setup","supervisorGeneration":self.owner_cleanup_generation,
+                "workerInstanceId":worker_instance_id,"workerId":descriptor.root_active_session_id,
+                "keyHex":key.iter().map(|byte|format!("{byte:02x}")).collect::<String>()});
+            drop(descriptor);
+            let mut input = child
+                .stdin
+                .take()
+                .ok_or_else(|| anyhow!("Private worker setup pipe unavailable"))?;
+            let frame = format!("{setup}\n");
+            match tokio::time::timeout_at(connect_deadline, async {
+                input.write_all(frame.as_bytes()).await?;
+                input.shutdown().await
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                _ => {
+                    let _ = child.kill().await;
+                    return Err(anyhow!("Private worker setup failed"));
+                }
+            }
+            drop(input);
+            *resident.owner_bootstrap_key.lock().expect("owner key lock") = Some(key);
+            resident.owner_bootstrap_sequence.store(0, Ordering::SeqCst);
+        }
         let child = SpawnedWorker {
             orphan_generation: OrphanGeneration {
                 pid: child.id().unwrap_or(0),

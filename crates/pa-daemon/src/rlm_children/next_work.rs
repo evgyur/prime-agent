@@ -96,6 +96,28 @@ pub(super) fn accepted_proof<'a>(
 }
 
 impl Source {
+    pub(crate) async fn owner_callback(&self, identity: Value, params: Value) -> Result<Value> {
+        let body = serde_json::to_vec(
+            &json!({"action":"owner_bootstrap","identity":identity,"params":params}),
+        )?;
+        let stream = pa_types::platform::transport::connect_transport(&self.socket_path).await?;
+        let (reader, mut writer) = stream.split();
+        let header=format!("POST / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",self.token,body.len());
+        writer.write_all(header.as_bytes()).await?;
+        writer.write_all(&body).await?;
+        let mut bytes = Vec::new();
+        reader.take(131073).read_to_end(&mut bytes).await?;
+        anyhow::ensure!(
+            bytes.len() <= 131072
+                && (bytes.starts_with(b"HTTP/1.1 200 ") || bytes.starts_with(b"HTTP/1.0 200 ")),
+            "Owner source unavailable"
+        );
+        let end = bytes
+            .windows(4)
+            .position(|p| p == b"\r\n\r\n")
+            .ok_or_else(|| anyhow!("Invalid owner response"))?;
+        Ok(serde_json::from_slice(&bytes[end + 4..])?)
+    }
     pub(crate) fn parse(value: &Value) -> Result<Self> {
         let source: Self = serde_json::from_value(value.clone())?;
         anyhow::ensure!(

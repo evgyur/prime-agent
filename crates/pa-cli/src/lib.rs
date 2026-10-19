@@ -120,9 +120,14 @@ fn main_impl(args: &[String], runtime: &dyn mode::Runtime) -> Result<i32, String
     }
 
     let private_launch = args.iter().any(|arg| arg == "--studio-private-launch-v1");
+    let private_worker_setup = args.first().map(String::as_str) == Some("worker")
+        && std::env::var(pa_daemon::worker::WORKER_ROLE_ENV).unwrap_or_default() == "1";
     let args = args
         .into_iter()
-        .filter(|arg| arg != "--studio-private-launch-v1")
+        .filter(|arg| {
+            arg != "--studio-private-launch-v1"
+                && (!private_worker_setup || arg != "--private-owner-setup-v1")
+        })
         .collect::<Vec<_>>();
     let parsed = args::parse_args(&args);
     if !parsed.diagnostics.is_empty() {

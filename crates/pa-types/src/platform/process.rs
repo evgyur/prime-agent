@@ -817,3 +817,48 @@ pub fn take_studio_launch_stream() -> anyhow::Result<std::os::unix::net::UnixStr
     stream.peer_addr()?;
     Ok(stream)
 }
+
+/// Close the dedicated worker setup stdin after its single bounded frame was consumed.
+#[cfg(target_os = "linux")]
+pub fn close_private_worker_setup_stdin() -> anyhow::Result<()> {
+    // SAFETY: called once in dedicated worker startup before any other stdin user or child.
+    anyhow::ensure!(
+        unsafe { libc::close(0) } == 0,
+        "Private worker stdin close failed"
+    );
+    Ok(())
+}
+
+/// Read one EOF-terminated private worker setup frame, bounded in bytes and time.
+#[cfg(target_os = "linux")]
+pub fn read_private_worker_setup_frame() -> anyhow::Result<Vec<u8>> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut frame = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        anyhow::ensure!(!remaining.is_zero(), "Private worker setup deadline");
+        let mut fd = libc::pollfd {
+            fd: 0,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: stack pollfd and fixed bounded stack buffer, fd0 owned by private startup.
+        let ready = unsafe {
+            libc::poll(
+                &mut fd,
+                1,
+                remaining.as_millis().min(i32::MAX as u128) as i32,
+            )
+        };
+        anyhow::ensure!(ready > 0, "Private worker setup unavailable");
+        let mut chunk = [0u8; 512];
+        let count = unsafe { libc::read(0, chunk.as_mut_ptr().cast(), chunk.len()) };
+        anyhow::ensure!(count >= 0, "Private worker setup read failed");
+        if count == 0 {
+            break;
+        }
+        frame.extend_from_slice(&chunk[..count as usize]);
+        anyhow::ensure!(frame.len() <= 4096, "Private worker setup too large");
+    }
+    Ok(frame)
+}

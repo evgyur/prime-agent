@@ -92,6 +92,8 @@ impl WorkerRouteState {
 /// One resident session worker: the durable identity (descriptor) plus the
 /// live request channel once the supervisor has connected to the worker.
 pub(crate) struct ResidentWorker {
+    pub(crate) owner_bootstrap_key: std::sync::Mutex<Option<Vec<u8>>>,
+    pub(crate) owner_bootstrap_sequence: std::sync::atomic::AtomicU64,
     pub(crate) worker_id: String,
     pub(crate) descriptor: Mutex<DaemonWorkerDescriptor>,
     pub(crate) descriptor_path: PathBuf,
@@ -175,6 +177,8 @@ impl ResidentWorker {
     ) -> Arc<Self> {
         let (route_state_tx, _) = tokio::sync::watch::channel(WorkerRouteState::initial());
         Arc::new(ResidentWorker {
+            owner_bootstrap_key: std::sync::Mutex::new(None),
+            owner_bootstrap_sequence: std::sync::atomic::AtomicU64::new(0),
             worker_id,
             descriptor: Mutex::new(descriptor),
             descriptor_path,

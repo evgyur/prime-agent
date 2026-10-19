@@ -46,6 +46,7 @@ pub(crate) use summary::{
 use turn::TurnRunner;
 
 mod commands;
+pub(crate) mod owner_bootstrap;
 
 pub use env::{
     strip_inherited_worker_env, WORKER_ACTIVE_SESSION_ID_ENV, WORKER_CWD_ENV,
@@ -97,6 +98,9 @@ use crate::session_store::{session_file_name, SessionFile};
 use crate::types::{AgentConnectionState, SessionActionSnapshot};
 
 pub struct Worker {
+    owner_bootstrap: std::sync::Mutex<Option<owner_bootstrap::WorkerOwner>>,
+    owner_bootstrap_operation: tokio::sync::Mutex<()>,
+    owner_bootstrap_result: std::sync::Mutex<Option<(Value, DaemonResponse)>>,
     pub(crate) config: WorkerConfig,
     /// Studio owns defaults per conversation. Its daemon workers keep model
     /// and thinking switches in the session file without rewriting the
@@ -769,6 +773,9 @@ impl Worker {
             Arc::clone(&core),
         );
         Worker {
+            owner_bootstrap: std::sync::Mutex::new(None),
+            owner_bootstrap_operation: tokio::sync::Mutex::new(()),
+            owner_bootstrap_result: std::sync::Mutex::new(None),
             config,
             session_scoped_preferences: crate::protocol::studio_session_preferences_enabled(),
             bound_socket_identity: std::sync::Mutex::new(None),
@@ -1065,10 +1072,16 @@ pub async fn run_worker() -> Result<()> {
         return Err(anyhow!("worker mode requires {WORKER_ROLE_ENV}=1"));
     }
     let config = WorkerConfig::from_env()?;
+    let owner = if std::env::args().any(|arg| arg == "--private-owner-setup-v1") {
+        Some(owner_bootstrap::read_setup(&config)?)
+    } else {
+        None
+    };
     // Self-registration: the supervisor's roster survives its own restarts
     // because workers re-present their identity (liveness watch + backoff).
     let registration = crate::registration::start(&config);
     let worker = Arc::new(Worker::new(config, registration));
+    *worker.owner_bootstrap.lock().expect("owner bootstrap lock") = owner;
     // The refused-registration self-heal: retire instead of remaining an
     // invisible lease-holder.
     if let Some(handle) = worker.registration.clone() {

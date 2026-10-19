@@ -1374,3 +1374,135 @@ fn shared_window_goal_seed_matches_persisted_goal_state() {
         );
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn owner_bootstrap_actual_same_goal_paused_or_complete_during_callback_denied() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let _faux = FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for status in [
+        pa_core::goals::GoalStatus::Paused,
+        pa_core::goals::GoalStatus::Complete,
+    ] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let file = dir.path().join("root.jsonl");
+        std::fs::write(&file, "fixture").unwrap();
+        let mut engine = AgentSessionEngine::new(AgentEngineConfig {
+            cwd: dir.path().into(),
+            agent_dir,
+            provider: None,
+            model: None,
+            api_key: None,
+            thinking: None,
+            session_dir: None,
+            session_file: None,
+            faux_script: Some(r#"{"responses":[{"text":"never"}]}"#.into()),
+            supervisor_link: None,
+            telemetry_disabled: None,
+            cron_store: None,
+            queued_steering_probe: None,
+        })
+        .unwrap();
+        let model = engine.resolve_model().unwrap();
+        let built = engine.build_session(&model).await.unwrap();
+        engine.mirror_goal_runtime(&built).await;
+        let mut goal = pa_core::goals::empty_goal_state();
+        goal.goal_id = Some("same-goal".into());
+        goal.objective = Some("fixture".into());
+        goal.status = pa_core::goals::GoalStatus::Active;
+        built
+            .goal_driver
+            .lock()
+            .await
+            .restore_from_persisted(goal.clone());
+        let children = std::sync::Arc::new(crate::rlm_children::SupervisorChildSessions::new(
+            std::sync::Arc::new(crate::supervisor_link::SupervisorLink::new(
+                std::path::PathBuf::new(),
+            )),
+            dir.path().into(),
+            "parent".into(),
+            std::sync::Arc::new(crate::model_allowlist::ModelRefusalTelemetry::new(
+                dir.path().into(),
+                true,
+            )),
+        ));
+        children.set_identity(crate::rlm_children::ParentIdentity {
+            session_id: Some("root".into()),
+            session_file: Some(file.to_string_lossy().into()),
+            cwd: Some(dir.path().to_string_lossy().into()),
+            ..crate::rlm_children::ParentIdentity::with_default_depth()
+        });
+        children.configure_gate(&json!({"expectedRevision":0,"policy":{"version":1,"enabled":true,"minActive":5,"maxActive":20,"rootWritesCode":false,"correctiveBudget":2},"task":{"projectId":"p","planId":"p","stepId":"s","taskGeneration":1,"policyRevision":1},"assignments":[]})).await.unwrap();
+        let gatefile = format!("{}.orchestration-gate.json", file.display());
+        let mut gate: Value = serde_json::from_slice(&std::fs::read(&gatefile).unwrap()).unwrap();
+        gate["suspended"] = json!(true);
+        gate["attempts"] = json!(2);
+        std::fs::write(&gatefile, serde_json::to_vec(&gate).unwrap()).unwrap();
+        children.restore_gate();
+        engine.children = Some(children.clone());
+        let identity = json!({"version":1,"operation":"owner_bootstrap_preflight","rootSessionId":"root","sessionFile":file,"cwd":dir.path(),"expectedGoalId":"same-goal","intendedWork":{"planId":"p","stepId":"s"}});
+        let before = SessionEngine::owner_bootstrap(&engine, identity.clone())
+            .await
+            .unwrap();
+        let socket = dir.path().join("source.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let envelope = json!({"planIds":["p"],"requiredLeaves":[{"planId":"p","stepId":"s"}],"launchRevision":4});
+        let mut request = identity;
+        request["operation"] = json!("owner_bootstrap_commit");
+        request["preflightId"] = before["preflightId"].clone();
+        request["mode"] = json!("source_bootstrap_only");
+        request["operationId"] = json!("op");
+        request["expectedGateRevision"] = before["gateRevision"].clone();
+        request["expectedAccountingEpoch"] = before["accountingEpoch"].clone();
+        request["expectedTask"] = before["task"].clone();
+        request["expectedPolicy"] = before["policy"].clone();
+        request["expectedAssignments"] = before["configuredAssignments"].clone();
+        request["envelope"] = envelope.clone();
+        request["pinnedSource"] =
+            json!({"socketPath":socket,"token":"fixture-secret","instanceId":"source"});
+        request["callback"] = json!({"instanceId":"source","operationId":"op","envelope":envelope,"intendedWork":{"planId":"p","stepId":"s"},"expectedSourceSnapshotRevision":4,"expectedSourceEpoch":0});
+        let driver = built.goal_driver.clone();
+        let source = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = [0u8; 8192];
+            stream.read(&mut bytes).await.unwrap();
+            goal.status = status;
+            driver.lock().await.restore_from_persisted(goal);
+            let body=json!({"operationId":"op","envelope":envelope,"complete":true,"instanceId":"source","sourceRevision":4,"sourceEpoch":0,"snapshot":{"complete":true,"revision":4,"planIds":["p"],"items":[{"planId":"p","stepId":"s","status":"ready"}]}}).to_string();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let result = SessionEngine::owner_bootstrap(&engine, request).await;
+        source.await.unwrap();
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Owner goal changed"));
+        assert_eq!(
+            engine.current_goal_state().unwrap().goal_id.as_deref(),
+            Some("same-goal")
+        );
+        assert_eq!(engine.current_goal_state().unwrap().status, status);
+        let after = children.gate_status().await;
+        assert!(after["managementScope"].is_null());
+        assert!(after["ownerBootstrapReceipt"].is_null());
+        assert_eq!(after["correctiveAttempts"], 2);
+        let durable: Value = serde_json::from_slice(&std::fs::read(&gatefile).unwrap()).unwrap();
+        assert_eq!(durable["suspended"], true);
+        assert_eq!(durable["attempts"], 2);
+    }
+}

@@ -457,6 +457,7 @@ struct SupervisorChildSessionsInner {
     gate: std::sync::Mutex<Gate>,
     spawn_gate: Mutex<()>,
     accounting_epoch: std::sync::atomic::AtomicU64,
+    owner_preflight: std::sync::Mutex<Option<(String, Value)>>,
     /// Confirmed-dead children whose final usage remains owed. Not roster or slot owners.
     retired_usage: std::sync::Mutex<Vec<RetiredChild>>,
     /// Spawn-name reservations held until admission is durable, so
@@ -527,6 +528,7 @@ impl SupervisorChildSessions {
                 gate: std::sync::Mutex::new(Gate::default()),
                 spawn_gate: Mutex::new(()),
                 accounting_epoch: std::sync::atomic::AtomicU64::new(0),
+                owner_preflight: std::sync::Mutex::new(None),
                 retired_usage: std::sync::Mutex::new(Vec::new()),
                 pending_spawn_names: std::sync::Mutex::new(std::collections::HashSet::new()),
                 deleted_children: std::sync::Mutex::new(std::collections::HashMap::new()),
