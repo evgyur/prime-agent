@@ -474,7 +474,7 @@ mod tests {
         changed = approval.clone();
         changed.bindings[0].quarantine_sha256 = "wrong".into();
         assert!(validate(&changed, dir.path()).is_err());
-        changed = approval.clone();
+        changed = approval;
         changed.bindings[0].assignment.ownership = "foreign".into();
         assert!(validate(&changed, dir.path()).is_err());
         assert!(!safe_id("../forged"));
@@ -577,7 +577,7 @@ mod tests {
         let mut gate = sessions.inner.gate.lock().unwrap().clone();
         let assignment = approval.bindings[0].assignment.clone();
         let idle = json!({"childId":"child","admissionGeneration":"new-g","incarnation":null,"executionKind":"idle","obligation":false,"ownerAcceptedLegacyClosures":["digest"]});
-        assert!(gate.legacy_closure_applies(&assignment, &[idle.clone()]));
+        assert!(gate.legacy_closure_applies(&assignment, std::slice::from_ref(&idle)));
         let mut active = idle.clone();
         active["obligation"] = json!(true);
         assert!(!gate.legacy_closure_applies(&assignment, &[active]));

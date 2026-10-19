@@ -1544,6 +1544,7 @@ mod saved_delete_tests {
 
     #[tokio::test]
     async fn owner_cancel_denies_wrong_edge_admission_live_and_corrupt_lease() {
+        use sha2::{Digest, Sha256};
         let dir = tempfile::TempDir::new().unwrap();
         let agent_dir = dir.path().join("agent");
         let sessions = agent_dir.join("sessions");
@@ -1603,10 +1604,13 @@ mod saved_delete_tests {
             supervisor.reconcile_owner_cancel(&request).await.is_err(),
             "missing admission display denies"
         );
-        use sha2::{Digest, Sha256};
         let canonical = crate::lease::canonical_session_path(&child_file);
         let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
-        let key: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        let key: String = digest.iter().fold(String::new(), |mut output, byte| {
+            use std::fmt::Write;
+            write!(&mut output, "{byte:02x}").unwrap();
+            output
+        });
         let corrupt = agent_dir.join("session-leases").join(format!("{key}.lock"));
         std::fs::create_dir_all(&corrupt).unwrap();
         std::fs::write(corrupt.join("owner.json"), "corrupt").unwrap();

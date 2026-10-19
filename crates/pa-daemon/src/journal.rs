@@ -991,7 +991,7 @@ mod tests {
         super::WorkerRecoveryJournal::restore_parent_owner_cancellations(dir.path(), &new, &parent)
             .unwrap();
         let journal = super::WorkerRecoveryJournal::open(&new).unwrap();
-        assert_eq!(journal.owner_cancel_facts(), &[fact.clone()]);
+        assert_eq!(journal.owner_cancel_facts(), std::slice::from_ref(&fact));
         assert!(journal.get_latest().is_empty());
         assert!(journal.latest_queue_snapshot("active").is_none());
         drop(journal);
@@ -1040,7 +1040,7 @@ mod tests {
                 .unwrap();
         }
         let mut journal = super::WorkerRecoveryJournal::open(&path).unwrap();
-        assert_eq!(journal.owner_cancel_facts(), &[fact.clone()]);
+        assert_eq!(journal.owner_cancel_facts(), std::slice::from_ref(&fact));
         let before = std::fs::read(&path).unwrap();
         journal.record_owner_cancel(fact).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), before);

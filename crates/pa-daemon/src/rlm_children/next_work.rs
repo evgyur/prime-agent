@@ -794,7 +794,7 @@ mod tests {
             handles.driver.lock().await.continuation_consumed();
         });
         let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let probe_count = probes.clone();
+        let probe_count = probes;
         *engine.goal_input_probe.lock().unwrap() = Some(Arc::new(move || {
             probe_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0
         }));
@@ -821,7 +821,7 @@ mod tests {
             gate.work_bindings.push(late);
         }
         let late_probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let late_count = late_probes.clone();
+        let late_count = late_probes;
         *engine.goal_input_probe.lock().unwrap() = Some(Arc::new(move || {
             late_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 2
         }));
@@ -1102,24 +1102,26 @@ mod tests {
         assert!(sessions.gate_correction().await.is_none());
         assert!(sessions.consume_managed_review(&candidate).is_err());
         assert!(sessions.managed_review_candidate(&request).await.is_err());
-        let gate = sessions.inner.gate.lock().unwrap();
-        assert_eq!(gate.attempts, 2);
-        assert_eq!(gate.consumed_managed_results.len(), 1);
-        let consumed = gate.consumed_managed_results.clone();
-        let mut persisted = serde_json::to_value(&*gate).unwrap();
-        persisted["workBindings"][0]["acceptedClosure"] = json!({"stale":true});
-        let restored: super::super::orchestration::Gate =
-            serde_json::from_value(persisted).unwrap();
-        assert!(restored.work_bindings[0].review_consumed);
-        assert_eq!(restored.consumed_managed_results, consumed);
-        assert!(restored.next_work.is_none());
-        assert!(accepted_proof(
-            restored.next_work.as_ref(),
-            restored.management_scope.as_ref(),
-            &restored.work_bindings[0]
-        )
-        .is_none());
-        drop(gate);
+        let restored = {
+            let gate = sessions.inner.gate.lock().unwrap();
+            assert_eq!(gate.attempts, 2);
+            assert_eq!(gate.consumed_managed_results.len(), 1);
+            let consumed = gate.consumed_managed_results.clone();
+            let mut persisted = serde_json::to_value(&*gate).unwrap();
+            persisted["workBindings"][0]["acceptedClosure"] = json!({"stale":true});
+            let restored: super::super::orchestration::Gate =
+                serde_json::from_value(persisted).unwrap();
+            assert!(restored.work_bindings[0].review_consumed);
+            assert_eq!(restored.consumed_managed_results, consumed);
+            assert!(restored.next_work.is_none());
+            assert!(accepted_proof(
+                restored.next_work.as_ref(),
+                restored.management_scope.as_ref(),
+                &restored.work_bindings[0]
+            )
+            .is_none());
+            restored
+        };
         *sessions.inner.gate.lock().unwrap() = restored;
         assert!(sessions.consume_managed_review(&candidate).is_err());
         assert!(sessions.managed_review_candidate(&request).await.is_err());
@@ -1210,14 +1212,16 @@ mod tests {
             sessions.gate_correction().await.unwrap();
             sessions.consume_gate_correction();
         }
-        let mut gate = sessions.inner.gate.lock().unwrap();
-        gate.suspended = true;
-        let original_scope = gate.management_scope.clone().unwrap();
-        let mut request = json!({"version":1,"expectedSessionId":"root","expectedGoalId":"goal",
+        let (original_scope, mut request) = {
+            let mut gate = sessions.inner.gate.lock().unwrap();
+            gate.suspended = true;
+            let original_scope = gate.management_scope.clone().unwrap();
+            let request = json!({"version":1,"expectedSessionId":"root","expectedGoalId":"goal",
             "expectedManagementOwner":original_scope["ownerBindingId"],"expectedGateRevision":gate.revision,
             "expectedTask":gate.task,"expectedPolicy":gate.policy,"envelope":original_scope["envelope"],
             "nextWorkSource":{"socketPath":"/tmp/source.sock","token":"fixture","instanceId":"new"}});
-        drop(gate);
+            (original_scope, request)
+        };
         request["expectedManagementOwner"] = json!("wrong");
         assert!(sessions
             .rebind_next_work_source(&request, Some("goal"))
@@ -1287,10 +1291,11 @@ mod tests {
                 &json!({"socketPath":socket,"token":"fixture","instanceId":"instance"}),
             )
             .unwrap();
-        let mut gate = sessions.inner.gate.lock().unwrap();
-        gate.task = Some(serde_json::from_value(json!({"projectId":"project","planId":"p","stepId":"root","taskGeneration":1,"policyRevision":1})).unwrap());
-        gate.policy = Some(serde_json::from_value(json!({"version":1,"enabled":true,"minActive":1,"maxActive":2,"rootWritesCode":false,"correctiveBudget":2})).unwrap());
-        drop(gate);
+        {
+            let mut gate = sessions.inner.gate.lock().unwrap();
+            gate.task = Some(serde_json::from_value(json!({"projectId":"project","planId":"p","stepId":"root","taskGeneration":1,"policyRevision":1})).unwrap());
+            gate.policy = Some(serde_json::from_value(json!({"version":1,"enabled":true,"minActive":1,"maxActive":2,"rootWritesCode":false,"correctiveBudget":2})).unwrap());
+        }
         sessions.refresh_next_work().await;
         dir
     }

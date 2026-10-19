@@ -368,9 +368,9 @@ async fn retask_controller_fixture(
 
 #[tokio::test]
 async fn retask_controller_display_write_failure_prevents_send() {
+    use std::os::unix::fs::PermissionsExt;
     let (dir, controller, sends) = retask_controller_fixture(RetaskAdmission::Queued).await;
     let display = dir.path().join("child/rlm-subagent.json");
-    use std::os::unix::fs::PermissionsExt;
     let child_dir = display.parent().unwrap();
     std::fs::set_permissions(child_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
     let result = controller.send_agent_message(input()).await;

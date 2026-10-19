@@ -385,8 +385,11 @@ mod tests {
             .finalize()
             .into_bytes()
             .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>();
+            .fold(String::new(), |mut output, byte| {
+                use std::fmt::Write;
+                write!(&mut output, "{byte:02x}").unwrap();
+                output
+            });
         let probe = serde_json::json!({"version":1,"launchId":"launch","generationNonce":"nonce","sequence":1,"payload":payload,"macHex":hex});
         let mut bad = probe.clone();
         bad["macHex"] = Value::String("00".repeat(32));

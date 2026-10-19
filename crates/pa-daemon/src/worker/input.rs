@@ -24,24 +24,6 @@ fn parent_admission_identity_valid(parent_session: Option<&str>, sender: &Value)
             .is_some_and(|s| s.starts_with("agentmsg_") && s.len() <= 128)
 }
 
-#[cfg(test)]
-mod parent_admission_tests {
-    use super::*;
-    #[test]
-    fn only_exact_durable_parent_can_supply_an_admission() {
-        let sender = json!({"sessionId":"parent","rlmAdmission":{"generation":"message-admission-v1:g","messageId":"agentmsg_m"}});
-        assert!(parent_admission_identity_valid(Some("parent"), &sender));
-        assert!(!parent_admission_identity_valid(None, &sender));
-        assert!(!parent_admission_identity_valid(
-            Some("unrelated-parent"),
-            &sender
-        ));
-        let mut old = sender;
-        old["rlmAdmission"]["generation"] = json!("legacy");
-        assert!(!parent_admission_identity_valid(Some("parent"), &old));
-    }
-}
-
 impl Worker {
     pub(crate) async fn handle_prompt(&self, payload: &Value, wait: bool) -> DaemonResponse {
         if let Err(response) = self.require_created("prompt") {
@@ -520,5 +502,23 @@ impl Worker {
             receipt["from"] = json!(sender);
         }
         response_success(None, "worker_deliver_message", Some(receipt))
+    }
+}
+
+#[cfg(test)]
+mod parent_admission_tests {
+    use super::*;
+    #[test]
+    fn only_exact_durable_parent_can_supply_an_admission() {
+        let sender = json!({"sessionId":"parent","rlmAdmission":{"generation":"message-admission-v1:g","messageId":"agentmsg_m"}});
+        assert!(parent_admission_identity_valid(Some("parent"), &sender));
+        assert!(!parent_admission_identity_valid(None, &sender));
+        assert!(!parent_admission_identity_valid(
+            Some("unrelated-parent"),
+            &sender
+        ));
+        let mut old = sender;
+        old["rlmAdmission"]["generation"] = json!("legacy");
+        assert!(!parent_admission_identity_valid(Some("parent"), &old));
     }
 }

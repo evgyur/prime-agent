@@ -132,33 +132,6 @@ async fn changed_owner_snapshot_before_queued_child_provider_holds_item_without_
 
 #[tokio::test]
 async fn validated_managed_start_survives_private_permit_strip_in_real_queue_path() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let socket = dir.path().join("owner.sock");
-    let listener = pa_types::platform::transport::bind_transport(&socket)
-        .await
-        .unwrap();
-    let server = tokio::spawn(async move {
-        let stream = listener.accept().await.unwrap();
-        let (reader, mut writer) = stream.split();
-        writer.write_all(b"{\"type\":\"daemon_hello\",\"protocol\":{\"name\":\"prime-agent.daemon\",\"version\":7}}\n").await.unwrap();
-        let mut reader = BufReader::new(reader);
-        let mut line = String::new();
-        reader.read_line(&mut line).await.unwrap();
-        let request: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(
-            request["command"]["beginWorkStart"]["expectedMessageId"],
-            "kickoff"
-        );
-        let response = crate::protocol::response_success(
-            request["id"].as_str(),
-            "configure_orchestration_gate",
-            Some(json!({"workStartPermitted":true,"managedResultTracking":true})),
-        );
-        writer
-            .write_all(format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes())
-            .await
-            .unwrap();
-    });
     struct InspectProvider(std::sync::atomic::AtomicBool);
     impl SessionEngine for InspectProvider {
         fn run_prompt(
@@ -214,6 +187,34 @@ async fn validated_managed_start_survives_private_permit_strip_in_real_queue_pat
             Ok(())
         }
     }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let socket = dir.path().join("owner.sock");
+    let listener = pa_types::platform::transport::bind_transport(&socket)
+        .await
+        .unwrap();
+    let server = tokio::spawn(async move {
+        let stream = listener.accept().await.unwrap();
+        let (reader, mut writer) = stream.split();
+        writer.write_all(b"{\"type\":\"daemon_hello\",\"protocol\":{\"name\":\"prime-agent.daemon\",\"version\":7}}\n").await.unwrap();
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let request: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            request["command"]["beginWorkStart"]["expectedMessageId"],
+            "kickoff"
+        );
+        let response = crate::protocol::response_success(
+            request["id"].as_str(),
+            "configure_orchestration_gate",
+            Some(json!({"workStartPermitted":true,"managedResultTracking":true})),
+        );
+        writer
+            .write_all(format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes())
+            .await
+            .unwrap();
+    });
     let engine = Arc::new(InspectProvider(std::sync::atomic::AtomicBool::new(false)));
     let mut runner = burst_runner(engine.clone());
     runner.passivation.link = Arc::new(crate::supervisor_link::SupervisorLink::new(socket));

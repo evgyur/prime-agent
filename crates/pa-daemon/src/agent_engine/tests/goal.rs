@@ -1469,7 +1469,11 @@ async fn owner_bootstrap_actual_same_goal_paused_or_complete_during_callback_den
         let source = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut bytes = [0u8; 8192];
-            stream.read(&mut bytes).await.unwrap();
+            let count = stream.read(&mut bytes).await.unwrap();
+            assert!(
+                count > 0,
+                "the fixture request must arrive before changing goal state"
+            );
             goal.status = status;
             driver.lock().await.restore_from_persisted(goal);
             let body=json!({"operationId":"op","envelope":envelope,"complete":true,"instanceId":"source","sourceRevision":4,"sourceEpoch":0,"snapshot":{"complete":true,"revision":4,"planIds":["p"],"items":[{"planId":"p","stepId":"s","status":"ready"}]}}).to_string();

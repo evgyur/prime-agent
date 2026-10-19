@@ -790,7 +790,7 @@ mod orchestration_queue_tests {
             config["expectedRevision"] = json!(1);
             match change {
                 "exception" => {
-                    config["exception"] = json!({"reason":"draining","evidence":"fixture work accepted","dependency":"four workers","clearCondition":"all settle","taskGeneration":1,"policyRevision":1})
+                    config["exception"] = json!({"reason":"draining","evidence":"fixture work accepted","dependency":"four workers","clearCondition":"all settle","taskGeneration":1,"policyRevision":1});
                 }
                 "disable" => config["policy"]["enabled"] = json!(false),
                 "retask" => config["task"]["taskGeneration"] = json!(2),

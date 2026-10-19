@@ -36,7 +36,7 @@ mod scoped_answer_tests {
     fn earlier_answer_is_never_reused_for_missing_or_unanswered_admission() {
         let old = json!({"role":"assistant","content":[{"type":"text","text":"FIRST PASS"}]});
         assert_eq!(
-            assistant_text_after_admission(&[old.clone()], Some("m")),
+            assistant_text_after_admission(std::slice::from_ref(&old), Some("m")),
             None
         );
         let marker = json!({"role":"custom","customType":"agent_message","details":{"id":"m"}});

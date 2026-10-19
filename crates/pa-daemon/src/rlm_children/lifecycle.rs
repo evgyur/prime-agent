@@ -1444,7 +1444,7 @@ mod owner_cancel_tests {
         assert!(*sessions.inner.running.borrow());
         tokio::time::timeout(
             Duration::from_secs(1),
-            sessions.restore_owner_cancellations(&[fact.clone()]),
+            sessions.restore_owner_cancellations(std::slice::from_ref(&fact)),
         )
         .await
         .unwrap()
@@ -1463,7 +1463,7 @@ mod owner_cancel_tests {
             "unknown"
         );
         sessions
-            .restore_owner_cancellations(&[fact.clone()])
+            .restore_owner_cancellations(std::slice::from_ref(&fact))
             .await
             .unwrap();
         assert!(sessions
@@ -1474,7 +1474,7 @@ mod owner_cancel_tests {
             .consumed_managed_results
             .is_empty());
         sessions
-            .restore_owner_cancellations(&[fact.clone()])
+            .restore_owner_cancellations(std::slice::from_ref(&fact))
             .await
             .unwrap();
         {
@@ -1486,7 +1486,7 @@ mod owner_cancel_tests {
             row.settled_status = None;
         }
         sessions
-            .restore_owner_cancellations(&[fact.clone()])
+            .restore_owner_cancellations(std::slice::from_ref(&fact))
             .await
             .unwrap();
         assert!(record.lock().await.admission_blocked);
@@ -1551,7 +1551,7 @@ mod owner_cancel_tests {
             .accounting_epoch
             .load(std::sync::atomic::Ordering::SeqCst);
         sessions
-            .restore_owner_cancellations(&[exact_fact.clone()])
+            .restore_owner_cancellations(std::slice::from_ref(&exact_fact))
             .await
             .unwrap();
         assert!(
@@ -1566,7 +1566,7 @@ mod owner_cancel_tests {
             .accounting_epoch
             .load(std::sync::atomic::Ordering::SeqCst);
         sessions
-            .restore_owner_cancellations(&[exact_fact.clone()])
+            .restore_owner_cancellations(std::slice::from_ref(&exact_fact))
             .await
             .unwrap();
         assert_eq!(

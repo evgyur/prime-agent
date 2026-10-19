@@ -204,7 +204,7 @@ mod owner_bootstrap_tests {
     fn proof(sequence: u64, payload: &str) -> Value {
         let mut mac = Hmac::<Sha256>::new_from_slice(&[7; 32]).unwrap();
         mac.update(&bytes("g", "i", "w", sequence, payload));
-        json!({"version":1,"generation":"g","instance":"i","worker":"w","sequence":sequence,"payload":payload,"macHex":mac.finalize().into_bytes().iter().map(|b|format!("{b:02x}")).collect::<String>()})
+        json!({"version":1,"generation":"g","instance":"i","worker":"w","sequence":sequence,"payload":payload,"macHex":mac.finalize().into_bytes().iter().fold(String::new(), |mut output, byte| { use std::fmt::Write; write!(&mut output, "{byte:02x}").unwrap(); output })})
     }
     #[test]
     fn owner_bootstrap_mac_targets_generation_instance_sequence_and_exact_payload() {

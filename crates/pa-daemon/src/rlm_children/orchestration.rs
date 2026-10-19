@@ -1445,7 +1445,7 @@ mod tests {
         };
         let old = json!({"childId":"old","admissionGeneration":"g","incarnation":null,"executionKind":"idle","obligation":false,"ownerCancellation":fact});
         assert!(!assignment_matches(&assignment, &old));
-        assert!(gate.cancellation_settles(&assignment, &[old.clone()]));
+        assert!(gate.cancellation_settles(&assignment, std::slice::from_ref(&old)));
         let permit = json!({"childId":"new","admissionGeneration":"new-g","incarnation":"new-worker","expectedMessageId":"new-m"});
         let new = json!({"childId":"new","admissionGeneration":"new-g","incarnation":"new-worker","expectedMessageId":"new-m","executionKind":"executing","obligation":true});
         assert!(gate.start_accounting_complete(&[old.clone(), new.clone()], &permit));
@@ -1503,7 +1503,7 @@ mod tests {
         let before = serde_json::to_value(&*sessions.inner.gate.lock().unwrap()).unwrap();
         assert_eq!(
             sessions
-                .historical_owner_cancellation(&request, &[fact.clone()])
+                .historical_owner_cancellation(&request, std::slice::from_ref(&fact))
                 .await
                 .unwrap()["status"],
             "found"
@@ -1743,7 +1743,7 @@ mod tests {
             expected_message_id: Some("old-message".into()),
         };
         let found = gate
-            .historical_owner_cancellation(&request, "parent", "child", &[fact.clone()])
+            .historical_owner_cancellation(&request, "parent", "child", std::slice::from_ref(&fact))
             .unwrap();
         assert_eq!(found["ownerCancellation"], json!(fact));
         assert_eq!(found["status"], "found");
@@ -1770,7 +1770,7 @@ mod tests {
                 &request,
                 "parent",
                 "child",
-                &[missing_message.clone()]
+                std::slice::from_ref(&missing_message)
             )
             .unwrap()["messageIdentityRecorded"],
             false
@@ -1785,7 +1785,7 @@ mod tests {
             .is_err());
         for (parent, child) in [("foreign", "child"), ("parent", "foreign")] {
             assert!(gate
-                .historical_owner_cancellation(&request, parent, child, &[fact.clone()])
+                .historical_owner_cancellation(&request, parent, child, std::slice::from_ref(&fact))
                 .is_err());
         }
         let mut bad = ReconcileOwnerCancellation {
@@ -1794,14 +1794,14 @@ mod tests {
             assignment: request.assignment.clone(),
         };
         assert!(gate
-            .historical_owner_cancellation(&bad, "parent", "child", &[fact.clone()])
+            .historical_owner_cancellation(&bad, "parent", "child", std::slice::from_ref(&fact))
             .is_err());
         bad.expected_revision = 4;
         bad.task.policy_revision += 1;
         assert!(gate
-            .historical_owner_cancellation(&bad, "parent", "child", &[fact.clone()])
+            .historical_owner_cancellation(&bad, "parent", "child", std::slice::from_ref(&fact))
             .is_err());
-        bad.task = request.task.clone();
+        bad.task = request.task;
         bad.assignment.artifact_ref = "different".into();
         assert!(gate
             .historical_owner_cancellation(&bad, "parent", "child", &[fact])
@@ -2185,7 +2185,7 @@ mod tests {
         let (started_tx, started_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel();
         tokio::spawn(async move {
-            let (stream, _) = {
+            let (stream, ()) = {
                 let stream = listener.accept().await.unwrap();
                 (stream, ())
             };
