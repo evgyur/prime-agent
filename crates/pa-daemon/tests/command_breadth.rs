@@ -525,8 +525,22 @@ const WIRE_FIXTURES: &[(&str, &str)] = &[
 /// The accept list is the TS list, in TS order, then the Rust-native supervisor/worker frames.
 #[test]
 fn known_command_types_match_the_ts_list() {
-    assert!(KNOWN_COMMAND_TYPES.len() > TS_DAEMON_COMMAND_TYPES.len());
-    let (head, tail) = KNOWN_COMMAND_TYPES.split_at(TS_DAEMON_COMMAND_TYPES.len());
+    // Installed private commands are inserted beside their related TS commands;
+    // exclude exactly those additions before checking the untouched TS ordering.
+    let parity_commands: Vec<_> = KNOWN_COMMAND_TYPES
+        .iter()
+        .copied()
+        .filter(|command| {
+            !matches!(
+                *command,
+                "get_owned_worker_cleanup"
+                    | "configure_orchestration_gate"
+                    | "get_orchestration_gate"
+            )
+        })
+        .collect();
+    assert!(parity_commands.len() > TS_DAEMON_COMMAND_TYPES.len());
+    let (head, tail) = parity_commands.split_at(TS_DAEMON_COMMAND_TYPES.len());
     assert_eq!(
         head, TS_DAEMON_COMMAND_TYPES,
         "accept list must start with the TS list"

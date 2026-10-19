@@ -58,6 +58,8 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
             "goal_objective_edit",
             "goal_lifecycle_control",
             "authoritative_child_roster",
+            "orchestration_gate_v1",
+            "roadmap_next_work_v1",
             "owned_session_recovery_context",
             "rlm_quiescence_barrier",
             "session_input_pause",

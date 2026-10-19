@@ -829,11 +829,14 @@ async fn a_cancelled_child_keeps_its_display_running_through_the_watcher_settle(
 fn assert_failure_row(follow_up: &Value, child_id: &str, error: &str) {
     let custom = &follow_up["customMessage"];
     let timestamp = custom["timestamp"].as_u64().expect("failure row timestamp");
+    let delivery_id = custom["details"]["terminalDeliveryId"]
+        .as_str()
+        .expect("failure row has a durable terminal delivery identity");
+    uuid::Uuid::parse_str(delivery_id).expect("terminal delivery identity is a UUID");
     let expected = create_rlm_child_failure_message(child_id, "f20-worker", error, timestamp);
-    assert_eq!(
-        *custom,
-        serde_json::to_value(AgentMessage::Custom(expected)).unwrap()
-    );
+    let mut expected = serde_json::to_value(AgentMessage::Custom(expected)).unwrap();
+    expected["details"]["terminalDeliveryId"] = json!(delivery_id);
+    assert_eq!(*custom, expected);
 }
 
 /// A child whose task prompt cannot be routed settles `error`, delivers
