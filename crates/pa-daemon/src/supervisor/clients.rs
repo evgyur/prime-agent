@@ -19,6 +19,16 @@ use super::{
 /// keeps running after its owner's last connection closes.
 pub(super) const OWNED_WORKER_DISCONNECT_GRACE: Duration = Duration::from_secs(30);
 
+/// A pre-admitted headless observer may remain parked for the entire goal. It
+/// does not own new external work: its only side effect retries an already-owed
+/// native continuation, under the same authority as other native
+/// autonomous activity (not a new external request). Keep its admission mutating/fenced, but do not make
+/// update prepare wait for the goal itself to finish.
+fn counts_toward_update_mutation_drain(command_type: &str) -> bool {
+    command_type != "wait_for_headless_completion"
+        && pa_types::daemon::is_daemon_mutating_command(command_type)
+}
+
 struct OwnedCleanupRunning {
     supervisor: Arc<Supervisor>,
     resident: Arc<ResidentWorker>,
@@ -638,9 +648,9 @@ impl Supervisor {
                 }
             }
         }
-        // Mutating commands count against the prepare transaction's drain.
-        let mutating =
-            !is_update_driver && pa_types::daemon::is_daemon_mutating_command(&type_name);
+        // Admission above remains unchanged, including new headless observers.
+        // Only a headless observer admitted before the fence is exempt from drain.
+        let mutating = !is_update_driver && counts_toward_update_mutation_drain(&type_name);
         if mutating {
             self.mutation_drain.begin();
         }
@@ -1235,6 +1245,30 @@ mod tests {
     #[cfg(unix)]
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn headless_observation_drain_exemption_never_weakens_update_admission() {
+        use crate::update_prepare::PrepareState;
+        let command = "wait_for_headless_completion";
+        assert!(pa_types::daemon::is_daemon_mutating_command(command));
+        assert!(!counts_toward_update_mutation_drain(command));
+        for phase in [
+            PrepareState::Draining,
+            PrepareState::Fenced,
+            PrepareState::Snapshotted,
+            PrepareState::Prepared,
+            PrepareState::Stopping,
+        ] {
+            assert!(update_gate_refuses(phase, command));
+            assert!(update_gate_refuses(phase, "prompt_and_wait"));
+        }
+        // A turn-owning long wait still drains, and existing read-only waits
+        // keep their classification. This is not a general wait exemption.
+        assert!(counts_toward_update_mutation_drain("prompt_and_wait"));
+        assert!(counts_toward_update_mutation_drain("prompt"));
+        assert!(!counts_toward_update_mutation_drain("wait_for_idle"));
+        assert!(!update_gate_refuses(PrepareState::Draining, "abort"));
+    }
 
     /// A response-write failure can retire the serve loop while an accepted
     /// shutdown task has not claimed its owner yet. Keep the receiver alive
