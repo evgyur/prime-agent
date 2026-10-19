@@ -592,6 +592,27 @@ impl Worker {
         if opened_existing_session {
             self.reseed_rlm_children().await;
         }
+        // Apply the supervisor-authenticated recovery facts before any kernel or
+        // goal boundary can consult the newly restored child obligations.
+        let owner_cancel_facts = self
+            .recovery
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|journal| journal.owner_cancel_facts().to_vec())
+            .unwrap_or_default();
+        if let Some(children) = self
+            .agent_engine
+            .as_ref()
+            .and_then(|engine| engine.children.as_ref())
+        {
+            if let Err(error) = children
+                .restore_owner_cancellations(&owner_cancel_facts)
+                .await
+            {
+                return response_failure(None, "create", &error.to_string(), None);
+            }
+        }
         // The built-in Herdr connector binds here, per session: the pane
         // identity comes from the create payload's client env (the client
         // that owns the pane sent it), never from this process's ambient

@@ -106,6 +106,7 @@ pub(crate) fn fake_supervisor(
 }
 
 mod abort_boundary_tests;
+mod cancel_restore_tests;
 mod connection_state_tests;
 mod goal_tests;
 mod kill_broadcast_tests;
