@@ -235,6 +235,7 @@ fn update_unknown_source_is_an_error_with_suggestion() {
 fn git_clone_update_remove_flow() {
     let _guard = super::test_support::ENV_MUTEX.lock().unwrap();
     let sandbox = Sandbox::new("git-flow");
+    let npm_command = vec![sandbox.npm_shim.display().to_string()];
     let (bare, work) = make_bare_repo(&sandbox.root);
 
     let source = GitSource {
@@ -249,7 +250,7 @@ fn git_clone_update_remove_flow() {
         SourceScope::User,
         &sandbox.cwd,
         &sandbox.agent_dir,
-        None,
+        Some(&npm_command),
     )
     .unwrap();
 
@@ -272,7 +273,7 @@ fn git_clone_update_remove_flow() {
         SourceScope::User,
         &sandbox.cwd,
         &sandbox.agent_dir,
-        None,
+        Some(&npm_command),
     )
     .unwrap();
     assert!(installed.join("skills.md").exists());
@@ -282,7 +283,7 @@ fn git_clone_update_remove_flow() {
         SourceScope::User,
         &sandbox.cwd,
         &sandbox.agent_dir,
-        None,
+        Some(&npm_command),
     )
     .unwrap();
 
@@ -296,6 +297,7 @@ fn git_clone_update_remove_flow() {
 fn git_ref_checkout_installs_the_pinned_revision() {
     let _guard = super::test_support::ENV_MUTEX.lock().unwrap();
     let sandbox = Sandbox::new("git-ref");
+    let npm_command = vec![sandbox.npm_shim.display().to_string()];
     let dir_root = sandbox.root.clone();
     let (bare, work) = make_bare_repo(&dir_root);
     run_git(&work, &["tag", "v1"]);
@@ -317,7 +319,7 @@ fn git_ref_checkout_installs_the_pinned_revision() {
         SourceScope::User,
         &sandbox.cwd,
         &sandbox.agent_dir,
-        None,
+        Some(&npm_command),
     )
     .unwrap();
     let installed = sandbox
