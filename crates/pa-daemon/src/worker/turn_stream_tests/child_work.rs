@@ -312,3 +312,50 @@ fn start_denial_diagnostic_preserves_safe_fences_not_untrusted_payload() {
         !TurnRunner::start_denial_diagnostic(Some("token=SECRET rawpayload")).contains("SECRET")
     );
 }
+
+#[tokio::test]
+async fn ordinary_child_admission_records_durable_start_without_managed_gate() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("worker.jsonl");
+    let engine = Arc::new(ProviderProbe(std::sync::atomic::AtomicUsize::new(0)));
+    let mut runner = burst_runner(engine.clone());
+    runner.recovery = Arc::new(Mutex::new(Some(
+        crate::journal::WorkerRecoveryJournal::open(&path).unwrap(),
+    )));
+    let mut row = managed_kickoff(json!({}));
+    row.as_object_mut().unwrap().remove("nativeWorkPermit");
+    row["rlmAdmission"] = json!({"messageId":"kickoff","generation":"message-admission-v1:g"});
+    runner.core.lock().unwrap().follow_up.push_back(QueuedItem {
+        message: "child task".into(),
+        priority: QueuePriority::Background,
+        preview: None,
+        custom_message: Some(row),
+        agent_message: Some("child task".into()),
+        queue_key: None,
+        admission_id: None,
+        images: Vec::new(),
+        done: None,
+        queue_visible: true,
+        policy: TurnPolicy::Injected,
+        forced_batch: false,
+    });
+    let idle = runner.idle_notify.clone();
+    let settled = idle.notified();
+    tokio::pin!(settled);
+    settled.as_mut().enable();
+    let running = tokio::spawn(runner.run());
+    tokio::time::timeout(std::time::Duration::from_secs(5), settled)
+        .await
+        .unwrap();
+    let facts = crate::journal::WorkerRecoveryJournal::read_message_facts(&path).unwrap();
+    let fact = facts
+        .get(&("burst-session".into(), "kickoff".into()))
+        .unwrap();
+    assert_eq!(fact.phase, "started");
+    assert_eq!(
+        fact.admission_generation.as_deref(),
+        Some("message-admission-v1:g")
+    );
+    assert_eq!(engine.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    running.abort();
+}

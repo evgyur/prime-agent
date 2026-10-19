@@ -248,3 +248,36 @@ async fn background_bash_strong_idle_holds_without_goal_but_turn_idle_returns() 
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn retask_receiver_admits_only_parent_and_keeps_preassigned_identity_in_queue() {
+    let worker = created_dispatch_worker().await;
+    {
+        let mut core = worker.core.lock().unwrap();
+        core.parent_session_id = Some("durable-parent".into());
+        core.busy = true;
+    }
+    let mut command = json!({"message":"bounded follow-up","sender":{"sessionId":"other","rlmAdmission":{
+        "messageId":"agentmsg_stable","generation":"message-admission-v1:g"}}});
+    assert!(
+        !worker
+            .dispatch("worker_deliver_message", &command)
+            .await
+            .success
+    );
+    assert!(worker.core.lock().unwrap().steering.is_empty());
+    command["sender"]["sessionId"] = json!("durable-parent");
+    let receipt = worker.dispatch("worker_deliver_message", &command).await;
+    assert!(receipt.success, "{receipt:?}");
+    assert_eq!(receipt.data.unwrap()["id"], "agentmsg_stable");
+    let core = worker.core.lock().unwrap();
+    let row = core
+        .steering
+        .front()
+        .unwrap()
+        .custom_message
+        .as_ref()
+        .unwrap();
+    assert_eq!(row["details"]["id"], "agentmsg_stable");
+    assert_eq!(row["rlmAdmission"]["generation"], "message-admission-v1:g");
+}

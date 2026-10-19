@@ -33,6 +33,7 @@ impl Supervisor {
             message,
             from_active_session_id,
             delivery_mode,
+            rest,
             ..
         } = command
         else {
@@ -82,7 +83,7 @@ impl Supervisor {
                     WakeOutcome::Unknown => {
                         return fail(format!(
                             "Unknown active session: {target_active_session_id}"
-                        ))
+                        ));
                     }
                     WakeOutcome::Failed(error) => return fail(error),
                 }
@@ -94,7 +95,7 @@ impl Supervisor {
         {
             return fail("Agent messaging cannot target the sending session".to_string());
         }
-        let sender = match &source {
+        let mut sender = match &source {
             Some(source) => {
                 // The wake already read the summary for its scope; every
                 // other path reads it here.
@@ -111,6 +112,11 @@ impl Supervisor {
             // the client id (`createAgentSessionMessageSender`).
             None => json!({ "clientId": client_id }),
         };
+        if source.is_some() {
+            if let Some(admission) = rest.get("rlmAdmission").filter(|value| !value.is_null()) {
+                sender["rlmAdmission"] = admission.clone();
+            }
+        }
         let delivery = DaemonWorkerCommand::WorkerDeliverMessage {
             id: None,
             target_active_session_id: target.worker_id.clone(),
@@ -141,7 +147,15 @@ impl Supervisor {
                     .error
                     .unwrap_or_else(|| "delivery failed".to_string()),
             ),
-            Err(error) => fail(format!("{error:#}")),
+            Err(error) => response_failure(
+                Some(command_id),
+                "send_message",
+                &format!("{error:#}"),
+                Some(pa_types::daemon::DaemonErrorInfo::CommandResultUncertain {
+                    client_id: client_id.to_string(),
+                    command_id: command_id.to_string(),
+                }),
+            ),
         }
     }
 
@@ -231,7 +245,7 @@ impl Supervisor {
                 return match self.wake_ledger_child(selector).await {
                     Some(outcome) => outcome,
                     None => WakeOutcome::Unknown,
-                }
+                };
             }
             Err(error) => return WakeOutcome::Failed(error.to_string()),
         };

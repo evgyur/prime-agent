@@ -157,6 +157,100 @@ impl super::SupervisorChildSessions {
     }
 }
 
+/// A durable worker start proves this exact admission was consumed, never that it
+/// finished. Normal busy/answer/notice settlement still runs afterwards. Legacy
+/// ambiguous sends without a stable message identity remain unresolved.
+fn admission_started_for(row: &ChildRecord, state: &Value) -> bool {
+    started_admission_identity_matches(
+        row.admission_generation.as_deref(),
+        row.expected_message_id.as_deref(),
+        row.session_id.as_deref(),
+        &row.active_session_id,
+        state,
+    )
+}
+
+fn started_admission_identity_matches(
+    generation: Option<&str>,
+    message: Option<&str>,
+    session: Option<&str>,
+    active: &str,
+    state: &Value,
+) -> bool {
+    let (Some(generation), Some(message), Some(session)) = (
+        generation.filter(|s| s.starts_with("message-admission-v1:")),
+        message.filter(|s| !s.is_empty()),
+        session.filter(|s| !s.is_empty()),
+    ) else {
+        return false;
+    };
+    let Some(incarnation) = state["workerInstanceId"].as_str().filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    state["activeSessionId"] == active
+        && state["sessionId"] == session
+        && state["messageLifecycleFacts"]
+            .as_array()
+            .is_some_and(|facts| {
+                facts.iter().any(|fact| {
+                    fact["phase"] == "started"
+                        && fact["messageId"] == message
+                        && fact["admissionGeneration"] == generation
+                        && fact["incarnation"] == incarnation
+                        && fact["activeSessionId"] == active
+                        && fact["sessionId"] == session
+                })
+            })
+}
+
+#[cfg(test)]
+mod admission_identity_tests {
+    use super::*;
+    fn state() -> Value {
+        json!({"activeSessionId":"a","sessionId":"s","workerInstanceId":"i",
+        "messageLifecycleFacts":[{"phase":"started","messageId":"m","admissionGeneration":"message-admission-v1:g",
+        "incarnation":"i","activeSessionId":"a","sessionId":"s"}]})
+    }
+    fn matches(state: &Value, generation: &str) -> bool {
+        started_admission_identity_matches(Some(generation), Some("m"), Some("s"), "a", state)
+    }
+    #[test]
+    fn exact_new_admission_fact_can_reconcile_lost_ack() {
+        assert!(matches(&state(), "message-admission-v1:g"));
+    }
+    #[test]
+    fn later_legacy_message_never_proves_earlier_unknown() {
+        let mut s = state();
+        s["messageLifecycleFacts"][0]["admissionGeneration"] = json!("legacy-later-generation");
+        assert!(!matches(&s, "legacy-later-generation"));
+    }
+    #[test]
+    fn stale_generation_incarnation_session_and_not_started_never_unlock() {
+        for (field, value) in [
+            ("admissionGeneration", "message-admission-v1:old"),
+            ("messageId", "other"),
+            ("incarnation", "old"),
+            ("sessionId", "other"),
+            ("activeSessionId", "other"),
+            ("phase", "queued"),
+        ] {
+            let mut s = state();
+            s["messageLifecycleFacts"][0][field] = json!(value);
+            assert!(!matches(&s, "message-admission-v1:g"), "{field}");
+        }
+        let mut restarted = state();
+        restarted["workerInstanceId"] = json!("new");
+        assert!(!matches(&restarted, "message-admission-v1:g"));
+    }
+    #[test]
+    fn idle_or_answer_without_correlated_fact_is_not_evidence() {
+        assert!(!matches(
+            &json!({"isStreaming":false,"text":"PASS"}),
+            "message-admission-v1:g"
+        ));
+    }
+}
+
 impl SupervisorChildSessionsInner {
     async fn apply_owner_cancel(
         &self,
@@ -587,7 +681,7 @@ impl SupervisorChildSessionsInner {
         };
         {
             let record = record.lock().await;
-            if !record.prompt_admitted || record.admission_blocked {
+            if !record.prompt_admitted {
                 return;
             }
         }
@@ -604,6 +698,37 @@ impl SupervisorChildSessionsInner {
             .await
             .ok();
         if let Some(state) = state {
+            {
+                let mut row = record.lock().await;
+                if row.admission_blocked {
+                    if !admission_started_for(&row, &state) {
+                        return;
+                    }
+                    let Some(mut display) =
+                        crate::rlm_ledger::read_rlm_subagent_display(Path::new(&row.session_dir))
+                    else {
+                        return;
+                    };
+                    if display.child_id != row.rlm_child_id
+                        || display.status == "deleted"
+                        || Some(display.session_file.as_str()) != row.session_file.as_deref()
+                        || display.admission_generation != row.admission_generation
+                        || display.expected_message_id != row.expected_message_id
+                    {
+                        return;
+                    }
+                    display.admission_unresolved = None;
+                    if !matches!(
+                        crate::rlm_ledger::write_rlm_subagent_display(&display),
+                        Ok(true)
+                    ) {
+                        return;
+                    }
+                    row.admission_blocked = false;
+                    self.accounting_epoch
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
             let row = record.lock().await;
             let mut gate = self.gate.lock().expect("gate lock");
             let mut next = gate.clone();
@@ -689,8 +814,11 @@ impl SupervisorChildSessionsInner {
                 return;
             }
             if record.lock().await.admission_blocked {
-                tokio::time::sleep(Duration::from_millis(WATCH_POLL_INTERVAL_MS)).await;
-                continue;
+                self.refresh_record(record).await;
+                if record.lock().await.admission_blocked {
+                    tokio::time::sleep(Duration::from_millis(WATCH_POLL_INTERVAL_MS)).await;
+                    continue;
+                }
             }
             // Slice-top usage flush: rows of turns that completed since the
             // last slice land here (crash loss is bounded to one slice).

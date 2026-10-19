@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use pa_core::kernel::rlm_runtime::create_default_rlm_subagent_session_name;
 use pa_core::session_engine::rlm_host::{
     RlmChildResult, RlmCreateSessionHandle, RlmCreateSessionRequest, RlmDeleteSubagentResult,
@@ -19,12 +19,12 @@ use pa_core::session_engine::rlm_host::{
     RlmSubagentHost,
 };
 use pa_core::session_engine::rlm_notices::{
-    create_rlm_child_failure_message, create_rlm_child_terminal_notice, RlmChildTerminalNotice,
+    RlmChildTerminalNotice, create_rlm_child_failure_message, create_rlm_child_terminal_notice,
 };
 use pa_core::session_engine::rlm_usage::{RlmChildUsageReport, RlmChildUsageSink};
 use pa_types::daemon::{DaemonCommand, DaemonSessionLifecycle, PromptInput};
 use pa_types::session::CustomMessage;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 use pa_core::session_engine::rlm_host::{
@@ -32,8 +32,8 @@ use pa_core::session_engine::rlm_host::{
 };
 
 use crate::rlm_child_model::{
-    assert_thinking_supported, cap_text, compact_rlm_text, resolve_child_model, rlm_child_label,
-    ANSWER_TEXT_MAX_CHARS,
+    ANSWER_TEXT_MAX_CHARS, assert_thinking_supported, cap_text, compact_rlm_text,
+    resolve_child_model, rlm_child_label,
 };
 use crate::supervisor_link::SupervisorLink;
 use crate::util::now_ms;
@@ -236,6 +236,10 @@ struct ChildTaskSnapshot {
 }
 
 impl ChildAdmission {
+    pub(crate) async fn identity(&self) -> Value {
+        let row = self.record.lock().await;
+        json!({"messageId": row.expected_message_id, "generation": row.admission_generation})
+    }
     pub(crate) async fn rejected(self) -> Result<()> {
         if !crate::rlm_ledger::write_rlm_subagent_display(&self.prior_display)? {
             bail!("Child admission display was deleted");
@@ -267,18 +271,35 @@ impl ChildAdmission {
 
     pub(crate) async fn accepted(self, message_id: &str) {
         {
-            let mut row = self.record.lock().await;
-            row.expected_message_id = Some(message_id.to_string());
-            if let Some(mut display) =
+            let row = self.record.lock().await;
+            if row.expected_message_id.as_deref() != Some(message_id) {
+                eprintln!(
+                    "pa-daemon: child admission receipt identity mismatch; retained unresolved"
+                );
+                return;
+            }
+            let Some(mut display) =
                 crate::rlm_ledger::read_rlm_subagent_display(Path::new(&row.session_dir))
+            else {
+                return;
+            };
+            if display.child_id != row.rlm_child_id
+                || display.status == "deleted"
+                || display.admission_generation != row.admission_generation
+                || display.expected_message_id != row.expected_message_id
+                || Some(display.session_file.as_str()) != row.session_file.as_deref()
             {
-                display.admission_generation = row.admission_generation.clone();
-                display.expected_message_id = row.expected_message_id.clone();
-                display.admission_unresolved = self.prior.blocked.then_some(true);
-                if let Err(error) = crate::rlm_ledger::write_rlm_subagent_display(&display) {
-                    eprintln!("pa-daemon: admission generation persistence failed: {error:#}");
-                    return;
-                }
+                return;
+            }
+            display.admission_unresolved = self.prior.blocked.then_some(true);
+            if !matches!(
+                crate::rlm_ledger::write_rlm_subagent_display(&display),
+                Ok(true)
+            ) {
+                eprintln!(
+                    "pa-daemon: admission generation persistence failed; retained unresolved"
+                );
+                return;
             }
         }
         // An earlier unresolved delivery is not closed by a later receipt.
@@ -772,6 +793,10 @@ impl SupervisorChildSessions {
             if row.closed_by_parent {
                 bail!("Child admission is closed");
             }
+            anyhow::ensure!(
+                !row.admission_blocked,
+                "Previous child message admission is unresolved; observe/reconcile it before another delivery"
+            );
             let display = crate::rlm_ledger::read_rlm_subagent_display(Path::new(&row.session_dir))
                 .filter(|display| {
                     display.child_id == row.rlm_child_id
@@ -782,8 +807,10 @@ impl SupervisorChildSessions {
                 .ok_or_else(|| anyhow!("Child admission display identity unavailable"))?;
             let mut pending = display.clone();
             pending.admission_unresolved = Some(true);
-            pending.admission_generation = Some(uuid::Uuid::new_v4().to_string());
-            pending.expected_message_id = None;
+            pending.admission_generation =
+                Some(format!("message-admission-v1:{}", uuid::Uuid::new_v4()));
+            pending.expected_message_id =
+                Some(pa_core::session_engine::agent_messaging::create_agent_session_message_id());
             if !crate::rlm_ledger::write_rlm_subagent_display(&pending)? {
                 bail!("Child admission display was deleted");
             }
@@ -805,9 +832,11 @@ impl SupervisorChildSessions {
                 expected: row.expected_message_id.take(),
             };
             row.owner_cancelled = false;
-            row.admission_generation =
-                crate::rlm_ledger::read_rlm_subagent_display(Path::new(&row.session_dir))
-                    .and_then(|d| d.admission_generation);
+            let pending = crate::rlm_ledger::read_rlm_subagent_display(Path::new(&row.session_dir));
+            row.admission_generation = pending
+                .as_ref()
+                .and_then(|d| d.admission_generation.clone());
+            row.expected_message_id = pending.and_then(|d| d.expected_message_id);
             row.admission_blocked = true;
             row.settled_status = None;
             row.settled = false;
@@ -820,6 +849,13 @@ impl SupervisorChildSessions {
             .accounting_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.refresh_running().await;
+        // Observe even when delivery loses its acknowledgement or its future is cancelled.
+        // The admission lock prevents observation until the send claim is released.
+        let inner = Arc::clone(&self.inner);
+        let watched = Arc::clone(&record);
+        tokio::spawn(async move {
+            inner.watch_child_settle(&watched).await;
+        });
         Ok(Some(ChildAdmission {
             sessions: self.clone(),
             record,

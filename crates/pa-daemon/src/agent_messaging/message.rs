@@ -213,9 +213,19 @@ impl AgentMessageController for LinkAgentMessageController {
         } else {
             None
         };
-        let outcome = match self.deliver_direct(&input).await {
+        let admission_identity = match &admission {
+            Some(admission) => Some(admission.identity().await),
+            None => None,
+        };
+        let outcome = match self
+            .deliver_direct(&input, admission_identity.as_ref())
+            .await
+        {
             DirectDelivery::Delivered(receipt) => Ok(receipt),
-            DirectDelivery::Unavailable => self.deliver_via_supervisor(input.clone()).await,
+            DirectDelivery::Unavailable => {
+                self.deliver_via_supervisor(input.clone(), admission_identity.as_ref())
+                    .await
+            }
             DirectDelivery::Rejected(error) => Err(DeliveryFailure::Rejected(error)),
             DirectDelivery::Unknown(error) => Err(DeliveryFailure::Unknown(error)),
         };
@@ -259,7 +269,11 @@ enum DeliveryFailure {
 impl LinkAgentMessageController {
     /// Try the direct worker-to-worker path: `Unavailable` only when the
     /// delivery command never reached the target; once sent, the outcome is final.
-    async fn deliver_direct(&self, input: &AgentMessageSendInput) -> DirectDelivery {
+    async fn deliver_direct(
+        &self,
+        input: &AgentMessageSendInput,
+        admission: Option<&Value>,
+    ) -> DirectDelivery {
         let ticket = match self
             .link
             .request_success(
@@ -282,10 +296,14 @@ impl LinkAgentMessageController {
             // unavailable) is the fallback trigger, not an error.
             Err(_) => return DirectDelivery::Unavailable,
         };
+        let mut sender = self.sender_block();
+        if let Some(admission) = admission {
+            sender["rlmAdmission"] = admission.clone();
+        }
         match crate::peer_client::deliver_message_over_peer_transport(
             &ticket,
             &input.message,
-            &self.sender_block(),
+            &sender,
             None,
         )
         .await
@@ -321,6 +339,7 @@ impl LinkAgentMessageController {
     async fn deliver_via_supervisor(
         &self,
         input: AgentMessageSendInput,
+        admission: Option<&Value>,
     ) -> Result<AgentMessageReceipt, DeliveryFailure> {
         let response = self
             .link
@@ -331,17 +350,25 @@ impl LinkAgentMessageController {
                     "message": input.message,
                     "fromActiveSessionId": self.active_session_id,
                     "agentOrigin": true,
+                    "rlmAdmission": admission,
                 }),
                 std::time::Duration::from_secs(30),
             )
             .await
             .map_err(|error| DeliveryFailure::Unknown(error.to_string()))?;
         if !response.success {
-            return Err(DeliveryFailure::Rejected(
-                response
-                    .error
-                    .unwrap_or_else(|| "Agent message was not accepted".to_string()),
-            ));
+            let unknown = matches!(
+                response.error_info,
+                Some(pa_types::daemon::DaemonErrorInfo::CommandResultUncertain { .. })
+            );
+            let error = response
+                .error
+                .unwrap_or_else(|| "Agent message was not accepted".to_string());
+            return Err(if unknown {
+                DeliveryFailure::Unknown(error)
+            } else {
+                DeliveryFailure::Rejected(error)
+            });
         }
         response
             .data

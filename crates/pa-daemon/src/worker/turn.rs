@@ -190,8 +190,11 @@ impl TurnRunner {
                             None
                         }
                         Err(_) => {
-                            eprintln!("pa-daemon: beginWorkStart transport_unknown child={} message={}; no retry",
-                                permit["childId"].as_str().unwrap_or("missing"),permit["expectedMessageId"].as_str().unwrap_or("missing"));
+                            eprintln!(
+                                "pa-daemon: beginWorkStart transport_unknown child={} message={}; no retry",
+                                permit["childId"].as_str().unwrap_or("missing"),
+                                permit["expectedMessageId"].as_str().unwrap_or("missing")
+                            );
                             None
                         }
                     };
@@ -503,13 +506,19 @@ impl TurnRunner {
             .filter_map(|item| {
                 item.custom_message
                     .as_ref()
-                    .filter(|row| row["nativeWorkPermit"]["managedResultTracking"] == true)
+                    .filter(|row| {
+                        row["nativeWorkPermit"]["managedResultTracking"] == true
+                            || row["rlmAdmission"]["generation"].as_str().is_some()
+                    })
                     .and_then(|row| {
                         row["details"]["id"].as_str().map(|id| {
                             (
                                 id.to_string(),
-                                row["nativeWorkPermit"]["admissionGeneration"]
+                                row["rlmAdmission"]["generation"]
                                     .as_str()
+                                    .or_else(|| {
+                                        row["nativeWorkPermit"]["admissionGeneration"].as_str()
+                                    })
                                     .map(str::to_string),
                             )
                         })

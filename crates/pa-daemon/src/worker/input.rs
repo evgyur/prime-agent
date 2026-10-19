@@ -11,6 +11,37 @@ use serde_json::Value;
 
 use crate::protocol::{response_failure, DaemonResponse};
 
+fn parent_admission_identity_valid(parent_session: Option<&str>, sender: &Value) -> bool {
+    let Some(parent) = parent_session.filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    sender["sessionId"].as_str() == Some(parent)
+        && sender["rlmAdmission"]["generation"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("message-admission-v1:"))
+        && sender["rlmAdmission"]["messageId"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("agentmsg_") && s.len() <= 128)
+}
+
+#[cfg(test)]
+mod parent_admission_tests {
+    use super::*;
+    #[test]
+    fn only_exact_durable_parent_can_supply_an_admission() {
+        let sender = json!({"sessionId":"parent","rlmAdmission":{"generation":"message-admission-v1:g","messageId":"agentmsg_m"}});
+        assert!(parent_admission_identity_valid(Some("parent"), &sender));
+        assert!(!parent_admission_identity_valid(None, &sender));
+        assert!(!parent_admission_identity_valid(
+            Some("unrelated-parent"),
+            &sender
+        ));
+        let mut old = sender;
+        old["rlmAdmission"]["generation"] = json!("legacy");
+        assert!(!parent_admission_identity_valid(Some("parent"), &old));
+    }
+}
+
 impl Worker {
     pub(crate) async fn handle_prompt(&self, payload: &Value, wait: bool) -> DaemonResponse {
         if let Err(response) = self.require_created("prompt") {
@@ -329,6 +360,17 @@ impl Worker {
             }
         }
         let sender = payload.get("sender").cloned().unwrap_or(Value::Null);
+        if sender.get("rlmAdmission").is_some() {
+            let core = self.core.lock().unwrap();
+            if !parent_admission_identity_valid(core.parent_session_id.as_deref(), &sender) {
+                return response_failure(
+                    None,
+                    "worker_deliver_message",
+                    "Invalid parent child-admission identity",
+                    None,
+                );
+            }
+        }
         // A delivery from one of this session's RLM children counts as the
         // child's reply: the settle watcher withholds the no-reply notice.
         if let Some(child) = sender
@@ -379,7 +421,13 @@ impl Worker {
                 drop(core);
                 return response_failure(None, "worker_deliver_message", &error.to_string(), None);
             }
-            let id = pa_core::session_engine::agent_messaging::create_agent_session_message_id();
+            let id = sender["rlmAdmission"]["messageId"]
+                .as_str()
+                .filter(|id| id.starts_with("agentmsg_") && id.len() <= 128)
+                .map(str::to_string)
+                .unwrap_or_else(
+                    pa_core::session_engine::agent_messaging::create_agent_session_message_id,
+                );
             let queued = core.busy;
             let summary = self.summary_locked(&core, inputs);
             // The receiving session's endpoint: the receipt's `target`
@@ -399,7 +447,7 @@ impl Worker {
             // The queued turn carries the `agent_message` row so the transcript renders
             // the collapsed card, while the row's `content` IS the rendered prompt —
             // the model context stays byte-identical to the plain-prompt delivery.
-            let custom_message =
+            let mut custom_message =
                 pa_core::session_engine::agent_messaging::create_agent_session_message_row(
                     &pa_core::session_engine::agent_messaging::AgentSessionMessageRowPayload {
                         id: &id,
@@ -411,6 +459,9 @@ impl Worker {
                         timestamp: crate::util::now_ms(),
                     },
                 );
+            if let Some(admission) = sender.get("rlmAdmission") {
+                custom_message["rlmAdmission"] = admission.clone();
+            }
             let item = QueuedItem {
                 priority: QueuePriority::Background,
                 // The labeled queue-strip row: "Agent message
