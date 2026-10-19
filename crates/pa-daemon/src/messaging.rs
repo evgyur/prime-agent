@@ -351,8 +351,14 @@ impl Supervisor {
                             |info| (info.cwd, info.rlm_depth),
                         );
                 Some(
-                    self.launch_ledger_child_wake(&session_file, cwd, &edge.child_id, depth)
-                        .await,
+                    self.launch_ledger_child_wake(
+                        &session_file,
+                        cwd,
+                        &edge.child_id,
+                        depth,
+                        &edge.parent,
+                    )
+                    .await,
                 )
             }
             _ => Some(WakeOutcome::Failed(format!(
@@ -369,11 +375,21 @@ impl Supervisor {
         cwd: String,
         child_id: &str,
         depth: u32,
+        parent_file: &str,
     ) -> WakeOutcome {
         // Reuse before spawning: a concurrent revival may already host the file.
         if let Some(resident) = self.registry.find_by_session_file(session_file).await {
             return WakeOutcome::Woken(resident);
         }
+        let runtime_metadata =
+            match child_wake_parent_metadata(parent_file, child_id, u64::from(depth)) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    return WakeOutcome::Failed(format!(
+                        "Passive child parent identity unavailable: {error:#}"
+                    ))
+                }
+            };
         let create = DaemonCommand::Create {
             id: None,
             session_path: Some(session_file.to_string()),
@@ -385,9 +401,9 @@ impl Supervisor {
             // into the DURABLE create command's rest, which the passivation
             // fence reads; without them the revived child's fence sees a
             // root and never re-passivates.
-            config: Some(json!({ "cwd": cwd, "rlmDepth": depth })),
+            config: Some(json!({ "cwd": cwd, "rlmDepth": depth, "parentSessionPath":parent_file })),
             telemetry_disabled: None,
-            runtime_metadata: Some(json!({ "kind": "subagent", "rlmChildId": child_id })),
+            runtime_metadata: Some(runtime_metadata),
             lifecycle: None,
             env: None,
             launch_env: None,
@@ -494,8 +510,48 @@ pub(crate) enum WakeOutcome {
     Failed(String),
 }
 
+/// Rebind a passive child's stable parent identity from its durable file,
+/// never a display name or an obsolete active-session handle.
+pub(crate) fn child_wake_parent_metadata(
+    parent_file: &str,
+    child_id: &str,
+    depth: u64,
+) -> anyhow::Result<Value> {
+    let parent =
+        crate::session_store::read_session_header_bounded(std::path::Path::new(parent_file))
+            .ok_or_else(|| anyhow::anyhow!("Parent session header unavailable"))?;
+    anyhow::ensure!(!parent.id.is_empty(), "Parent session has no durable ID");
+    Ok(
+        json!({"kind":"subagent","rlmChildId":child_id,"rlmDepth":depth,"parentSessionId":parent.id,"parentSessionFile":parent_file}),
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn passive_child_wake_uses_durable_parent_header_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut parent = crate::session_store::SessionFile::create("/fixture", None, 0);
+        parent.set_path(dir.path().join("parent.jsonl"));
+        parent.rewrite().unwrap();
+        let metadata =
+            super::child_wake_parent_metadata(parent.path.to_str().unwrap(), "child", 3).unwrap();
+        assert_eq!(metadata["parentSessionId"], parent.session_id());
+        assert_eq!(
+            metadata["parentSessionFile"],
+            parent.path.to_string_lossy().as_ref()
+        );
+        assert_eq!(metadata["kind"], "subagent");
+        assert_eq!(metadata["rlmChildId"], "child");
+        assert_eq!(metadata["rlmDepth"], 3);
+        assert!(super::child_wake_parent_metadata(
+            dir.path().join("missing").to_str().unwrap(),
+            "child",
+            3
+        )
+        .is_err());
+    }
+
     use super::*;
     use crate::registry::ResidentWorker;
     use crate::supervisor::SupervisorOptions;

@@ -1077,15 +1077,44 @@ impl Supervisor {
             .map_or_else(|| "/".to_string(), |info| info.cwd);
         // The identity rides `config.rlmDepth` + `runtime_metadata.rlmChildId` —
         // the keys launch_worker copies into the DURABLE create command's rest.
+        let parent_file = if depth > 0 && !child_id.is_empty() {
+            let Some(parent) = crate::session_store::read_session_header_bounded(
+                std::path::Path::new(&session_file),
+            )
+            .and_then(|header| header.parent_session) else {
+                return Some(crate::messaging::WakeOutcome::Failed(
+                    "Passive child has no durable parent file".into(),
+                ));
+            };
+            Some(parent)
+        } else {
+            None
+        };
+        let runtime_metadata = if let Some(parent) = &parent_file {
+            match crate::messaging::child_wake_parent_metadata(parent, &child_id, depth) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    return Some(crate::messaging::WakeOutcome::Failed(format!(
+                        "Passive child parent identity unavailable: {error:#}"
+                    )))
+                }
+            }
+        } else {
+            json!({"rlmChildId":child_id})
+        };
+        let mut wake_config = json!({"cwd":cwd,"rlmDepth":depth});
+        if let Some(parent) = &parent_file {
+            wake_config["parentSessionPath"] = json!(parent);
+        }
         let create = DaemonCommand::Create {
             id: None,
             session_path: Some(session_file.clone()),
             continue_recent: Some(false),
             no_session: None,
             name: None,
-            config: Some(json!({ "cwd": cwd, "rlmDepth": depth })),
+            config: Some(wake_config),
             telemetry_disabled: None,
-            runtime_metadata: Some(json!({ "rlmChildId": child_id })),
+            runtime_metadata: Some(runtime_metadata),
             lifecycle: None,
             env: None,
             launch_env: None,
