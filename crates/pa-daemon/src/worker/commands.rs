@@ -1,15 +1,56 @@
 //! The dispatch surface: command routing, the command handlers,
 //! and the abort family.
 use super::{
-    checkpoint_queue_recovery, clear_withdrawn_progress_note, enqueue_priority, json,
-    persist_custom_row, response_failure, response_success, KillCloseReason, Lane, QueueCheckpoint,
-    QueuePriority, QueuedItem, Result, SessionFile, TurnPolicy, TurnSettle, VecDeque, Worker,
-    PROMPT_ABORTED_BEFORE_DELIVERY, SIDE_QUESTION_SETTLE_TIMEOUT,
+    KillCloseReason, Lane, PROMPT_ABORTED_BEFORE_DELIVERY, QueueCheckpoint, QueuePriority,
+    QueuedItem, Result, SIDE_QUESTION_SETTLE_TIMEOUT, SessionFile, TurnPolicy, TurnSettle,
+    VecDeque, Worker, checkpoint_queue_recovery, clear_withdrawn_progress_note, enqueue_priority,
+    json, persist_custom_row, response_failure, response_success,
 };
 
 use serde_json::Value;
 
 use crate::protocol::DaemonResponse;
+
+/// Only the current branch's rows after the exact admitted message can answer it.
+/// Missing admission/new final returns none, never an earlier task's PASS.
+fn assistant_text_after_admission(messages: &[Value], scope: Option<&str>) -> Option<String> {
+    let start = match scope {
+        Some(id) => {
+            messages.iter().rposition(|row| {
+                row["customType"] == "agent_message" && row["details"]["id"] == id
+            })? + 1
+        }
+        None => 0,
+    };
+    messages[start..]
+        .iter()
+        .rev()
+        .find(|row| crate::types::message_role(row) == Some("assistant"))
+        .map(crate::types::message_text)
+}
+
+#[cfg(test)]
+mod scoped_answer_tests {
+    use super::*;
+    #[test]
+    fn earlier_answer_is_never_reused_for_missing_or_unanswered_admission() {
+        let old = json!({"role":"assistant","content":[{"type":"text","text":"FIRST PASS"}]});
+        assert_eq!(
+            assistant_text_after_admission(&[old.clone()], Some("m")),
+            None
+        );
+        let marker = json!({"role":"custom","customType":"agent_message","details":{"id":"m"}});
+        assert_eq!(
+            assistant_text_after_admission(&[old.clone(), marker.clone()], Some("m")),
+            None
+        );
+        let new = json!({"role":"assistant","content":[{"type":"text","text":"SECOND"}]});
+        assert_eq!(
+            assistant_text_after_admission(&[old, marker, new], Some("m")).as_deref(),
+            Some("SECOND")
+        );
+    }
+}
 
 impl Worker {
     pub(crate) async fn dispatch(&self, command_type: &str, payload: &Value) -> DaemonResponse {
@@ -307,7 +348,7 @@ impl Worker {
             "get_queue" => self.handle_get_queue(),
             "clear_queue" => self.handle_clear_queue(),
             "abort_and_clear_queue" => self.handle_abort_and_clear_queue(),
-            "get_last_assistant_text" => self.handle_get_last_assistant_text(),
+            "get_last_assistant_text" => self.handle_get_last_assistant_text(payload),
             "get_connection_state" => self.handle_get_connection_state(),
             "get_mcp_connections" => self.handle_get_mcp_connections().await,
             "set_mcp_static_token" => self.handle_set_mcp_static_token(payload).await,
@@ -672,11 +713,12 @@ impl Worker {
                             .as_ref()
                             .is_some_and(|action| action.phase == "running")
                 );
-                value["runningMessageIds"] = json!(core
-                    .running_admission_ids
-                    .iter()
-                    .filter_map(|id| id.strip_prefix("message:"))
-                    .collect::<Vec<_>>());
+                value["runningMessageIds"] = json!(
+                    core.running_admission_ids
+                        .iter()
+                        .filter_map(|id| id.strip_prefix("message:"))
+                        .collect::<Vec<_>>()
+                );
                 value
             }),
         )
@@ -1170,23 +1212,20 @@ impl Worker {
         response_success(None, "abort_and_clear_queue", cleared.data)
     }
 
-    fn handle_get_last_assistant_text(&self) -> DaemonResponse {
+    fn handle_get_last_assistant_text(&self, payload: &Value) -> DaemonResponse {
         if let Err(response) = self.require_created("get_last_assistant_text") {
             return response;
         }
         let core = self.core.lock().unwrap();
-        let text = core.store.as_ref().and_then(|store| {
-            store
-                .messages()
-                .into_iter()
-                .rev()
-                .find(|message| crate::types::message_role(message) == Some("assistant"))
-                .map(|message| crate::types::message_text(&message))
-        });
+        let scope = payload.get("afterAgentMessageId").and_then(Value::as_str);
+        let text = core
+            .store
+            .as_ref()
+            .and_then(|store| assistant_text_after_admission(&store.messages(), scope));
         response_success(
             None,
             "get_last_assistant_text",
-            Some(json!({ "text": text })),
+            Some(json!({ "text": text, "answerScopeMessageId": scope })),
         )
     }
 

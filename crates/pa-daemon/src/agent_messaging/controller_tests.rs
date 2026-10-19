@@ -8,7 +8,7 @@ use crate::rlm_children::RlmChildIdentity;
 use crate::supervisor_link::SupervisorLink;
 use pa_core::session_engine::agent_messaging::AgentMessageController;
 use pa_types::platform::transport::bind_transport;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -174,6 +174,7 @@ enum RetaskAdmission {
     Rejected,
     LostAck,
     LostAckFinished,
+    LostAckStaleAnswer,
     LostAckStaleGeneration,
     SupervisorUncertain,
     MalformedAck,
@@ -244,7 +245,8 @@ async fn retask_controller_fixture(
                             Some(id),
                             kind,
                             Some(json!({
-                                "text": answer.lock().unwrap().clone()
+                                "text": if command["afterAgentMessageId"].as_str().is_some() && answer.lock().unwrap().as_str() == "FIRST" { Value::Null } else { json!(answer.lock().unwrap().clone()) },
+                                "answerScopeMessageId": command["afterAgentMessageId"],
                             })),
                         ),
                         "wait_for_idle" => {
@@ -264,6 +266,7 @@ async fn retask_controller_fixture(
                                     return;
                                 }
                                 RetaskAdmission::LostAckFinished
+                                | RetaskAdmission::LostAckStaleAnswer
                                 | RetaskAdmission::LostAckStaleGeneration => {
                                     let mut generation =
                                         command["rlmAdmission"]["generation"].clone();
@@ -273,7 +276,9 @@ async fn retask_controller_fixture(
                                     }
                                     *admission_fact.lock().unwrap() = json!({"phase":"started", "messageId":command["rlmAdmission"]["messageId"],
                                         "admissionGeneration":generation,"activeSessionId":"bbb222","sessionId":"sess-b","incarnation":"incarnation"});
-                                    *answer.lock().unwrap() = "SECOND".into();
+                                    if !matches!(admission, RetaskAdmission::LostAckStaleAnswer) {
+                                        *answer.lock().unwrap() = "SECOND".into();
+                                    }
                                     busy.store(false, std::sync::atomic::Ordering::SeqCst);
                                     return; // delivery executed, acknowledgement lost
                                 }
@@ -641,10 +646,10 @@ async fn family_labels_children_and_parent_from_the_registry() {
     assert_eq!(family[2].id, "ddd444");
     assert_eq!(family[2].name.as_deref(), Some("worker-a"));
     assert_eq!(family[2].aliases, vec!["sub-kid1", "sess-d"]);
-    assert!(!family
-        .iter()
-        .any(|member| member.id == "ddd444"
-            && member.relationship == AgentFamilyRelationship::Sibling));
+    assert!(
+        !family.iter().any(|member| member.id == "ddd444"
+            && member.relationship == AgentFamilyRelationship::Sibling)
+    );
     assert!(!family.iter().any(|member| member.id == "xxx999"));
 }
 
@@ -962,12 +967,16 @@ fn summaries_label_the_nuclear_family_by_durable_edges() {
         .find(|s| s.active_session_id.as_deref() == Some("own333"))
         .unwrap();
     assert_eq!(child.relationship, Some(AgentFamilyRelationship::Child));
-    assert!(!summaries
-        .iter()
-        .any(|s| s.active_session_id.as_deref() == Some("foreign444")));
-    assert!(!summaries
-        .iter()
-        .any(|s| s.active_session_id.as_deref() == Some("root555")));
+    assert!(
+        !summaries
+            .iter()
+            .any(|s| s.active_session_id.as_deref() == Some("foreign444"))
+    );
+    assert!(
+        !summaries
+            .iter()
+            .any(|s| s.active_session_id.as_deref() == Some("root555"))
+    );
 }
 
 #[test]
@@ -1237,9 +1246,11 @@ fn summaries_label_root_siblings_and_never_foreign_children() {
         .find(|s| s.active_session_id.as_deref() == Some("root222"))
         .unwrap();
     assert_eq!(sibling.relationship, Some(AgentFamilyRelationship::Sibling));
-    assert!(!summaries
-        .iter()
-        .any(|s| s.active_session_id.as_deref() == Some("child999")));
+    assert!(
+        !summaries
+            .iter()
+            .any(|s| s.active_session_id.as_deref() == Some("child999"))
+    );
 }
 
 #[tokio::test]
@@ -1379,12 +1390,14 @@ async fn retask_stale_started_fact_never_clears_unknown_or_overwrites_identity()
     assert!(controller.send_agent_message(input()).await.is_err());
     let before = crate::rlm_ledger::read_rlm_subagent_display(&dir.path().join("child")).unwrap();
     assert!(before.expected_message_id.is_some());
-    assert!(controller
-        .send_agent_message(input())
-        .await
-        .unwrap_err()
-        .to_string()
-        .contains("unresolved"));
+    assert!(
+        controller
+            .send_agent_message(input())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unresolved")
+    );
     let result = pa_core::session_engine::rlm_host::RlmSubagentHost::collect(
         controller.children.as_ref().unwrap().as_ref(),
         vec!["sub-retask".into()],
@@ -1424,5 +1437,32 @@ async fn retask_supervisor_uncertain_reply_never_restores_previous_answer() {
             .admission_unresolved,
         Some(true)
     );
+    assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn retask_started_but_no_new_answer_never_returns_prior_pass() {
+    let (_dir, controller, sends) =
+        retask_controller_fixture(RetaskAdmission::LostAckStaleAnswer).await;
+    assert!(controller.send_agent_message(input()).await.is_err());
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let result = pa_core::session_engine::rlm_host::RlmSubagentHost::collect(
+                controller.children.as_ref().unwrap().as_ref(),
+                vec!["sub-retask".into()],
+                100,
+            )
+            .await
+            .unwrap();
+            if result[0].settled {
+                break result;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(result[0].status, "error");
+    assert_eq!(result[0].answer_text, None);
     assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 1);
 }

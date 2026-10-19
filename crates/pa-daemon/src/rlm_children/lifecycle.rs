@@ -2,14 +2,14 @@
 //! prompt/kill/close routing, settle watching with its notices, and the
 //! spawn-admission outbox types (`CreatedSessionIds`, `CreatedChild`).
 use super::{
-    anyhow, cap_text, compact_rlm_text, create_rlm_child_failure_message,
-    create_rlm_child_terminal_notice, json, now_ms, Arc, ChildCloseReason, ChildRecord, Context,
-    CustomMessage, DaemonCommand, DaemonSessionLifecycle, Duration, Map, Mutex, ParentIdentity,
-    Path, PromptInput, Result, RlmChildTerminalNotice, SupervisorChildSessionsInner, Value,
-    ANSWER_TEXT_MAX_CHARS, CREATE_TIMEOUT_MS, IDLE_WAIT_GRACE_MS, KILL_TIMEOUT_MS,
-    NOTICE_DELIVERY_TIMEOUT_MS, PROMPT_TIMEOUT_MS, RUNTIME_METADATA_PROMPT_MAX, STATE_TIMEOUT_MS,
-    WATCH_MAX_UNREACHABLE_POLLS, WATCH_POLL_INTERVAL_MS, WATCH_SETTLE_GRACE_MS,
-    WATCH_WAIT_SLICE_MS,
+    ANSWER_TEXT_MAX_CHARS, Arc, CREATE_TIMEOUT_MS, ChildCloseReason, ChildRecord, Context,
+    CustomMessage, DaemonCommand, DaemonSessionLifecycle, Duration, IDLE_WAIT_GRACE_MS,
+    KILL_TIMEOUT_MS, Map, Mutex, NOTICE_DELIVERY_TIMEOUT_MS, PROMPT_TIMEOUT_MS, ParentIdentity,
+    Path, PromptInput, RUNTIME_METADATA_PROMPT_MAX, Result, RlmChildTerminalNotice,
+    STATE_TIMEOUT_MS, SupervisorChildSessionsInner, Value, WATCH_MAX_UNREACHABLE_POLLS,
+    WATCH_POLL_INTERVAL_MS, WATCH_SETTLE_GRACE_MS, WATCH_WAIT_SLICE_MS, anyhow, cap_text,
+    compact_rlm_text, create_rlm_child_failure_message, create_rlm_child_terminal_notice, json,
+    now_ms,
 };
 
 /// Parsed ids of one created child session.
@@ -636,13 +636,22 @@ impl SupervisorChildSessionsInner {
     /// (the preview compacts it; the binding lane caps it at
     /// [`ANSWER_TEXT_MAX_CHARS`] instead, so the whole fenced JSON a
     /// settle binds from survives).
-    async fn child_answer_raw(&self, active_session_id: &str) -> Result<Option<String>> {
+    async fn child_answer_raw(
+        &self,
+        active_session_id: &str,
+        scope: Option<&str>,
+    ) -> Result<Option<String>> {
         let command = DaemonCommand::GetLastAssistantText {
             id: None,
             active_session_id: active_session_id.to_string(),
-            rest: Map::default(),
+            rest: scope
+                .map(|id| Map::from_iter([("afterAgentMessageId".into(), json!(id))]))
+                .unwrap_or_default(),
         };
         let answer = self.command(&command, STATE_TIMEOUT_MS).await?;
+        if scope.is_some_and(|id| answer["answerScopeMessageId"].as_str() != Some(id)) {
+            return Ok(None); // An older receiver must not silently answer without the boundary.
+        }
         Ok(answer
             .get("text")
             .and_then(Value::as_str)
@@ -767,8 +776,15 @@ impl SupervisorChildSessionsInner {
         // a link round trip): one fetch yields the raw text both lanes
         // derive from — the compact preview for the roster rows and the
         // full text for the collect envelope's binding lane.
+        let answer_scope = {
+            let row = record.lock().await;
+            row.admission_generation
+                .as_deref()
+                .filter(|g| g.starts_with("message-admission-v1:"))
+                .and(row.expected_message_id.clone())
+        };
         let raw_answer = self
-            .child_answer_raw(&active_session_id)
+            .child_answer_raw(&active_session_id, answer_scope.as_deref())
             .await
             .ok()
             .flatten();
@@ -865,6 +881,19 @@ impl SupervisorChildSessionsInner {
                     let row = record.lock().await;
                     if row.admission_blocked || row.settled_status.is_none() {
                         continue;
+                    }
+                }
+                {
+                    let mut row = record.lock().await;
+                    if row
+                        .admission_generation
+                        .as_deref()
+                        .is_some_and(|g| g.starts_with("message-admission-v1:"))
+                        && row.settled_status == Some("done")
+                        && row.answer_text.is_none()
+                    {
+                        row.settled_status = Some("error");
+                        row.error = Some("Child became idle without a new answer for its exact message admission".into());
                     }
                 }
                 // The run's final rows are attributed before the terminal
@@ -1050,7 +1079,12 @@ impl SupervisorChildSessionsInner {
         // what the child last said instead of a bare failure row.
         let live_or_file = {
             let record = record.lock().await;
-            if record.answer_captured && record.answer_preview.is_some() {
+            if (record.answer_captured && record.answer_preview.is_some())
+                || record
+                    .admission_generation
+                    .as_deref()
+                    .is_some_and(|g| g.starts_with("message-admission-v1:"))
+            {
                 None
             } else {
                 Some((
@@ -1062,7 +1096,7 @@ impl SupervisorChildSessionsInner {
         let exit_text = match live_or_file {
             Some((active_session_id, session_file)) => {
                 let live = self
-                    .child_answer_raw(&active_session_id)
+                    .child_answer_raw(&active_session_id, None)
                     .await
                     .ok()
                     .flatten();
@@ -1151,12 +1185,9 @@ impl SupervisorChildSessionsInner {
                 .find(|binding| binding.child_id == child_id)
             {
                 binding.terminal_delivery = Some(terminal_id.clone());
-                wire["details"]["nativeManagedResult"] =
-                    json!(next
-                        .policy
-                        .as_ref()
-                        .is_some_and(|policy| policy.managed_pass_policy.as_deref()
-                            == Some("causal_results_v1")));
+                wire["details"]["nativeManagedResult"] = json!(next.policy.as_ref().is_some_and(
+                    |policy| policy.managed_pass_policy.as_deref() == Some("causal_results_v1")
+                ));
                 if let Err(error) = self.persist_gate(&next) {
                     eprintln!("pa-daemon: terminal result intent persist failed: {error:#}");
                     return None;
@@ -1423,13 +1454,15 @@ mod owner_cancel_tests {
             .restore_owner_cancellations(&[fact.clone()])
             .await
             .unwrap();
-        assert!(sessions
-            .inner
-            .gate
-            .lock()
-            .unwrap()
-            .consumed_managed_results
-            .is_empty());
+        assert!(
+            sessions
+                .inner
+                .gate
+                .lock()
+                .unwrap()
+                .consumed_managed_results
+                .is_empty()
+        );
         sessions
             .restore_owner_cancellations(&[fact.clone()])
             .await
@@ -1477,15 +1510,19 @@ mod owner_cancel_tests {
         }
         sessions.retain_management_obligation("goal").unwrap();
         let mut request = json!({"expectedRevision":7,"task":task,"assignment":assignment});
-        assert!(sessions
-            .reconcile_owner_cancellation(&request)
-            .await
-            .is_err());
+        assert!(
+            sessions
+                .reconcile_owner_cancellation(&request)
+                .await
+                .is_err()
+        );
         request["fact"] = json!({"forged":true});
-        assert!(sessions
-            .reconcile_owner_cancellation(&request)
-            .await
-            .is_err());
+        assert!(
+            sessions
+                .reconcile_owner_cancellation(&request)
+                .await
+                .is_err()
+        );
         request.as_object_mut().unwrap().remove("fact");
         let exact_fact = crate::journal::OwnerCancelFact {
             parent_session_file: parent,
@@ -1499,10 +1536,12 @@ mod owner_cancel_tests {
             .restore_owner_cancellations(&[wrong_fact])
             .await
             .unwrap();
-        assert!(sessions
-            .reconcile_owner_cancellation(&request)
-            .await
-            .is_err());
+        assert!(
+            sessions
+                .reconcile_owner_cancellation(&request)
+                .await
+                .is_err()
+        );
         let epoch = sessions
             .inner
             .accounting_epoch
@@ -1552,10 +1591,12 @@ mod owner_cancel_tests {
         assert_eq!(receipt["kind"], "owner_cancel");
         assert_eq!(receipt["processExitObserved"], false);
         assert_eq!(receipt["revision"], 8);
-        assert!(sessions
-            .reconcile_owner_cancellation(&request)
-            .await
-            .is_err());
+        assert!(
+            sessions
+                .reconcile_owner_cancellation(&request)
+                .await
+                .is_err()
+        );
         request["expectedRevision"] = json!(8);
         assert_eq!(
             sessions
@@ -1570,13 +1611,15 @@ mod owner_cancel_tests {
         assert_eq!(status["decision"], "suspended");
         assert_eq!(status["correctiveAttempts"], 2);
         assert_eq!(status["managementObligation"]["goalId"], "goal");
-        assert!(sessions
-            .inner
-            .gate
-            .lock()
-            .unwrap()
-            .consumed_managed_results
-            .is_empty());
+        assert!(
+            sessions
+                .inner
+                .gate
+                .lock()
+                .unwrap()
+                .consumed_managed_results
+                .is_empty()
+        );
         let bytes = std::fs::read(sessions.inner.gate_path().unwrap()).unwrap();
         sessions.restore_gate();
         assert_eq!(sessions.gate_status().await["unknown"], 1); // Receipt alone is not evidence.
@@ -1595,10 +1638,12 @@ mod owner_cancel_tests {
             bytes
         );
         record.lock().await.admission_generation = Some("changed".into());
-        assert!(sessions
-            .reconcile_owner_cancellation(&request)
-            .await
-            .is_err());
+        assert!(
+            sessions
+                .reconcile_owner_cancellation(&request)
+                .await
+                .is_err()
+        );
         assert!(sessions.gate_status().await["unknown"].as_u64().unwrap() > 0);
         // A legitimate task change through generic configure invalidates retained receipts.
         let mut reconfigure = json!({"expectedRevision":8,"task":request["task"].clone(),
