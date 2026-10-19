@@ -1,5 +1,10 @@
 //! Owner-authenticated Roadmap projection at existing continuation/admission boundaries.
-use super::*;
+use super::{
+    anyhow, json, DaemonCommand, Duration, Gate, Map, PathBuf, Result, RlmSubagentHost,
+    SupervisorChildSessions, Value,
+};
+#[cfg(test)]
+use super::{Arc, ParentIdentity};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -106,9 +111,9 @@ impl Source {
         writer.write_all(header.as_bytes()).await?;
         writer.write_all(&body).await?;
         let mut bytes = Vec::new();
-        reader.take(131073).read_to_end(&mut bytes).await?;
+        reader.take(131_073).read_to_end(&mut bytes).await?;
         anyhow::ensure!(
-            bytes.len() <= 131072
+            bytes.len() <= 131_072
                 && (bytes.starts_with(b"HTTP/1.1 200 ") || bytes.starts_with(b"HTTP/1.0 200 ")),
             "Owner source unavailable"
         );
@@ -575,7 +580,7 @@ impl SupervisorChildSessions {
             }
         }
     }
-    pub(super) fn next_work_view(&self, gate: &Gate, rows: &[Value]) -> Value {
+    pub(super) fn next_work_view(gate: &Gate, rows: &[Value]) -> Value {
         if !gate.next_work_enabled {
             return Value::Null;
         }
@@ -618,7 +623,7 @@ impl SupervisorChildSessions {
         snapshot["runtime"] = json!({"complete":rows.iter().all(|row| row["executionKind"] != "unknown"),"freeSlots":free,"ownership":gate.work_bindings,"ready":ready,"awaitingAcceptance":acceptance});
         snapshot
     }
-    pub(crate) async fn reserve_work(&self, child_id: &str, work: Option<&Value>) -> Result<()> {
+    pub(crate) fn reserve_work(&self, child_id: &str, work: Option<&Value>) -> Result<()> {
         let mut gate = self.inner.gate.lock().expect("gate lock");
         if !gate.next_work_enabled {
             anyhow::ensure!(work.is_none(), "next_work is not activated by Studio");
@@ -874,7 +879,7 @@ mod tests {
         let binding = gate.work_bindings[0].clone();
         let rows = vec![json!({"childId":"A","obligation":false,"executionKind":"settled"})];
         assert!(
-            sessions.next_work_view(&gate, &rows)["runtime"]["awaitingAcceptance"]
+            SupervisorChildSessions::next_work_view(&gate, &rows)["runtime"]["awaitingAcceptance"]
                 .as_array()
                 .unwrap()
                 .is_empty()
@@ -903,7 +908,8 @@ mod tests {
                 "{mutation}"
             );
             assert_eq!(
-                sessions.next_work_view(&gate, &rows)["runtime"]["awaitingAcceptance"]
+                SupervisorChildSessions::next_work_view(&gate, &rows)["runtime"]
+                    ["awaitingAcceptance"]
                     .as_array()
                     .unwrap()
                     .len(),
@@ -924,7 +930,7 @@ mod tests {
         gate.next_work = None;
         assert!(accepted_proof(None, Some(&scope), &binding).is_none());
         assert_eq!(
-            sessions.next_work_view(&gate, &rows)["runtime"]["awaitingAcceptance"]
+            SupervisorChildSessions::next_work_view(&gate, &rows)["runtime"]["awaitingAcceptance"]
                 .as_array()
                 .unwrap()
                 .len(),
@@ -934,7 +940,7 @@ mod tests {
         assert!(accepted_proof(gate.next_work.as_ref(), Some(&scope), &binding).is_some());
         gate.next_work.as_mut().unwrap()["items"][0]["completion"] = Value::Null;
         assert_eq!(
-            sessions.next_work_view(&gate, &rows)["runtime"]["awaitingAcceptance"]
+            SupervisorChildSessions::next_work_view(&gate, &rows)["runtime"]["awaitingAcceptance"]
                 .as_array()
                 .unwrap()
                 .len(),
@@ -942,7 +948,7 @@ mod tests {
         );
         gate.policy.as_mut().unwrap().managed_pass_policy = None;
         assert!(
-            sessions.next_work_view(&gate, &rows)["runtime"]["awaitingAcceptance"]
+            SupervisorChildSessions::next_work_view(&gate, &rows)["runtime"]["awaitingAcceptance"]
                 .as_array()
                 .unwrap()
                 .is_empty()
@@ -1302,17 +1308,14 @@ mod tests {
             json!({"planId":"p","stepId":"A","snapshotRevision":7}),
             json!({"planId":"p","stepId":"B","snapshotRevision":6}),
         ] {
-            assert!(sessions.reserve_work("kid", Some(&work)).await.is_err());
+            assert!(sessions.reserve_work("kid", Some(&work)).is_err());
         }
         let work = json!({"planId":"p","stepId":"B","snapshotRevision":7});
-        sessions.reserve_work("B", Some(&work)).await.unwrap();
-        assert!(sessions
-            .reserve_work("duplicate", Some(&work))
-            .await
-            .is_err());
+        sessions.reserve_work("B", Some(&work)).unwrap();
+        assert!(sessions.reserve_work("duplicate", Some(&work)).is_err());
         let gate = sessions.inner.gate.lock().unwrap().clone();
         assert_eq!(gate.work_bindings.len(), 1);
-        let view = sessions.next_work_view(
+        let view = SupervisorChildSessions::next_work_view(
             &gate,
             &[
                 json!({"childId":"B","obligation":false,"executionKind":"idle"}),
@@ -1328,7 +1331,6 @@ mod tests {
                 "D",
                 Some(&json!({"planId":"p","stepId":"D","snapshotRevision":7})),
             )
-            .await
             .unwrap();
         assert_eq!(sessions.inner.gate.lock().unwrap().work_bindings.len(), 2);
     }
@@ -1343,7 +1345,6 @@ mod tests {
                 "B",
                 Some(&json!({"planId":"p","stepId":"B","snapshotRevision":7}))
             )
-            .await
             .is_err());
         let gate = sessions.inner.gate.lock().unwrap();
         let stored = serde_json::to_string(&*gate).unwrap();
@@ -1382,7 +1383,6 @@ mod tests {
                 "stale",
                 Some(&json!({"planId":"p","stepId":"B","snapshotRevision":7}))
             )
-            .await
             .is_err());
     }
     #[tokio::test]
@@ -1476,7 +1476,6 @@ mod tests {
                 "B",
                 Some(&json!({"planId":"p","stepId":"B","snapshotRevision":7})),
             )
-            .await
             .unwrap();
         sessions
             .push_test_child(RlmChildIdentity {
@@ -1671,20 +1670,14 @@ mod tests {
         let sessions = sessions();
         let _source = source(&sessions, projection()).await;
         let work = json!({"planId":"p","stepId":"B","snapshotRevision":7});
-        sessions.reserve_work("pending", Some(&work)).await.unwrap();
-        assert!(sessions
-            .reserve_work("duplicate", Some(&work))
-            .await
-            .is_err());
+        sessions.reserve_work("pending", Some(&work)).unwrap();
+        assert!(sessions.reserve_work("duplicate", Some(&work)).is_err());
         let gate = sessions.inner.gate.lock().unwrap().clone();
         assert_eq!(
-            sessions.next_work_view(&gate, &[])["runtime"]["freeSlots"],
+            SupervisorChildSessions::next_work_view(&gate, &[])["runtime"]["freeSlots"],
             1
         );
         sessions.release_unsent_work("pending").unwrap();
-        sessions
-            .reserve_work("replacement", Some(&work))
-            .await
-            .unwrap();
+        sessions.reserve_work("replacement", Some(&work)).unwrap();
     }
 }

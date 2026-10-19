@@ -1432,7 +1432,7 @@ impl TurnRunner {
                 if status.as_ref().is_some_and(|status| {
                     status["policy"]["managedPassPolicy"] == "causal_results_v1"
                 }) {
-                    let review = request.custom_message.as_ref().map(|row| json!({"childId":row["details"]["childId"],"terminalDeliveryId":row["details"]["terminalDeliveryId"],"nativeNonce":crate::child_status_notices::mint()})).unwrap_or(Value::Null);
+                    let review = request.custom_message.as_ref().map_or(Value::Null, |row| json!({"childId":row["details"]["childId"],"terminalDeliveryId":row["details"]["terminalDeliveryId"],"nativeNonce":crate::child_status_notices::mint()}));
                     let allowed = tokio::runtime::Handle::current().block_on(
                         engine.orchestration_gate(Some(json!({"beginManagedReview":review}))),
                     );

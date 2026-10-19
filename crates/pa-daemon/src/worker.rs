@@ -1067,6 +1067,9 @@ fn is_goal_context_item(item: &QueuedItem) -> bool {
 ///
 /// Errors when the worker role env is missing, the worker env pair cannot be
 /// read, or the serve loop fails.
+///
+/// # Panics
+/// Panics if an internal worker state lock is poisoned.
 pub async fn run_worker() -> Result<()> {
     if std::env::var(WORKER_ROLE_ENV).unwrap_or_default() != "1" {
         return Err(anyhow!("worker mode requires {WORKER_ROLE_ENV}=1"));

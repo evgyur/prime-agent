@@ -136,9 +136,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     "rlmDepth": identity.rlm_depth + 1,
                     "createdAt": now_ms(),
                 });
-                sessions
-                    .reserve_work(&child_id, request.work.as_ref())
-                    .await?;
+                sessions.reserve_work(&child_id, request.work.as_ref())?;
                 let created = this
                     .create_child(
                         &child_id,
@@ -294,8 +292,12 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     if let Some(mut display) =
                         crate::rlm_ledger::read_rlm_subagent_display(Path::new(&row.session_dir))
                     {
-                        display.admission_generation = row.admission_generation.clone();
-                        display.expected_message_id = row.expected_message_id.clone();
+                        display
+                            .admission_generation
+                            .clone_from(&row.admission_generation);
+                        display
+                            .expected_message_id
+                            .clone_from(&row.expected_message_id);
                         crate::rlm_ledger::write_rlm_subagent_display(&display)?;
                     } else if watcher_this.gate.lock().expect("gate lock").enabled() {
                         bail!("Spawn admission display unavailable");

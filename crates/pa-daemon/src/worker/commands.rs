@@ -695,8 +695,7 @@ impl Worker {
             .lock()
             .unwrap()
             .as_ref()
-            .map(|journal| json!(journal.owner_cancel_facts()))
-            .unwrap_or_else(|| json!([]));
+            .map_or_else(|| json!([]), |journal| json!(journal.owner_cancel_facts()));
         let (core, inputs) = self.summary_inputs();
         let summary = self.summary_locked(&core, inputs);
         response_success(

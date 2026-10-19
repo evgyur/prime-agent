@@ -1,6 +1,14 @@
 //! Task-scoped orchestration accounting. No task text or automatic worker admission.
-use super::*;
+#[cfg(test)]
+use super::ParentIdentity;
+use super::{
+    anyhow, durable_child_selector, json, now_ms, Arc, ChildRecord, DaemonCommand, Duration, Map,
+    Path, PathBuf, Result, RlmSubagentHost, SupervisorChildSessions, SupervisorChildSessionsInner,
+    Value, STATE_TIMEOUT_MS,
+};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 mod legacy_closure;
 use legacy_closure::LegacyClosureReceipt;
 
@@ -263,11 +271,14 @@ impl Gate {
     }
 }
 
+type OwnerBootstrapFinalizer<'a> =
+    dyn Fn(&mut dyn FnMut() -> Result<Value>) -> Result<Value> + Sync + 'a;
+
 impl SupervisorChildSessions {
     pub(crate) async fn owner_bootstrap(
         &self,
         payload: &Value,
-        finalize: &(dyn Fn(&mut dyn FnMut() -> Result<Value>) -> Result<Value> + Sync),
+        finalize: &OwnerBootstrapFinalizer<'_>,
     ) -> Result<Value> {
         let identity = self.inner.identity.lock().expect("identity lock").clone();
         anyhow::ensure!(
@@ -1081,20 +1092,17 @@ impl SupervisorChildSessions {
                         && scope["envelope"]["requiredLeaves"].is_array(),
                     "Invalid management scope"
                 );
-                match next.management_scope.as_ref() {
-                    Some(old) => {
-                        if scope.get("ownerBindingId").is_none() {
-                            scope["ownerBindingId"] = old["ownerBindingId"].clone();
-                        }
-                        anyhow::ensure!(old == &scope, "Management scope replacement denied");
+                if let Some(old) = next.management_scope.as_ref() {
+                    if scope.get("ownerBindingId").is_none() {
+                        scope["ownerBindingId"] = old["ownerBindingId"].clone();
                     }
-                    None => {
-                        anyhow::ensure!(
-                            scope.get("ownerBindingId").is_none(),
-                            "Management owner identity is Native-issued"
-                        );
-                        scope["ownerBindingId"] = json!(uuid::Uuid::new_v4().to_string());
-                    }
+                    anyhow::ensure!(old == &scope, "Management scope replacement denied");
+                } else {
+                    anyhow::ensure!(
+                        scope.get("ownerBindingId").is_none(),
+                        "Management owner identity is Native-issued"
+                    );
+                    scope["ownerBindingId"] = json!(uuid::Uuid::new_v4().to_string());
                 }
                 next.management_scope = Some(scope);
             }
@@ -1144,7 +1152,7 @@ impl SupervisorChildSessions {
                 Some(row)
                     if row["executionKind"] == "executing" && assignment.dependencies_satisfied =>
                 {
-                    active += 1
+                    active += 1;
                 }
                 Some(row) if row["executionKind"] != "unknown" => {}
                 _ => unknown += 1,
@@ -1162,7 +1170,7 @@ impl SupervisorChildSessions {
                     })
             })
             .count();
-        let next_work = self.next_work_view(&gate, &rows);
+        let next_work = Self::next_work_view(&gate, &rows);
         let decision = if revision_changed {
             "unknown"
         } else if gate.suspended {
@@ -1317,7 +1325,6 @@ impl SupervisorChildSessions {
             )
         };
         let agent_dir = self.inner.agent_dir.clone();
-        use futures::StreamExt;
         futures::stream::iter(records).map(|record| { let parent = parent.clone(); let facts = facts.clone(); let closures = closures.clone(); let agent_dir = agent_dir.clone(); async move {
             let (id, selector, generation, expected, blocked, obligation)={let row=record.lock().await;
                 (row.rlm_child_id.clone(),durable_child_selector(row.session_id.as_deref(),&row.rlm_child_id),
@@ -1401,7 +1408,6 @@ impl SupervisorChildSessionsInner {
             let mut options = std::fs::OpenOptions::new();
             options.create_new(true).write(true);
             pa_core::platform::perms::set_private_mode(&mut options);
-            use std::io::Write;
             let mut file = options.open(&temp)?;
             file.write_all(&serde_json::to_vec(gate)?)?;
             file.sync_all()?;

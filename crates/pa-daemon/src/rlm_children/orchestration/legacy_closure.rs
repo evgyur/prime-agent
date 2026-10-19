@@ -1,7 +1,15 @@
 //! Explicit operator evidence policy for retained legacy bindings, not terminal proof.
-use super::*;
+#[cfg(test)]
+use super::ParentIdentity;
+use super::{
+    anyhow, json, Arc, Assignment, ChildRecord, Deserialize, Gate, Path, PathBuf, Result,
+    RlmSubagentHost, Serialize, SupervisorChildSessions, Task, Value, MAX_ACTIVE,
+};
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 const APPROVAL_ROOT: &str = "/etc/prime-agent/operator-approvals";
 const POLICY: &str = "owner_accepted_bounded_exit_cleanup_with_sustained_quarantine_v1";
 const MAX_BYTES: u64 = 1024 * 1024;
@@ -75,7 +83,6 @@ fn bounded_read(path: &Path) -> Result<Vec<u8>> {
     options.read(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
     }
     let mut file = options.open(path)?;
@@ -92,7 +99,6 @@ fn bounded_read(path: &Path) -> Result<Vec<u8>> {
             "Evidence identity changed"
         );
     }
-    use std::io::Read;
     let mut bytes = Vec::new();
     file.by_ref().take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
     anyhow::ensure!(bytes.len() as u64 <= MAX_BYTES, "Evidence too large");
@@ -120,7 +126,6 @@ fn trusted_approval(path: &Path) -> Result<Vec<u8>> {
         );
         let mut options = fs::OpenOptions::new();
         options.read(true);
-        use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
         let mut file = options.open(path)?;
         let opened = file.metadata()?;
@@ -134,7 +139,6 @@ fn trusted_approval(path: &Path) -> Result<Vec<u8>> {
                 && opened.len() <= MAX_BYTES,
             "Operator approval changed during open"
         );
-        use std::io::Read;
         let mut bytes = Vec::new();
         file.by_ref().take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
         anyhow::ensure!(
@@ -389,7 +393,6 @@ impl SupervisorChildSessions {
         let mut options = fs::OpenOptions::new();
         options.create_new(true).write(true);
         pa_core::platform::perms::set_private_mode(&mut options);
-        use std::io::Write;
         let mut file = options.open(&temp)?;
         file.write_all(&serde_json::to_vec(&next)?)?;
         file.sync_all()?;

@@ -62,9 +62,6 @@ impl ChildCloseReason {
     }
 }
 
-/// How long a detached child prompt waits for its spawning parent turn
-/// before prompting anyway; a stuck turn must not orphan the child's task.
-
 /// Grace between the first idle observation and the settle decision.
 const WATCH_SETTLE_GRACE_MS: u64 = 250;
 const CREATE_TIMEOUT_MS: u64 = 120_000;

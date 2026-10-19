@@ -246,8 +246,7 @@ impl Worker {
             .map(|row| {
                 row["details"]["terminalDeliveryId"]
                     .as_str()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+                    .map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_string)
             });
         if let (Some(id), Some(row)) = (&terminal_id, custom_message.as_mut()) {
             row["details"]["terminalDeliveryId"] = json!(id);
@@ -424,9 +423,9 @@ impl Worker {
             let id = sender["rlmAdmission"]["messageId"]
                 .as_str()
                 .filter(|id| id.starts_with("agentmsg_") && id.len() <= 128)
-                .map(str::to_string)
-                .unwrap_or_else(
+                .map_or_else(
                     pa_core::session_engine::agent_messaging::create_agent_session_message_id,
+                    str::to_string,
                 );
             let queued = core.busy;
             let summary = self.summary_locked(&core, inputs);

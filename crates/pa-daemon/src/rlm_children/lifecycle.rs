@@ -762,7 +762,7 @@ impl SupervisorChildSessionsInner {
                     match self.persist_gate(&next) {
                         Ok(()) => *gate = next,
                         Err(error) => {
-                            eprintln!("pa-daemon: started result persist failed: {error:#}")
+                            eprintln!("pa-daemon: started result persist failed: {error:#}");
                         }
                     }
                 }
