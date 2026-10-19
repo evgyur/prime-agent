@@ -86,6 +86,22 @@ impl RlmSubagentHost for SupervisorChildSessions {
         let this = Arc::clone(&self.inner);
         let sessions = self.clone();
         Box::pin(async move {
+            // Reserve requested names before waiting for shared admission capacity.
+            // A same-name contender must not wait behind the owner of its reservation.
+            let _reservation = request
+                .name
+                .as_ref()
+                .map(|name| {
+                    if !this.reserve_spawn_name(name) {
+                        let depth = this.identity.lock().expect("identity lock").rlm_depth + 1;
+                        return Err(spawn_name_unavailable_error(name, depth));
+                    }
+                    Ok(SpawnNameReservationGuard {
+                        inner: Arc::clone(&this),
+                        name: name.clone(),
+                    })
+                })
+                .transpose()?;
             sessions.refresh_next_work().await;
             let _spawn = this.spawn_gate.lock().await;
             sessions.assert_gate_capacity().await?;
@@ -100,22 +116,6 @@ impl RlmSubagentHost for SupervisorChildSessions {
             let name = request.name.clone().unwrap_or_else(|| {
                 create_default_rlm_subagent_session_name(&request.prompt, &child_id)
             });
-            // A requested name is reserved before the first await and held
-            // until the admission settles, so parallel same-name spawns
-            // cannot both register; a default name never reserves.
-            let _reservation = request
-                .name
-                .is_some()
-                .then(|| {
-                    if !this.reserve_spawn_name(&name) {
-                        return Err(spawn_name_unavailable_error(&name, identity.rlm_depth + 1));
-                    }
-                    Ok(SpawnNameReservationGuard {
-                        inner: Arc::clone(&this),
-                        name: name.clone(),
-                    })
-                })
-                .transpose()?;
             let admission = async {
                 this.assert_name_available(&name, identity.rlm_depth + 1)
                     .await?;
