@@ -1,7 +1,11 @@
 use super::*;
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // faux registrations are process-global
 async fn create_restores_cross_namespace_cancel_before_kernel_accounting() {
+    let _faux = crate::agent_engine::tests::FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     for case in [
         "matching",
         "foreign-parent",

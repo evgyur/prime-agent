@@ -160,7 +160,11 @@ async fn background_refinement_event_is_fenced_to_its_review_session() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // faux registrations are process-global
 async fn background_bash_strong_idle_holds_without_goal_but_turn_idle_returns() {
+    let _faux = crate::agent_engine::tests::FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     use std::sync::atomic::{AtomicBool, Ordering};
     let dir = tempfile::TempDir::new().unwrap();
     let worker = Worker::new(
