@@ -190,6 +190,7 @@ impl Worker {
 #[cfg(test)]
 mod owner_bootstrap_tests {
     use super::*;
+    use serde_json::json;
     fn owner() -> WorkerOwner {
         WorkerOwner {
             key: vec![7; 32],
